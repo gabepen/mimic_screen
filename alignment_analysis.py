@@ -1,4 +1,5 @@
 import argparse
+import numpy as np
 from glob import glob 
 import os 
 from tqdm import tqdm
@@ -7,6 +8,8 @@ import re
 import pdb
 from statistics import mean 
 from Bio.PDB import PDBParser
+import matplotlib.pyplot as plt
+from matplotlib.ticker import StrMethodFormatter, PercentFormatter
 
 def calculate_average_pLDDT(pdb_file):
     
@@ -129,7 +132,11 @@ def alignment_stats(alignment, control_dict):
             score = lp[3]
             tcov =  float(lp[6])
 
-
+            # manual check of alignment 
+            if 'P10383' in target:
+                print(l)
+            input()
+            
             # alignment base statistic requirements
             if float(score) > 0.5 and tcov > 0.25 and evalue < 0.01:
 
@@ -174,6 +181,57 @@ def validation(data_table, ids_of_interest):
                 output = map(str, output)
                 print(','.join(output))
 
+def results_to_stdout(data_table, query_db):
+    
+    '''pipe results dataframe to stdout in csv format
+    '''
+
+    # get results 
+    average_pLDDTs = {}
+    for row in data_table:
+
+        # store average pLDDTS
+        if row[0] not in average_pLDDTs and query_db:
+            average_pLDDTs[row[0]] = calculate_average_pLDDT(query_db + '/' + row[0])
+        else:
+            average_pLDDTs[row[0]] = 'NA'
+
+        # clean up file name to just have UNIProt ID
+        start = 'AF-'
+        end = '-F1'
+        #target_id = re.search(f'{start}(.*?){end}', row[5]).group(1) if re.search(f'{start}(.*?){end}', row[5]) else None
+        #query_id = '_'.join(row[0].split('_')[:2])
+
+        target_id = row[5]
+        query_id = row[0]
+
+        # match order of existing table in paper 
+        output = [query_id, target_id, row[1], row[2], row[3], row[4],  average_pLDDTs[row[0]], row[-1]]
+        output = map(str, output)
+        print(','.join(output))
+
+def plot_freeliving_fraction_distribution(data_table, output_path):
+
+    '''plots a simple histogram of the pct_freeliving column of a results datatable
+    '''
+
+    # create np array from column 4 of data_table 
+    #column_data = [row[4] for row in data_table if row[-1] != 'filtered']
+    #pct_freeliving_array = np.array(column_data, dtype=float)
+    pct_freeliving_array = np.array(data_table)
+   
+    # create histogram 
+    #plt.hist(pct_freeliving_array, bins=30, weights=np.ones(len(pct_freeliving_array)) / len(pct_freeliving_array))
+    plt.hist(pct_freeliving_array, bins=30)
+    plt.xlim(0.0,1.0)
+    plt.xticks(np.arange(0.0,1.0,0.2))
+    plt.gca().xaxis.set_major_formatter(StrMethodFormatter('{x:,.2f}')) # 2 decimal places
+    #plt.gca().yaxis.set_major_formatter(PercentFormatter(xmax=1)) 
+
+
+    # save plot to output path 
+    plt.savefig(output_path)
+
 def main():
 
     '''Script that determines the overall presence of wMel protein alignments with the free-living control dataset.
@@ -201,9 +259,17 @@ def main():
         with open(args.json_file, 'r') as json_f:
             control_dictionary = json.load(json_f)
 
+    # plot the distribution of freeliving fraction values directly from control table 
+    pct_fl_array = [] 
+    for query in control_dictionary:
+        pct_fl_array.append(control_dictionary[query]['algn_fraction'])
+
+    #plot_freeliving_fraction_distribution(pct_fl_array, '/storage1/gabe/proteome/final_figs/pct_freeliving_dists/wMel_countfl_dist.png')
+
     # generate alignment stats data table 
-    data_table = alignment_stats(args.alignment, control_dictionary)
-    input()
+    #data_table = alignment_stats(args.alignment, control_dictionary)
+    #plot_freeliving_fraction_distribution(data_table, '/storage1/gabe/proteome/final_figs/pct_freeliving_dists/Caldimonas_pctfl_dist.png')
+
 
     # parse validation IDs
     if args.validation_ids:
@@ -213,27 +279,6 @@ def main():
             for uni_id in ids:
                 ids_of_interest.add(uni_id.strip())
         validation(data_table, ids_of_interest)
-
-
-    # get results 
-    average_pLDDTs = {}
-    for row in data_table:
-
-        # store average pLDDTS
-        if row[0] not in average_pLDDTs:
-            average_pLDDTs[row[0]] = calculate_average_pLDDT(wol_db + '/' + row[0])
-
-        # clean up file name to just have UNIProt ID
-        start = 'AF-'
-        end = '-F1'
-        target_id = re.search(f'{start}(.*?){end}', row[5]).group(1) if re.search(f'{start}(.*?){end}', row[5]) else None
-
-        query_id = '_'.join(row[0].split('_')[:2])
-
-        # match order of existing table in paper 
-        output = [query_id, target_id, row[1], row[2], row[3], row[4],  average_pLDDTs[row[0]], row[-1]]
-        output = map(str, output)
-        print(','.join(output))
 
 if __name__ == '__main__':
     main()

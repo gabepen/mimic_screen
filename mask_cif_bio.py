@@ -100,7 +100,7 @@ def main():
 
     # make path consistent
     if args.structure_dir[-1] != '/':
-        structure_dir = args.structure_dir += '/'
+        structure_dir = args.structure_dir + '/'
     else:
         structure_dir = args.structure_dir
 
@@ -115,8 +115,8 @@ def main():
     for file in structure_files:
 
 
-        struct_name = pdb.split('/')[-1]
-        c_mask, n_mask = get_mask_bounds(pdb)
+        struct_name = file.split('/')[-1]
+        c_mask, n_mask = get_mask_bounds(file)
 
         # print ranges in verbose mode
         if args.verbose:
