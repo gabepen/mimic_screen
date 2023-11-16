@@ -132,13 +132,8 @@ def alignment_stats(alignment, control_dict):
             score = lp[3]
             tcov =  float(lp[6])
 
-            # manual check of alignment 
-            if 'P10383' in target:
-                print(l)
-            input()
-            
             # alignment base statistic requirements
-            if float(score) > 0.5 and tcov > 0.25 and evalue < 0.01:
+            if float(score) > 0.4 and tcov > 0.25 and evalue < 0.01:
 
                 # check presence in control proteomes
                 if query in control_dict:
@@ -190,6 +185,9 @@ def results_to_stdout(data_table, query_db):
     average_pLDDTs = {}
     for row in data_table:
 
+        if row[-1] == 'filtered':
+            continue
+            
         # store average pLDDTS
         if row[0] not in average_pLDDTs and query_db:
             average_pLDDTs[row[0]] = calculate_average_pLDDT(query_db + '/' + row[0])
@@ -199,11 +197,11 @@ def results_to_stdout(data_table, query_db):
         # clean up file name to just have UNIProt ID
         start = 'AF-'
         end = '-F1'
-        #target_id = re.search(f'{start}(.*?){end}', row[5]).group(1) if re.search(f'{start}(.*?){end}', row[5]) else None
-        #query_id = '_'.join(row[0].split('_')[:2])
+        target_id = re.search(f'{start}(.*?){end}', row[5]).group(1) if re.search(f'{start}(.*?){end}', row[5]) else None
+        query_id = re.search(f'{start}(.*?){end}', row[0]).group(1) if re.search(f'{start}(.*?){end}', row[0]) else None
 
-        target_id = row[5]
-        query_id = row[0]
+        #target_id = row[5]
+        #query_id = row[0]
 
         # match order of existing table in paper 
         output = [query_id, target_id, row[1], row[2], row[3], row[4],  average_pLDDTs[row[0]], row[-1]]
@@ -216,9 +214,9 @@ def plot_freeliving_fraction_distribution(data_table, output_path):
     '''
 
     # create np array from column 4 of data_table 
-    #column_data = [row[4] for row in data_table if row[-1] != 'filtered']
-    #pct_freeliving_array = np.array(column_data, dtype=float)
-    pct_freeliving_array = np.array(data_table)
+    column_data = [row[4] for row in data_table if row[-1] != 'filtered']
+    pct_freeliving_array = np.array(column_data, dtype=float)
+    #pct_freeliving_array = np.array(data_table)
    
     # create histogram 
     #plt.hist(pct_freeliving_array, bins=30, weights=np.ones(len(pct_freeliving_array)) / len(pct_freeliving_array))
@@ -267,9 +265,11 @@ def main():
     #plot_freeliving_fraction_distribution(pct_fl_array, '/storage1/gabe/proteome/final_figs/pct_freeliving_dists/wMel_countfl_dist.png')
 
     # generate alignment stats data table 
-    #data_table = alignment_stats(args.alignment, control_dictionary)
-    #plot_freeliving_fraction_distribution(data_table, '/storage1/gabe/proteome/final_figs/pct_freeliving_dists/Caldimonas_pctfl_dist.png')
-
+    data_table = alignment_stats(args.alignment, control_dictionary)
+    plot_freeliving_fraction_distribution(data_table, '/storage1/gabe/proteome/final_figs/helicobacter_pylori_26695.png')
+    
+    # output csv to stdout
+    results_to_stdout(data_table, False)
 
     # parse validation IDs
     if args.validation_ids:
