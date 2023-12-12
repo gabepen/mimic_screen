@@ -1,11 +1,11 @@
 import os 
 from glob import glob 
 import argparse
-#import seaborn as sns
 import pandas as pd
 import matplotlib as mpl
 import matplotlib.pyplot as plt
 from matplotlib.patches import Rectangle
+from mpl_toolkits.axes_grid1 import make_axes_locatable
 import numpy as np
 import csv
 import alignment_analysis as aa
@@ -259,6 +259,34 @@ def scatter_hist(cdf,fdf,scores,x_vals,x_lab, ax, ax_histx, ax_histy):
     ax.set_xlabel(x_lab)
     ax.set_ylabel('Sequence Similarity')
 
+    # return image object for color bar addition 
+    return hh
+
+def add_right_colorbar(fig, cmap, norm, panel_axes, size='5%', pad=0.05):
+    """
+    Add a color bar to the right side of a multi-panel figure.
+
+    Parameters:
+        - fig: Matplotlib figure
+        - cmap: Colormap
+        - norm: Normalize instance for mapping the data values to the colormap
+        - panel_axes: List of Matplotlib axes objects for the panels
+        - size: Colorbar size (default is '5%')
+        - pad: Colorbar padding (default is 0.05)
+    """
+
+     # Create an axis for the color bar on the right side of the entire figure
+    divider = make_axes_locatable(fig.add_subplot(1, 1, 1, frame_on=False))
+    cax = divider.append_axes("right", size=size, pad=pad)
+
+    # Create the color bar
+    cbar = plt.colorbar(plt.cm.ScalarMappable(cmap=cmap, norm=norm), cax=cax)
+
+    # Hide the axis labels and ticks
+    cax.set_xticks([])
+    cax.yaxis.tick_left()  # Move colorbar ticks to the left side
+    return cbar
+
 def multi_panel_alignmentspace(data_table1, data_table2, plt_name1, plt_name2, file_name):
 
     ''' Original space and seq coservation figure
@@ -283,6 +311,7 @@ def multi_panel_alignmentspace(data_table1, data_table2, plt_name1, plt_name2, f
     fig.savefig(file_name)
 
 def multi_panel_hist_scatter(data_table1, data_table2, mp_label_array, plt_name1, plt_name2, file_name):
+
 
     fig, axs = plt.subplots(ncols=2, nrows=2)
 
@@ -312,14 +341,13 @@ def multi_panel_hist_scatter(data_table1, data_table2, mp_label_array, plt_name1
             else:
                 xlab = 'TM-Score'
             if j % 2 == 0:   
-                scatter_hist(cdf1, fdf1, [], xtype, xlab, ax, ax_histx, ax_histy)
+                im = scatter_hist(cdf1, fdf1, [], xtype, xlab, ax, ax_histx, ax_histy)
             else:
-                scatter_hist(cdf2, fdf2, [], xtype, xlab, ax, ax_histx, ax_histy)
-    
+                im = scatter_hist(cdf2, fdf2, [], xtype, xlab, ax, ax_histx, ax_histy)
+
     fig.tight_layout(pad=1)
     fig.savefig(file_name)
     
-
 def main():
 
     plt.style.use('/home/gabe/matplot/BME163.mplstyle')
@@ -345,7 +373,7 @@ def main():
     #multi_panel_alignmentspace(data_table1, data_table2, 'Legionella - Human', 'wMel - Drosophila', '/storage1/gabe/proteome/final_figs/alignment_space_seq-vs-pctfl.png')
     mp_label_array = [['tcov', 'tcov'],
                       ['tm-score', 'tm-score']]
-    multi_panel_hist_scatter(data_table1, data_table2, mp_label_array, 'Legionella - Human', 'wMel - Drosophila',  '/storage1/gabe/proteome/final_figs/alignment_space_mp_scatterhist_alt.png')
+    multi_panel_hist_scatter(data_table1, data_table2, mp_label_array, 'Legionella - Human', 'wMel - Drosophila',  '/storage1/gabe/proteome/final_figs/alignment_space_mp_scatterhist_alt_colorbar.png')
 
 if __name__ == '__main__':
     main()

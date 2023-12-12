@@ -5,7 +5,6 @@ import os
 from tqdm import tqdm
 import json
 import re
-import pdb
 from statistics import mean 
 from Bio.PDB import PDBParser
 import matplotlib.pyplot as plt
@@ -36,14 +35,11 @@ def calculate_average_pLDDT(pdb_file):
                 except IndexError:
                     print('pLDDT ERROR')
                     print(pdb_file)
-                    breakpoint()
-            
+                    return 'ERR' 
                 
         # return average pDDT for structure
         return mean(pLDDTs)
  
-
-
 def generate_control_dictionary(control_dir):
 
     '''Generates and returns control dictionary which contains statistics for each query protein
@@ -77,7 +73,7 @@ def generate_control_dictionary(control_dir):
 
                 # check for RBH hit within accepted evalue range
                 if evalue < 0.01 and score > 0.3:
-                
+
                     # initialize query in stat dictionary
                     if query not in control_dict:
                         control_dict[query] = {'algn_fraction': 0, 'counts': 1, 'tm_score_avg': score, 'tcov_avg': tcov, 'fident_avg': fident}
@@ -101,8 +97,7 @@ def generate_control_dictionary(control_dir):
         json.dump(control_dict, o_file, indent=2) 
     
     return control_dict
-
-            
+          
 def alignment_stats(alignment, control_dict):
 
     '''
@@ -168,8 +163,8 @@ def validation(data_table, ids_of_interest):
                 # clean up file name to just have UNIProt ID
                 start = 'AF-'
                 end = '-F1'
-                query_id = re.search(f'{start}(.*?){end}', row[0]).group(1) if re.search(f'{start}(.*?){end}', row[0]) else None
-                target_id = re.search(f'{start}(.*?){end}', row[5]).group(1) if re.search(f'{start}(.*?){end}', row[5]) else None
+                query_id = re.search(f'{start}(.*?){end}', row[0]).group(1) if re.search(f'{start}(.*?){end}', row[0]) else row[0]
+                target_id = re.search(f'{start}(.*?){end}', row[5]).group(1) if re.search(f'{start}(.*?){end}', row[5]) else row[5]
 
                 # match order of existing table in paper 
                 output = [query_id, target_id, row[1], row[2], row[3], row[4],  average_pLDDTs[uni_id]]
@@ -189,7 +184,7 @@ def results_to_stdout(data_table, query_db):
             continue
             
         # store average pLDDTS
-        if row[0] not in average_pLDDTs and query_db:
+        if row[0] not in average_pLDDTs and query_db != None:
             average_pLDDTs[row[0]] = calculate_average_pLDDT(query_db + '/' + row[0])
         else:
             average_pLDDTs[row[0]] = 'NA'
@@ -197,11 +192,8 @@ def results_to_stdout(data_table, query_db):
         # clean up file name to just have UNIProt ID
         start = 'AF-'
         end = '-F1'
-        target_id = re.search(f'{start}(.*?){end}', row[5]).group(1) if re.search(f'{start}(.*?){end}', row[5]) else None
-        query_id = re.search(f'{start}(.*?){end}', row[0]).group(1) if re.search(f'{start}(.*?){end}', row[0]) else None
-
-        #target_id = row[5]
-        #query_id = row[0]
+        target_id = re.search(f'{start}(.*?){end}', row[5]).group(1) if re.search(f'{start}(.*?){end}', row[5]) else row[5]
+        query_id = re.search(f'{start}(.*?){end}', row[0]).group(1) if re.search(f'{start}(.*?){end}', row[0]) else row[0].split('_')[0]
 
         # match order of existing table in paper 
         output = [query_id, target_id, row[1], row[2], row[3], row[4],  average_pLDDTs[row[0]], row[-1]]
@@ -216,16 +208,12 @@ def plot_freeliving_fraction_distribution(data_table, output_path):
     # create np array from column 4 of data_table 
     column_data = [row[4] for row in data_table if row[-1] != 'filtered']
     pct_freeliving_array = np.array(column_data, dtype=float)
-    #pct_freeliving_array = np.array(data_table)
    
     # create histogram 
-    #plt.hist(pct_freeliving_array, bins=30, weights=np.ones(len(pct_freeliving_array)) / len(pct_freeliving_array))
     plt.hist(pct_freeliving_array, bins=30)
     plt.xlim(0.0,1.0)
     plt.xticks(np.arange(0.0,1.0,0.2))
     plt.gca().xaxis.set_major_formatter(StrMethodFormatter('{x:,.2f}')) # 2 decimal places
-    #plt.gca().yaxis.set_major_formatter(PercentFormatter(xmax=1)) 
-
 
     # save plot to output path 
     plt.savefig(output_path)
@@ -242,13 +230,13 @@ def main():
 
     parser.add_argument('-a','--alignment', type=str, help='path to an expiremental alignment file')
     parser.add_argument('-c','--controls', type=str, help='paths to a directory of control alignments')
-    parser.add_argument('-v','--validation_ids', type=str, help='path to a txt file of structure IDs to pull from results')
+    parser.add_argument('-f','--fid_plot', type=str, help='output path for png of fraction of identical residues histogram')
     parser.add_argument('-j','--json_file', type=str, help='path to a pre-generated json of control alignment stats')
-    args = parser.parse_args()
-
-    # this is for getting statistic from the legionella structure files for validation purposes 
-    legion_db = '/storage1/gabe/proteome/databases/lpneumophila/maskedlp'
-    wol_db    = '/storage1/gabe/proteome/databases/woldb/masked'
+    parser.add_argument('-o','--std_out',  action='store_true', help='output csv table of results to std_out')
+    parser.add_argument('-p','--pdb_database', type=str, help='path to database of pdb files used in alignment')
+    parser.add_argument('-v','--validation_ids', type=str, help='path to a txt file of structure IDs to pull from results')
+    parser.add_argument('')
+    args = parser.parse_args()   
 
     # either generate the control dictionary or load it from previous run 
     if not args.json_file:
@@ -257,27 +245,29 @@ def main():
         with open(args.json_file, 'r') as json_f:
             control_dictionary = json.load(json_f)
 
-    # plot the distribution of freeliving fraction values directly from control table 
-    pct_fl_array = [] 
-    for query in control_dictionary:
-        pct_fl_array.append(control_dictionary[query]['algn_fraction'])
-
-    #plot_freeliving_fraction_distribution(pct_fl_array, '/storage1/gabe/proteome/final_figs/pct_freeliving_dists/wMel_countfl_dist.png')
-
     # generate alignment stats data table 
     data_table = alignment_stats(args.alignment, control_dictionary)
-    plot_freeliving_fraction_distribution(data_table, '/storage1/gabe/proteome/final_figs/helicobacter_pylori_26695.png')
+    
+    # plot histogram of freeliving fraction values for alignment
+    if args.fid_plot:
+        plot_freeliving_fraction_distribution(data_table, args.fidplot)
     
     # output csv to stdout
-    results_to_stdout(data_table, False)
+    if args.std_out and args.pdb_database:
+        results_to_stdout(data_table, args.pdb_database)
+    elif args.std_out:
+        results_to_stdout(data_table, None)
 
-    # parse validation IDs
+    # parse list of validation or general IDs of interest to pull from the results of an alignment
     if args.validation_ids:
         ids_of_interest = set()
         with open(args.validation_ids, 'r') as txt_f:
             ids = txt_f.readlines()
-            for uni_id in ids:
-                ids_of_interest.add(uni_id.strip())
+            for struct_id in ids:
+                # add structure IDs to id set 
+                ids_of_interest.add(struct_id.strip())
+
+        # find ids and print to std_out in csv format
         validation(data_table, ids_of_interest)
 
 if __name__ == '__main__':

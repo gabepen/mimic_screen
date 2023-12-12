@@ -6,41 +6,6 @@ import urllib
 import http.cookiejar
 import bacdive
 import re
-import pdb
-
-def get_paper_titles_from_bacdive_entry(bacdive_entry):
-  """Extracts the paper titles from the literature section of a BacDive database entry.
-
-  Args:
-    bacdive_entry: A BacDive database entry.
-
-  Returns:
-    A list of paper titles.
-  """
-
-  # Get the literature section of the BacDive database entry.
-  literature_section = bacdive_entry["Literature"]
-
-  # Split the literature section into individual references.
-  references = re.split(r"[;]", literature_section)
-
-  # Extract the paper title from each reference.
-  paper_titles = []
-  for reference in references:
-    # Split the reference into individual fields.
-    fields = reference.split(r"\t")
-
-    # The paper title is the first field in the reference.
-    paper_title = fields[0]
-
-    # Remove any leading or trailing whitespace from the paper title.
-    paper_title = paper_title.strip()
-
-    # Add the paper title to the list of paper titles.
-    paper_titles.append(paper_title)
-
-  return paper_titles
-
 
 def teach_bard(bard):
 
@@ -150,19 +115,19 @@ def main():
     parser.add_argument('-f', '--file', type=str, help='path to file output of taxon_selector.py')
     parser.add_argument('-o', '--output', type=str, help='path to output file for bard determinations ')
     parser.add_argument('-r', '--resume', type=str, help='tax id to resume calling from')
+    parser.add_argument('-b', '--bacdive_creds', type=str, help='BacDive client email and password seperated by a comma ("email,pw")')
     args = parser.parse_args()
 
-    # __Secure-1PSID value 
-
     cookie_dict = {
-        "__Secure-1PSID": "cQjPQw7Fp6XQCKZyF6azwVWITjD0s3s1qy-z9s3GK7iDfej3935oaIgdvxQKnXm0L1yw5w.",
-        "__Secure-1PSIDTS": "sidts-CjEB3e41hdVqZyp3zzry-xNeC5ThZrrvkAo6LlJOg-q8nOK_TXj93_PDBcXCIYNO1xxLEAA",
-        "__Secure-1PSIDCC": "ACA-OxPxnBGmAetuDyhqyArowiNiqHhYQwBoUyvSJGuXTdKT4au-7DBjiiiYzacgOIKshHYt"
+        "__Secure-1PSID": "",
+        "__Secure-1PSIDTS": "",
+        "__Secure-1PSIDCC": ""
         # Any cookie values you want to pass session object.
     }
 
-    # loging to bacdive client 
-    client = bacdive.BacdiveClient('gapenunu@ucsc.edu', 'rmz0anz-FCX0dbf1fjy')
+    # loging into bacdive client 
+    credentials = args.bacdive_creds.split(',')
+    client = bacdive.BacdiveClient(credentials[0], credentials[1])
 
     # init bard 
     bard = BardCookies(cookie_dict=cookie_dict)
@@ -254,7 +219,7 @@ def main():
                     print(e)
                     print(strain['General'])
                     print(species_name)
-                    breakpoint()
+                    
                 # entry has a no NCBI tax id (specific strain)
                 except KeyError:
                     continue

@@ -95,7 +95,6 @@ def collect_already_selected(previous_selection):
     
     return taxids
 
-
 def main():
 
     '''This program randomly selects taxons within two ranks within a taxonDB subtree
@@ -157,6 +156,7 @@ def main():
                     s_count = 0
                     selection_opts = selection_dict[pool]
                     while s_count < 4:
+
                         # monitoring
                         opt = random.choice(selection_opts)
                         selection_opts.remove(opt)

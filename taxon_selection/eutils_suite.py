@@ -1,5 +1,5 @@
 from Bio import Entrez
-Entrez.email = 'gapenunu@ucsc.edu'
+Entrez.email = ''
 
 class Librarian:
 
@@ -81,7 +81,7 @@ class Librarian:
 
 def main():
 
-    ''' testing here
+    ''' testing examples 
     '''
 
     '''
@@ -93,11 +93,13 @@ def main():
         input()
     '''
     
+    '''
     elib = Librarian('nuccore')
     prot_fa = elib.find_ids_records(['OW203764.1'])
     for l in prot_fa:
         print(l)
         input()
+    '''
 
 if __name__ == "__main__":
     main()
