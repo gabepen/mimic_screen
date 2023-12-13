@@ -14,6 +14,7 @@ def main():
     parser.add_argument('-q','--query', type=str, help='path to query proteome')
     parser.add_argument('-o','--output', type=str, help='path to parent output folder')
     parser.add_argument('-d','--database_dir', type=str, help='path to database directory')
+    parser.add_argument('-t','--threads', type=str, help='threads (INT) to pass to foldseek, default = ALL')
     args = parser.parse_args()
 
     # make paths absolute
@@ -52,9 +53,14 @@ def main():
         if os.path.exists(output_path):
             continue
 
-        subprocess.run(['foldseek', 'easy-rbh', args.query,
-                        proteome[0], output_path, 'multirbhtmp', 
-                        '--format-output', 'query,target,evalue,alntmscore,alnlen,qlen,tcov,qcov,tlen,u,t,lddt,fident,pident,prob'], stdout=subprocess.DEVNULL)
+        if args.threads:
+            subprocess.run(['foldseek', 'easy-rbh', args.query,
+                            proteome[0], output_path, 'multirbhtmp', '--threads', args.threads, 
+                            '--format-output', 'query,target,evalue,alntmscore,alnlen,qlen,tcov,qcov,tlen,u,t,lddt,fident,pident,prob'], stdout=subprocess.DEVNULL)
+        else:
+            subprocess.run(['foldseek', 'easy-rbh', args.query,
+                            proteome[0], output_path, 'multirbhtmp',
+                            '--format-output', 'query,target,evalue,alntmscore,alnlen,qlen,tcov,qcov,tlen,u,t,lddt,fident,pident,prob'], stdout=subprocess.DEVNULL)
 
 if __name__ == '__main__':
     main()
