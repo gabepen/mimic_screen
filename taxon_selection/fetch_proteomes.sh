@@ -5,11 +5,11 @@ set -e
 # cause the bash shell to treat unset variables as an error and exit immediately
 set -u
 
-# Define the destination directory
-destination_dir=$1
+# File containing the list of tax IDs and species name, one per line
+tax_id_file=$1
 
-# File containing the list of tax IDs, one per line
-tax_id_file=$2
+# Define the destination directory
+destination_dir=$2
 
 # set up logging to catch taxids not found in alphafold DBs 
 log_file=$3

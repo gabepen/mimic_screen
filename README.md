@@ -99,6 +99,10 @@ $ python strain_type_checker_bard.py -f file_from_taxon_selector.py -o output_fi
 
 fetch_proteomes.sh: download and merge AlphaFold database proteome shards for a list of taxids
 ```
-$
+$ bash fetch_proteomes.sh taxid_file download_directory log_file missing_taxids_file
 ```
+- taxid file should have one taxid and species name per line seperated by a space 
+- download directory will contain the merged proteome shards for a taxid in a folder with the species name 
+- for taxids that are missing from the AlphaFold databases the taxid is added to the missing_taxids_file and the output for the gsutil cp command to the log_file 
+ 
 
