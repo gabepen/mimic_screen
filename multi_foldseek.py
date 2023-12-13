@@ -50,7 +50,7 @@ def main():
         output_path = output_prefix + db_name + '_rbh.tsv'
 
         # check to see if output exists
-        if os.path.exists(output_path):
+        if os.path.exists(output_path): 
             continue
 
         if args.threads:
