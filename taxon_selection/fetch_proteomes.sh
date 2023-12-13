@@ -5,9 +5,15 @@ set -e
 # cause the bash shell to treat unset variables as an error and exit immediately
 set -u
 
+# Define the destination directory
+destination_dir=$1
+
+# File containing the list of tax IDs, one per line
+tax_id_file=$2
+
 # set up logging to catch taxids not found in alphafold DBs 
-log_file="/storage1/gabe/taxon_selection/error_log3.txt"
-missing_file="/storage1/gabe/taxon_selection/missing_taxids3.txt"
+log_file=$3
+missing_file=$4
 
 # function for handling gsutils errors
 log_missing() {
@@ -15,16 +21,10 @@ log_missing() {
     echo "$2" >> "$log_file"
 }
 
-# Define the destination directory
-destination_dir="/storage1/gabe/proteome/databases/free_living_dbs"
-
 # Check if the destination directory exists, and create it if not
 if [ ! -d "$destination_dir" ]; then
   mkdir -p "$destination_dir"
 fi
-
-# File containing the list of tax IDs, one per line
-tax_id_file="/storage1/gabe/taxon_selection/free_living_taxids/free_living_taxids5.txt"
 
 # Check if the tax ID file exists
 if [ ! -f "$tax_id_file" ]; then

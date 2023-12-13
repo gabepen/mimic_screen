@@ -69,3 +69,36 @@ $ pyton taxon_selector.py -t tree -p directory of previously generated csv from 
     - ```
         conda install -c bioconda taxonkit
       ```
+    - https://bioinf.shenwei.me/taxonkit/
+3. Generate subtree with this command
+    - ```
+        taxonkit list --ids 2 -n -r --json --data-dir='/path/to/taxdump' > bacterial_tree.json
+      ```
+
+strain_type_checker_bard.py: Determine if randomly selected taxon are host-associated 
+```
+$ python strain_type_checker_bard.py -f file_from_taxon_selector.py -o output_file -b bacdive_credentials 
+```
+- Uses bacdive api which requires login credentials
+    - signup: https://api.bacdive.dsmz.de/
+    - then use with -b email,pw
+- Follow instructions for using cookies with this unofficial bardapi https://github.com/dsdanielpark/Bard-API
+    - Different accounts and connections will require different cookies 
+    - For this papers use __Secure-1PSID, __Secure-1PSIDTS, and __Secure-1PSIDCC all needed to be specifed and updated 
+        - add these values or more to the cookie_dict in main()
+            ```
+            cookie_dict = {
+                "__Secure-1PSID": "value",
+                "__Secure-1PSIDTS": "value",
+                "__Secure-1PSIDCC": "value"
+                # Any cookie values you want to pass session object.
+            }
+            ```
+- The bardapi is unoffical and will sometimes lead to interuptions as max requests on an account are reached 
+    - use the -r flag with the taxid of the last submitted query to resume script from that point 
+
+fetch_proteomes.sh: download and merge AlphaFold database proteome shards for a list of taxids
+```
+$
+```
+
