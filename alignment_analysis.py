@@ -86,12 +86,16 @@ def generate_control_dictionary(control_dir):
                         control_dict[query]['fident_avg'] += fident
 
     # update running totals and save as averages 
+    hc_count = 0 
     for query in control_dict:
         control_dict[query]['algn_fraction'] = control_dict[query]['counts'] / total_taxon
         control_dict[query]['tm_score_avg'] =  control_dict[query]['tm_score_avg'] /  control_dict[query]['counts']
         control_dict[query]['tcov_avg'] =  control_dict[query]['tcov_avg'] /  control_dict[query]['counts']
         control_dict[query]['fident_avg'] =  control_dict[query]['fident_avg'] /  control_dict[query]['counts']
+        if control_dict[query]['algn_fraction'] >= 0.8:
+            hc_count += 1
     
+    print(hc_count)
     # save to json 
     with open(control_dir + '/control_alignment_statistics.json', 'w+') as o_file:
         json.dump(control_dict, o_file, indent=2) 
@@ -235,7 +239,6 @@ def main():
     parser.add_argument('-o','--std_out',  action='store_true', help='output csv table of results to std_out')
     parser.add_argument('-p','--pdb_database', type=str, help='path to database of pdb files used in alignment')
     parser.add_argument('-v','--validation_ids', type=str, help='path to a txt file of structure IDs to pull from results')
-    parser.add_argument('')
     args = parser.parse_args()   
 
     # either generate the control dictionary or load it from previous run 
