@@ -358,6 +358,7 @@ def main():
     parser.add_argument('-a2','--aln_tsv2', type=str, help='path to second alignment file')
     parser.add_argument('-c1','--controls1', type=str, help='paths to a directory of control alignments')
     parser.add_argument('-c2','--controls2', type=str, help='paths to a directory of control alignments')
+    parser.add_argument('-o','--output_path', type=str, help='output path for figure')
     args = parser.parse_args()
 
     # generate control database statistics for each alignment file 
@@ -368,12 +369,12 @@ def main():
     data_table1 = aa.alignment_stats(args.aln_tsv1, control_dict1)
     data_table2 = aa.alignment_stats(args.aln_tsv2, control_dict2)
 
-    #table_to_csv(data_table2, '/storage1/gabe/proteome/final_figs/overcontrolhits.csv')
+    #table_to_csv(data_table2, 'dt.csv')
 
-    #multi_panel_alignmentspace(data_table1, data_table2, 'Legionella - Human', 'wMel - Drosophila', '/storage1/gabe/proteome/final_figs/alignment_space_seq-vs-pctfl.png')
+   # multi_panel_alignmentspace(data_table1, data_table2, 'Legionella - Human', 'wMel - Drosophila', )
     mp_label_array = [['tcov', 'tcov'],
                       ['tm-score', 'tm-score']]
-    multi_panel_hist_scatter(data_table1, data_table2, mp_label_array, 'Legionella - Human', 'wMel - Drosophila',  '/storage1/gabe/proteome/final_figs/alignment_space_mp_scatterhist_alt_colorbar.png')
+    multi_panel_hist_scatter(data_table1, data_table2, mp_label_array, 'Helicobacter pylori - Human', 'Legionella - Human', args.output_path)
 
 if __name__ == '__main__':
     main()
