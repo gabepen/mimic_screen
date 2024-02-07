@@ -95,7 +95,7 @@ def generate_control_dictionary(control_dir):
         if control_dict[query]['algn_fraction'] >= 0.8:
             hc_count += 1
     
-    print(hc_count)
+    
     # save to json 
     with open(control_dir + '/control_alignment_statistics.json', 'w+') as o_file:
         json.dump(control_dict, o_file, indent=2) 
@@ -182,11 +182,12 @@ def results_to_stdout(data_table, query_db):
 
     # get results 
     average_pLDDTs = {}
+    pairs = set()
     for row in data_table:
 
         if row[-1] == 'filtered':
             continue
-            
+        
         # store average pLDDTS
         if row[0] not in average_pLDDTs and query_db != None:
             average_pLDDTs[row[0]] = calculate_average_pLDDT(query_db + '/' + row[0])
@@ -199,10 +200,14 @@ def results_to_stdout(data_table, query_db):
         target_id = re.search(f'{start}(.*?){end}', row[5]).group(1) if re.search(f'{start}(.*?){end}', row[5]) else row[5]
         query_id = re.search(f'{start}(.*?){end}', row[0]).group(1) if re.search(f'{start}(.*?){end}', row[0]) else row[0].split('_')[0]
 
-        # match order of existing table in paper 
-        output = [query_id, target_id, row[1], row[2], row[3], row[4],  average_pLDDTs[row[0]], row[-1]]
-        output = map(str, output)
-        print(','.join(output))
+        alignment_pair  = (query_id, target_id) 
+        
+        if alignment_pair not in pairs:
+            # format output order
+            output = [query_id, target_id, row[1], row[2], row[3], row[4],  average_pLDDTs[row[0]], row[-1]]
+            output = map(str, output)
+            pairs.add(alignment_pair)
+            print(','.join(output))
 
 def plot_freeliving_fraction_distribution(data_table, output_path):
 
@@ -253,7 +258,7 @@ def main():
     
     # plot histogram of freeliving fraction values for alignment
     if args.fid_plot:
-        plot_freeliving_fraction_distribution(data_table, args.fidplot)
+        plot_freeliving_fraction_distribution(data_table, args.fid_plot)
     
     # output csv to stdout
     if args.std_out and args.pdb_database:
