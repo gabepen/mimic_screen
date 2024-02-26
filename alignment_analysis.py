@@ -70,6 +70,7 @@ def generate_control_dictionary(control_dir):
                 tcov = float(lp[6]) 
                 qcov = float(lp[7])
                 fident = float(lp[12])
+                
 
                 # check for RBH hit within accepted evalue range
                 if evalue < 0.01 and score > 0.3:
@@ -130,24 +131,25 @@ def alignment_stats(alignment, control_dict):
             fident = float(lp[12])
             score = lp[3]
             tcov =  float(lp[6])
-
+            qcov = float(lp[7])
+                
             # alignment base statistic requirements
-            if float(score) > 0.4 and tcov > 0.25 and evalue < 0.01:
+            if float(score) > 0.4 and  evalue < 0.01 and (tcov >= 0.25 or qcov >= 0.5):
 
                 # check presence in control proteomes
                 if query in control_dict:
                     if control_dict[query]['algn_fraction'] > 0.8:
-                        data_table.append([query, float(score), tcov, fident, control_dict[query]['algn_fraction'], target, 'controlled'])
+                        data_table.append([query, float(score), tcov, qcov, fident, control_dict[query]['algn_fraction'], target, 'controlled'])
                     else:
-                        data_table.append([query, float(score), tcov, fident, control_dict[query]['algn_fraction'], target, 'candidate'])
+                        data_table.append([query, float(score), tcov, qcov, fident, control_dict[query]['algn_fraction'], target, 'candidate'])
                 else:
-                    data_table.append([query, float(score), tcov, fident,0.0, target,'candidate'])      
+                    data_table.append([query, float(score), tcov, qcov, fident,0.0, target,'candidate'])      
 
             else:
                 try:
-                    data_table.append([query, float(score), tcov, fident, control_dict[query]['algn_fraction'], target, 'filtered'])
+                    data_table.append([query, float(score), tcov, qcov, fident, control_dict[query]['algn_fraction'], target, 'filtered'])
                 except KeyError:
-                    data_table.append([query, float(score), tcov, fident,0.0, target,'filtered']) 
+                    data_table.append([query, float(score), tcov, qcov, fident,0.0, target,'filtered']) 
 
             
     return data_table
@@ -168,10 +170,10 @@ def validation(data_table, ids_of_interest):
                 start = 'AF-'
                 end = '-F1'
                 query_id = re.search(f'{start}(.*?){end}', row[0]).group(1) if re.search(f'{start}(.*?){end}', row[0]) else row[0]
-                target_id = re.search(f'{start}(.*?){end}', row[5]).group(1) if re.search(f'{start}(.*?){end}', row[5]) else row[5]
+                target_id = re.search(f'{start}(.*?){end}', row[6]).group(1) if re.search(f'{start}(.*?){end}', row[6]) else row[6]
 
                 # match order of existing table in paper 
-                output = [query_id, target_id, row[1], row[2], row[3], row[4],  average_pLDDTs[uni_id]]
+                output = [query_id, target_id, row[1], row[2], row[3], row[4], row[5], average_pLDDTs[uni_id]]
                 output = map(str, output)
                 print(','.join(output))
 
@@ -197,14 +199,14 @@ def results_to_stdout(data_table, query_db):
         # clean up file name to just have UNIProt ID
         start = 'AF-'
         end = '-F1'
-        target_id = re.search(f'{start}(.*?){end}', row[5]).group(1) if re.search(f'{start}(.*?){end}', row[5]) else row[5]
+        target_id = re.search(f'{start}(.*?){end}', row[6]).group(1) if re.search(f'{start}(.*?){end}', row[6]) else row[6]
         query_id = re.search(f'{start}(.*?){end}', row[0]).group(1) if re.search(f'{start}(.*?){end}', row[0]) else row[0].split('_')[0]
 
         alignment_pair  = (query_id, target_id) 
         
         if alignment_pair not in pairs:
             # format output order
-            output = [query_id, target_id, row[1], row[2], row[3], row[4],  average_pLDDTs[row[0]], row[-1]]
+            output = [query_id, target_id, row[1], row[2], row[3], row[4], row[5],  average_pLDDTs[row[0]], row[-1]]
             output = map(str, output)
             pairs.add(alignment_pair)
             print(','.join(output))
