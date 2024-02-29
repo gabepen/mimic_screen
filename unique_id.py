@@ -8,7 +8,7 @@ def collect_unqiue_ids(results_file, threshold):
        outputs a list of unique target uniprot ids to stdout within a threshold 
        
        format for results file is expected to be as follows:
-       queryID,targetID,tm-score,tcov,fid,fraction-freeliving,avgPLDDT,controlstat
+       queryID,targetID,tm-score,tcov,qcov,fid,fraction-freeliving,avgPLDDT,controlstat
     '''
     
     with open(results_file) as csv_f:
@@ -19,11 +19,11 @@ def collect_unqiue_ids(results_file, threshold):
             l = l.split(',')
 
             low_score = min(low_score, float(l[2]))
-            if float(l[5]) <= float(threshold) and l[0] not in query_ids:
+            if float(l[6]) <= float(threshold) and l[0] not in query_ids:
                 #print(l[0])
                 query_ids.add(l[0])
             
-            if float(l[5]) <= float(threshold) and l[1] not in target_ids:
+            if float(l[6]) <= float(threshold) and l[1] not in target_ids:
                 print(l[1])
                 target_ids.add(l[1])
         

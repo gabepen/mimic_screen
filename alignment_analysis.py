@@ -134,7 +134,7 @@ def alignment_stats(alignment, control_dict):
             qcov = float(lp[7])
                 
             # alignment base statistic requirements
-            if float(score) > 0.4 and  evalue < 0.01 and (tcov >= 0.25 or qcov >= 0.5):
+            if float(score) > 0.4 and  evalue < 0.01 and (tcov > 0.25): # or qcov >= 0.8
 
                 # check presence in control proteomes
                 if query in control_dict:
