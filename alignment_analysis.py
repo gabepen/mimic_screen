@@ -134,7 +134,7 @@ def alignment_stats(alignment, control_dict):
             qcov = float(lp[7])
                 
             # alignment base statistic requirements
-            if float(score) > 0.4 and  evalue < 0.01 and (tcov > 0.25): # or qcov >= 0.8
+            if float(score) > 0.4 and  evalue < 0.01 and (tcov > 0.25 or qcov >= 0.5):
 
                 # check presence in control proteomes
                 if query in control_dict:
@@ -154,17 +154,19 @@ def alignment_stats(alignment, control_dict):
             
     return data_table
 
-def validation(data_table, ids_of_interest):
+def validation(data_table, ids_of_interest, structure_db=None):
 
     # find validation IDs in results
     average_pLDDTs = {}
     for row in data_table:
+        if row[-1] == 'filtered':
+            continue
         for uni_id in ids_of_interest:
             if uni_id in row[0]:
 
                 # want to know the correlation between free living presence and pLDDT
-                if uni_id not in average_pLDDTs:
-                    average_pLDDTs[uni_id] = calculate_average_pLDDT(legion_db + '/' + row[0])
+                if uni_id not in average_pLDDTs and structure_db != None:
+                    average_pLDDTs[uni_id] = calculate_average_pLDDT(structure_db + '/' + row[0])
             
                 # clean up file name to just have UNIProt ID
                 start = 'AF-'
@@ -278,7 +280,7 @@ def main():
                 ids_of_interest.add(struct_id.strip())
 
         # find ids and print to std_out in csv format
-        validation(data_table, ids_of_interest)
+        validation(data_table, ids_of_interest, args.pdb_database)
 
 if __name__ == '__main__':
     main()
