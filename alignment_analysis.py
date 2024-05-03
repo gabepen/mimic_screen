@@ -187,6 +187,7 @@ def results_to_stdout(data_table, query_db):
     # get results 
     average_pLDDTs = {}
     pairs = set()
+    ids = set()
     for row in data_table:
 
         if row[-1] == 'filtered':
@@ -203,14 +204,15 @@ def results_to_stdout(data_table, query_db):
         end = '-F1'
         target_id = re.search(f'{start}(.*?){end}', row[6]).group(1) if re.search(f'{start}(.*?){end}', row[6]) else row[6]
         query_id = re.search(f'{start}(.*?){end}', row[0]).group(1) if re.search(f'{start}(.*?){end}', row[0]) else row[0].split('_')[0]
-
+        
         alignment_pair  = (query_id, target_id) 
         
-        if alignment_pair not in pairs:
+        if alignment_pair not in pairs and query_id not in ids:
             # format output order
             output = [query_id, target_id, row[1], row[2], row[3], row[4], row[5],  average_pLDDTs[row[0]], row[-1]]
             output = map(str, output)
             pairs.add(alignment_pair)
+            ids.add(query_id)
             print(','.join(output))
 
 def plot_freeliving_fraction_distribution(data_table, output_path):

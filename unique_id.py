@@ -24,14 +24,13 @@ def collect_unqiue_ids(results_file, threshold):
                 query_ids.add(l[0])
             
             if float(l[6]) <= float(threshold) and l[1] not in target_ids:
-                print(l[1])
+                #print(l[1])
                 target_ids.add(l[1])
         
                 
 def main():
     
     '''collect unique IDs from results file based on fraction freeliving proteomes aligned threshold
-    
        inteneded for preparing list of accession for GO enrichment analysis 
     '''
 
