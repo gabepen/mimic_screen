@@ -1,0 +1,11 @@
+# Required files 
+query_proteome: "data/wmel.faa"
+accession_list: "data/wmel_top.txt"
+
+# Required values 
+microbe_id: '163164'
+taxon_id: '953'
+work_dir: 'outputs'
+
+#Resource values
+mmseq_threads: '40'

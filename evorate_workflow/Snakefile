@@ -1,0 +1,88 @@
+configfile: "config/config.yaml"
+
+samples = []
+with open(config["accession_list"], 'r') as file:
+    for line in file:
+        samples.append(line.strip())
+work_dir = config["work_dir"]
+
+rule all:
+    input:
+        expand("{work_dir}/results/{sample}_absrel.json", work_dir=config["work_dir"], sample=samples)
+
+rule download_and_rbh:
+    input:
+        query_proteome=config["query_proteome"]
+    params:
+        threads=config["mmseq_threads"],
+        microbe_id=config["microbe_id"],
+        taxon_id=config["taxon_id"],
+        work_dir=config["work_dir"]
+    output:
+        "{work_dir}/collected_orthologs.txt"    
+    shell:
+        'python scripts/find_orthologs.py -p {input.query_proteome} -t {params.threads} -i {params.microbe_id} -x {params.taxon_id} -w {params.work_dir}'
+
+rule collect_orthologs:
+    input:
+        rules.download_and_rbh.output,
+    params:
+        microbe_id=config["microbe_id"],
+        work_dir=config["work_dir"]
+    output:
+        "{work_dir}/msa_files/{sample}/gene.fna"
+    shell:
+        'python scripts/collect_orthologs.py -i {params.microbe_id} -s {wildcards.sample} -w {params.work_dir}' 
+
+rule hyphy_codon_preprocess:
+    input:
+        "{work_dir}/msa_files/{sample}/gene.fna"
+    output:
+        prot_seqs="{work_dir}/msa_files/{sample}/gene.fna_protein.fas",
+        nuc_seqs="{work_dir}/msa_files/{sample}/gene.fna_nuc.fas"
+    shell:
+        '''
+        hyphy scripts/hyphy/pre-msa.bf --input {input}
+        '''
+
+rule mafft_align:
+    input:
+        "{work_dir}/msa_files/{sample}/gene.fna_protein.fas"
+    output:
+        "{work_dir}/msa_files/{sample}/{sample}_protein.msa"
+    shell:
+        '''
+        mafft --auto {input} > {output}
+        '''
+
+rule hyphy_codon_postprocess:
+    input:
+        prot_msa="{work_dir}/msa_files/{sample}/{sample}_protein.msa",
+        nuc_seqs="{work_dir}/msa_files/{sample}/gene.fna_nuc.fas"
+    output:
+        "{work_dir}/msa_files/{sample}/{sample}_codon.msa"
+    shell:
+        '''
+        hyphy scripts/hyphy/post-msa.bf --protein-msa {input.prot_msa} --nucleotide-sequences {input.nuc_seqs} --output {output}
+        '''
+
+rule iqtree:
+    input:
+        "{work_dir}/msa_files/{sample}/{sample}_codon.msa"
+    output:
+        "{work_dir}/tree_files/{sample}/{sample}.treefile"
+    shell:
+        '''
+        iqtree -s {input} --prefix "{work_dir}/tree_files/{wildcards.sample}/{wildcards.sample}"
+        '''     
+
+rule absrel:
+    input:
+        alignment="{work_dir}/msa_files/{sample}/{sample}_codon.msa",
+        tree="{work_dir}/tree_files/{sample}/{sample}.treefile"
+    output:
+        "{work_dir}/results/{sample}_absrel.json"
+    shell:
+        '''
+        hyphy absrel --alignment {input.alignment} --tree {input.tree} --output {output}
+        '''
