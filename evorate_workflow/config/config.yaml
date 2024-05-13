@@ -4,8 +4,9 @@ accession_list: "data/wmel_top.txt"
 
 # Required values 
 microbe_id: '163164'
-taxon_id: '953'
+taxon_id: '766'
 work_dir: 'outputs'
+max_genomes: '500'
 
 #Resource values
 mmseq_threads: '40'

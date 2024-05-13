@@ -17,11 +17,12 @@ rule download_and_rbh:
         threads=config["mmseq_threads"],
         microbe_id=config["microbe_id"],
         taxon_id=config["taxon_id"],
-        work_dir=config["work_dir"]
+        work_dir=config["work_dir"],
+        max_genomes=config["max_genomes"]
     output:
         "{work_dir}/collected_orthologs.txt"    
     shell:
-        'python scripts/find_orthologs.py -p {input.query_proteome} -t {params.threads} -i {params.microbe_id} -x {params.taxon_id} -w {params.work_dir}'
+        'python scripts/find_orthologs.py -p {input.query_proteome} -t {params.threads} -i {params.microbe_id} -x {params.taxon_id} -w {params.work_dir} -m {params.max_genomes}'
 
 rule collect_orthologs:
     input:

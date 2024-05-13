@@ -4,6 +4,7 @@ from tqdm import tqdm
 import os
 import zipfile
 import shutil
+import random
 
 def taxonkit_get_subtree(taxid):
 
@@ -16,15 +17,23 @@ def taxonkit_get_subtree(taxid):
     
     return output[1:]
 
-def download_genomes(id_list, workdir):
+def download_genomes(id_list, max_genome_count, workdir):
     
     '''uses ncbi datasets to download genomes for a list of taxids'''
     
     # Create a directory to store the genomes
     os.makedirs(workdir + '/genomes', exist_ok=True)
     
+    # shuffle taxid list 
+    random.shuffle(id_list)
+    
     # Download the genomes
+    max_genome_count = min(max_genome_count, len(id_list))
     for taxid in tqdm(id_list):
+        
+        # Break if we have reached the maximum number of genomes
+        if max_genome_count == 0:
+            break
         
         if not taxid:
             continue
@@ -45,9 +54,14 @@ def download_genomes(id_list, workdir):
             "--assembly-version", "latest", "--released-after", "01/01/2022",
         ]
         download_command = ' '.join(download_command)
+        # Run the download command and capture the output
+        dl_output = subprocess.run(download_command, shell=True, capture_output=True)
         
-        # Run the download command retrying upon errors up to 10 times 
-        subprocess.run(download_command, shell=True)
+        # Check the return code of the subprocess to determine if a download was successful
+        if dl_output.returncode == 0:
+            max_genome_count -= 1
+        else:
+            continue
 
 def mmseq2_RBH(query_proteome, query_id, workdir, threads=1):
     
@@ -114,11 +128,10 @@ def main():
     parser = argparse.ArgumentParser(description="RBH blastp analysis for identifying orthologs")
     parser.add_argument("-p", "--query_proteome", help="Path to the query proteome file")
     parser.add_argument("-i", "--query_id", help="ID of the query microbe")
-    parser.add_argument("-s", "--query_sequence", help="Specific query sequence from the proteome")
     parser.add_argument("-x", "--taxid", type=int, help="Taxonomy ID for the species of interest")
-    parser.add_argument("-n", "--nrdb_path", help="Path to the nr database")
     parser.add_argument("-w", "--workdir", default="work", help="Path to the working directory")
     parser.add_argument("-t", "--threads", type=int, help="Number of threads for mmseqs to use")
+    parser.add_argument("-m", "--max_genome_count", default=300, type=int, help="max number of genomess to download")
     args = parser.parse_args()
 
     # make workdir
@@ -126,7 +139,7 @@ def main():
     
     # Collect genome fastas for the taxid group
     id_list = taxonkit_get_subtree(args.taxid)
-    download_genomes(id_list, args.workdir)
+    download_genomes(id_list, args.max_genome_count, args.workdir)
     
     # Run mmseq2 analysis 
     mmseq2_RBH(args.query_proteome, args.query_id, args.workdir)

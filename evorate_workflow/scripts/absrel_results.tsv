@@ -1,17 +1,30 @@
-Sample	Avergae Corrected P-value
-WP_006280069.1_absrel.json	1.0
-WP_010962436.1_absrel.json	0.9324324527760237
-WP_010962411.1_absrel.json	0.9622014792418204
-WP_010962519.1_absrel.json	0.9823227720613127
-WP_010962698.1_absrel.json	0.9388609091994202
-WP_010962853.1_absrel.json	0.9051498469265343
-WP_010962700.1_absrel.json	0.9207436395615862
-WP_010082675.1_absrel.json	0.9133382610382791
-WP_010962692.1_absrel.json	0.920472895286645
-WP_010962962.1_absrel.json	0.9509138562649924
-WP_010962598.1_absrel.json	0.6796014226328445
-WP_010962790.1_absrel.json	0.9866830532083105
-WP_010962856.1_absrel.json	0.979808463609741
-WP_006280257.1_absrel.json	0.9878552994011021
-WP_010962656.1_absrel.json	1.0
-WP_010962854.1_absrel.json	0.9726027635932988
+Sample	Avergae Corrected P-value	significant selection signals
+WP_006280069.1_absrel.json	1.0	0
+WP_010962436.1_absrel.json	0.93	4
+WP_010962411.1_absrel.json	0.96	2
+WP_010962519.1_absrel.json	0.98	2
+WP_010962698.1_absrel.json	0.94	6
+WP_010962853.1_absrel.json	0.91	8
+WP_010962700.1_absrel.json	0.92	5
+WP_010082675.1_absrel.json	0.91	0
+WP_010962692.1_absrel.json	0.92	5
+WP_010962962.1_absrel.json	0.95	5
+WP_010962598.1_absrel.json	0.68	22
+WP_010962790.1_absrel.json	0.99	1
+WP_010962856.1_absrel.json	0.98	1
+WP_006280257.1_absrel.json	0.99	1
+WP_010962656.1_absrel.json	1.0	0
+WP_010962854.1_absrel.json	0.97	2
+WP_010962910.1_absrel.json	0.88	13
+WP_010081988.1_absrel.json	0.97	0
+WP_010962309.1_absrel.json	1.0	0
+WP_010962371.1_absrel.json	0.99	0
+WP_010962828.1_absrel.json	0.98	1
+WP_010962837.1_absrel.json	0.81	11
+WP_010963006.1_absrel.json	0.98	2
+WP_010962628.1_absrel.json	0.89	9
+WP_010962900.1_absrel.json	0.98	1
+WP_010963155.1_absrel.json	0.96	4
+WP_010082157.1_absrel.json	0.99	0
+WP_010082532.1_absrel.json	0.98	1
+WP_010082541.1_absrel.json	0.94	3

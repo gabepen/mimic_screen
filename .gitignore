@@ -1,5 +1,4 @@
 **/*.json
 /evorate_workflow/outputs/
-/evorate_workflow/hp_outputs/
 /evorate_workflow/.snakemake/
 /evorate_workflow/data/*.faa
