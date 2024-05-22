@@ -9,7 +9,7 @@ work_dir = config["work_dir"]
 rule all:
     input:
         expand("{work_dir}/results/{sample}_absrel.json", work_dir=config["work_dir"], sample=samples)
-
+        
 rule download_and_rbh:
     input:
         query_proteome=config["query_proteome"]
@@ -76,7 +76,7 @@ rule iqtree:
         "{work_dir}/tree_files/{sample}/{sample}.treefile"
     shell:
         '''
-        iqtree -s {input} --prefix "{work_dir}/tree_files/{wildcards.sample}/{wildcards.sample}" --quiet
+        iqtree -s {input} --prefix "{work_dir}/tree_files/{wildcards.sample}/{wildcards.sample}" -nt AUTO --quiet
         '''     
 
 rule absrel:

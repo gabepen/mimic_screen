@@ -1,0 +1,40 @@
+executor: slurm
+use-conda: False
+jobs: 100 # Have up to N jobs submitted at any given time
+latency-wait: 30 # Wait N seconds for output files due to latency
+retries: 2 # Retry jobs N times.
+max-jobs-per-second: 5
+max-status-checks-per-second: 5
+keep-going: True
+
+# These resources will be applied to all rules. Can be overriden on a per-rule basis below.
+default-resources:
+  slurm_partition: "medium"
+  slurm_account: # Same as sbatch -A. Not all clusters use this.
+  runtime: 180 # In minutes
+  mem_mb: 30000 # In MB
+
+set-resources:
+  download_and_rbh:
+    slurm_partition: "medium"
+    slurm_account: # Same as sbatch -A. Not all clusters use this.
+    runtime: 600 # In minutes
+  collect_orthologs:
+    slurm_partition: "short"
+    slurm_accout: # Same as sbatch -A. Not all clusters use this.
+    runtime: 60 # In minutes
+  iqtree:
+    slurm_partition: "medium"
+    slurm_account: # Same as sbatch -A. Not all clusters use this.
+    runtime: 300 # In minutes
+  absrel:
+    slurm_partition: "medium"
+    slurm_account: # Same as sbatch -A. Not all clusters use this.
+    runtime: 600 # In minutes
+
+set-threads:
+  download_and_rbh: 80
+  collect_orthologs: 1
+  iqtree: 20
+  absrel: 1
+
