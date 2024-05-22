@@ -6,7 +6,7 @@ def parse_absrel_results(directory, test_type):
     
     # output csv 
     with open('absrel_results.tsv', 'w') as out:
-        out.write('Sample\tAvergae Corrected P-value\tsignificant selection signals\n')
+        out.write('Sample\tAvergae Corrected P-value\tsignificant selection branches\n')
         # parse directory of absrel result json files
         for filename in os.listdir(directory):
             if filename.endswith('.json'):
@@ -19,7 +19,7 @@ def parse_absrel_results(directory, test_type):
                     selection_pvalues = 0
                     for branch in data['branch attributes']['0']:
                         corrected_pvalues.append(data['branch attributes']['0'][branch]['Corrected P-value'])
-                        if data['branch attributes']['0'][branch]['Corrected P-value'] < 0.1:
+                        if data['branch attributes']['0'][branch]['Corrected P-value'] < 0.05:
                             selection_pvalues += 1
             out.write(f"{filename}\t{round(sum(corrected_pvalues)/len(corrected_pvalues), 2)}\t{selection_pvalues}\n")  
     

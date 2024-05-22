@@ -4,7 +4,7 @@ from tqdm import tqdm
 import zipfile 
 import shutil
 import subprocess
-
+from loguru import logger
 
 def collect_ortholog_seqs(workdir, query_sequence):
     
@@ -21,10 +21,11 @@ def collect_ortholog_seqs(workdir, query_sequence):
     
     # means accession was not found in query proteome
     if len (ortho_accessions) == 0:
+        logger.warning(f"No orthologs found for {query_sequence}")
         return None
     
     # download ortholog sequences from NCBI datasets as one fasta file 
-    print(f"downloading {len(ortho_accessions)} ortholog sequences of {query_sequence} from NCBI datasets...")
+    logger.info(f"Downloading {len(ortho_accessions)} ortholog sequences of {query_sequence} from NCBI datasets.")
     output_path = f"{workdir}/msa_files/{query_sequence}_orthologs_dataset.zip"
     download_command = f"datasets download gene accession {' '.join(ortho_accessions)} --include gene --filename {output_path}"
     subprocess.run(download_command, shell=True)
@@ -89,8 +90,12 @@ def main():
     parser.add_argument("-s", "--query_sequence", help="Specific query sequence from the proteome")
     parser.add_argument("-w", "--workdir", help="Path to the working directory")
     parser.add_argument("-t", "--threads", type=int, help="Number of threads for mmseqs to use")
+    parser.add_argument("-l", "--log", default='logs/', help="Path to the log file")
     args = parser.parse_args()
     
+    # initialize logging 
+    logger.remove()  # Remove default handler
+    logger.add(f"{args.log}/ortholog_collection/{args.query_sequence}_orthologs.log", rotation="500 MB") # Add a log file handler
     
     collect_ortholog_accesssions(args.query_sequence, args.query_id, args.workdir)
 

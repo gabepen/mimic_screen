@@ -1,12 +1,15 @@
 # Required files 
-query_proteome: "data/wmel.faa"
-accession_list: "data/wmel_top.txt"
+query_proteome: "data/hpylori_proteome.faa"
+accession_list: "data/helicobacter_ALL.txt"
 
 # Required values 
-microbe_id: '163164'
-taxon_id: '766'
+microbe_id: '85962'
+taxon_id: '213849'
 work_dir: 'outputs'
-max_genomes: '500'
+max_genomes: '1000'
+
+# Logging
+log_path: 'logs/'
 
 #Resource values
 mmseq_threads: '40'

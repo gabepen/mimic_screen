@@ -5,15 +5,16 @@ import os
 import zipfile
 import shutil
 import random
+from loguru import logger
 
 def taxonkit_get_subtree(taxid):
 
     '''Uses taxonkit to generate a list of subspecies for a given taxid'''
     
-    print(f"Getting subtree ids for taxid: {taxid}")
     taxonkit_command = f"taxonkit list --ids {taxid} --indent ''"
     result = subprocess.run(taxonkit_command, shell=True, capture_output=True)
     output = result.stdout.decode().splitlines()
+    logger.info(f"Subtree taxid: {taxid} Size: {len(output)}")
     
     return output[1:]
 
@@ -27,7 +28,20 @@ def download_genomes(id_list, max_genome_count, workdir):
     # shuffle taxid list 
     random.shuffle(id_list)
     
+    # Log download command 
+    download_command = [
+        "datasets", "download", "genome", "taxon", "taxid",
+        "--filename", f"workdir/genomes/taxid_dataset.zip",
+        "--include", "gff3,protein", "--annotated",
+        "--assembly-source", "RefSeq", "--assembly-level", "complete",
+        "--assembly-version", "latest", "--released-after", "01/01/2016",
+    ]
+    download_command = ' '.join(download_command)
+    logger.info("ncbi datasets download command:" + download_command)
+        
+    
     # Download the genomes
+    potential_dl_count = min(max_genome_count, len(id_list))
     max_genome_count = min(max_genome_count, len(id_list))
     for taxid in tqdm(id_list):
         
@@ -51,18 +65,32 @@ def download_genomes(id_list, max_genome_count, workdir):
             "--filename", f"{workdir}/genomes/{taxid}_dataset.zip",
             "--include", "gff3,protein", "--annotated",
             "--assembly-source", "RefSeq", "--assembly-level", "complete",
-            "--assembly-version", "latest", "--released-after", "01/01/2022",
+            "--assembly-version", "latest", "--released-after", "01/01/2016",
         ]
         download_command = ' '.join(download_command)
+        
         # Run the download command and capture the output
         dl_output = subprocess.run(download_command, shell=True, capture_output=True)
         
         # Check the return code of the subprocess to determine if a download was successful
         if dl_output.returncode == 0:
+            
+            # logging output 
+            dl_error_message = dl_output.stderr.decode().split('\n')
+            dl_error_message = dl_error_message[1].strip().split('[')[0]
+            logger.info(f"{dl_error_message} for taxid {taxid}")
+            
+            # mark a succesful genome download 
             max_genome_count -= 1
         else:
+            dl_error_message = dl_output.stderr.decode().split('\n')
+            dl_error_message = dl_error_message[1].strip().replace('Error:', '')
+            logger.warning(f"Failed to download genome for taxid {taxid}, {dl_error_message}")
             continue
 
+    # Log the number of genomes downloaded
+    logger.info(f"Downloaded {potential_dl_count - max_genome_count} genomes of {potential_dl_count} requested")
+    
 def mmseq2_RBH(query_proteome, query_id, workdir, threads=1):
     
     # create results directory 
@@ -88,7 +116,7 @@ def mmseq2_RBH(query_proteome, query_id, workdir, threads=1):
             t_fasta = os.path.join(data_dir, subdir, 'protein.faa')
             
             # Run mmseqs easy-rbh to identify orthologs
-            mmseqs_command = f"mmseqs easy-rbh {query_proteome} {t_fasta} {workdir}/rbh_results/{query_id}_{taxid}_{genome_accession}.tsv {workdir}/tmp --threads {threads}"
+            mmseqs_command = f"mmseqs easy-rbh {query_proteome} {t_fasta} {workdir}/rbh_results/{query_id}_{taxid}_{genome_accession}.tsv {workdir}/tmp --threads {threads} > /dev/null"
             subprocess.run(mmseqs_command, shell=True)
             # Clean up the extracted files
             shutil.rmtree(extract_dir)
@@ -132,8 +160,13 @@ def main():
     parser.add_argument("-w", "--workdir", default="work", help="Path to the working directory")
     parser.add_argument("-t", "--threads", type=int, help="Number of threads for mmseqs to use")
     parser.add_argument("-m", "--max_genome_count", default=300, type=int, help="max number of genomess to download")
+    parser.add_argument("-l", "--log", default="logs/", help="log file name")
     args = parser.parse_args()
 
+    # initialize logging 
+    logger.remove()  # Remove default handler
+    logger.add(args.log + 'find_orthologs.log', rotation="500 MB") # Add a log file handler
+    
     # make workdir
     os.makedirs(args.workdir, exist_ok=True)
     
