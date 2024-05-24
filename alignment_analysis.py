@@ -9,6 +9,8 @@ from statistics import mean
 from Bio.PDB import PDBParser
 import matplotlib.pyplot as plt
 from matplotlib.ticker import StrMethodFormatter, PercentFormatter
+import parse_hyphy_output
+import pandas as pd
 
 def calculate_average_pLDDT(pdb_file):
     
@@ -132,16 +134,14 @@ def alignment_stats(alignment, control_dict):
             score = lp[3]
             tcov =  float(lp[6])
             qcov = float(lp[7])
+            
                 
             # alignment base statistic requirements
             if float(score) > 0.4 and  evalue < 0.01 and (tcov > 0.25 or qcov >= 0.5):
-
+                
                 # check presence in control proteomes
                 if query in control_dict:
-                    if control_dict[query]['algn_fraction'] > 0.8:
-                        data_table.append([query, float(score), tcov, qcov, fident, control_dict[query]['algn_fraction'], target, 'controlled'])
-                    else:
-                        data_table.append([query, float(score), tcov, qcov, fident, control_dict[query]['algn_fraction'], target, 'candidate'])
+                    data_table.append([query, float(score), tcov, qcov, fident, control_dict[query]['algn_fraction'], target, 'candidate'])
                 else:
                     data_table.append([query, float(score), tcov, qcov, fident,0.0, target,'candidate'])      
 
@@ -151,7 +151,7 @@ def alignment_stats(alignment, control_dict):
                 except KeyError:
                     data_table.append([query, float(score), tcov, qcov, fident,0.0, target,'filtered']) 
 
-            
+    
     return data_table
 
 def validation(data_table, ids_of_interest, structure_db=None):
@@ -178,14 +178,15 @@ def validation(data_table, ids_of_interest, structure_db=None):
                 output = [query_id, target_id, row[1], row[2], row[3], row[4], row[5], average_pLDDTs[uni_id]]
                 output = map(str, output)
                 print(','.join(output))
+   
 
-def results_to_stdout(data_table, query_db):
+def make_output_df(data_table):
     
-    '''pipe results dataframe to stdout in csv format
+    '''cleans up the results table and returns as a pandas dataframe
     '''
 
+    output_table = []
     # get results 
-    average_pLDDTs = {}
     pairs = set()
     ids = set()
     for row in data_table:
@@ -193,12 +194,6 @@ def results_to_stdout(data_table, query_db):
         if row[-1] == 'filtered':
             continue
         
-        # store average pLDDTS
-        if row[0] not in average_pLDDTs and query_db != None:
-            average_pLDDTs[row[0]] = calculate_average_pLDDT(query_db + '/' + row[0])
-        else:
-            average_pLDDTs[row[0]] = 'NA'
-
         # clean up file name to just have UNIProt ID
         start = 'AF-'
         end = '-F1'
@@ -209,12 +204,16 @@ def results_to_stdout(data_table, query_db):
         
         if alignment_pair not in pairs and query_id not in ids:
             # format output order
-            output = [query_id, target_id, row[1], row[2], row[3], row[4], row[5],  average_pLDDTs[row[0]], row[-1]]
-            output = map(str, output)
+            output = [query_id, target_id, row[1], row[2], row[3], row[4], row[5]]
+            output_table.append(output)
             pairs.add(alignment_pair)
             ids.add(query_id)
-            print(','.join(output))
+            
+    # Convert data_table to pandas DataFrame
+    df = pd.DataFrame(output_table, columns=['query', 'target', 'score', 'tcov', 'qcov', 'fident', 'algn_fraction'])
 
+    return df
+           
 def plot_freeliving_fraction_distribution(data_table, output_path):
 
     '''plots a simple histogram of the pct_freeliving column of a results datatable
@@ -243,13 +242,15 @@ def main():
 
     parser = argparse.ArgumentParser()
 
-    parser.add_argument('-a','--alignment', type=str, help='path to an expiremental alignment file')
+    parser.add_argument('-a','--alignment', type=str, help='path to a foldseek alignment result file')
     parser.add_argument('-c','--controls', type=str, help='paths to a directory of control alignments')
     parser.add_argument('-f','--fid_plot', type=str, help='output path for png of fraction of identical residues histogram')
     parser.add_argument('-j','--json_file', type=str, help='path to a pre-generated json of control alignment stats')
-    parser.add_argument('-o','--std_out',  action='store_true', help='output csv table of results to std_out')
+    parser.add_argument('-o','--csv_out',  type=str, help='output csv table of results to provided path')
     parser.add_argument('-p','--pdb_database', type=str, help='path to database of pdb files used in alignment')
     parser.add_argument('-v','--validation_ids', type=str, help='path to a txt file of structure IDs to pull from results')
+    parser.add_argument('-e','--evorate_analysis', type=str, help='path to evorateworkflow results directory')
+    parser.add_argument('-i','--id_map', type=str, help='path to id mapping file from uniprot')
     args = parser.parse_args()   
 
     # either generate the control dictionary or load it from previous run 
@@ -259,19 +260,22 @@ def main():
         with open(args.json_file, 'r') as json_f:
             control_dictionary = json.load(json_f)
 
-    # generate alignment stats data table 
-    data_table = alignment_stats(args.alignment, control_dictionary)
-    
+    # generate alignment stats data table and then clean up the ids
+    alignment_table = alignment_stats(args.alignment, control_dictionary)
+    alignment_df = make_output_df(alignment_table)
+        
+    # parse evorate analysis and add to current datatable
+    if args.evorate_analysis:
+        evorate_df = parse_hyphy_output.parse_absrel_results(args.evorate_analysis, args.id_map)
+        alignment_df = pd.merge(alignment_df, evorate_df, on='query', how='left')
+        
+    # save dataframe to csv 
+    alignment_df.to_csv(args.csv_out, index=False)
+        
     # plot histogram of freeliving fraction values for alignment
     if args.fid_plot:
         plot_freeliving_fraction_distribution(data_table, args.fid_plot)
     
-    # output csv to stdout
-    if args.std_out and args.pdb_database:
-        results_to_stdout(data_table, args.pdb_database)
-    elif args.std_out:
-        results_to_stdout(data_table, None)
-
     # parse list of validation or general IDs of interest to pull from the results of an alignment
     if args.validation_ids:
         ids_of_interest = set()
