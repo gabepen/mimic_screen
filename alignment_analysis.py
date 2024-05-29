@@ -234,7 +234,7 @@ def plot_freeliving_fraction_distribution(data_table, output_path):
 def plot_evorate_stats(data_frame, output_path):
     # Get the columns for fraction free living aligned and evorate stat
     fraction_freeliving = data_frame['algn_fraction']
-    evorate_stats = data_frame[['selected nonsyn length avgs', 'branches with selection']]
+    evorate_stats = data_frame[['selected_syn_per_site_avg','selected_ns_per_site_avg', 'branch_fraction']]
     
     
     # Create a multipanel scatter plot
@@ -286,11 +286,6 @@ def main():
         evorate_df = parse_hyphy_output.parse_absrel_results(args.evorate_analysis, args.id_map)
         alignment_df = pd.merge(alignment_df, evorate_df, on='query', how='left')
 
-        nan_count = alignment_df['branches with selection'].isna().sum()
-        row_count = alignment_df.shape[0]
-        print(row_count, nan_count)
-        input()
-    
     plot_evorate_stats(alignment_df, '/storage1/gabe/mimic_screen/main_paper/final_figs/evorate_figs/wmel_multipanel_scatter.png')
     # save dataframe to csv 
     alignment_df.to_csv(args.csv_out, index=False)

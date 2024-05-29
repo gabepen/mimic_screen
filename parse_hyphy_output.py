@@ -45,6 +45,8 @@ def parse_absrel_results(directory, id_map_file):
                 sig_full_model_syn_branch_lens = []
                 selection_pvalues = 0
                 
+                
+            
                 # parse each branch in the json file for appropriate info 
                 for branch in json_data['branch attributes']['0']:
                     
@@ -71,11 +73,12 @@ def parse_absrel_results(directory, id_map_file):
                 # add to data frame 
                 data.append({
                     'query': filename,
-                    'nonsyn branch length avgs': sum(full_model_nonsyn_branch_lens) / len(full_model_nonsyn_branch_lens) if full_model_nonsyn_branch_lens else None,
-                    'syn branch length avgs': sum(full_model_syn_branch_lens) / len(full_model_syn_branch_lens) if full_model_syn_branch_lens else None,
-                    'branches with selection': selection_pvalues,
-                    'selected nonsyn length avgs': sum(sig_full_model_nonsyn_branch_lens) / len(sig_full_model_nonsyn_branch_lens) if sig_full_model_nonsyn_branch_lens else None,
-                    'selected syn length avgs': sum(sig_full_model_syn_branch_lens) / len(sig_full_model_syn_branch_lens) if sig_full_model_syn_branch_lens else None
+                    'ns_per_site_avg': sum(full_model_nonsyn_branch_lens) / len(full_model_nonsyn_branch_lens) if full_model_nonsyn_branch_lens else None,
+                    'syn_per_site_avg': sum(full_model_syn_branch_lens) / len(full_model_syn_branch_lens) if full_model_syn_branch_lens else None,
+                    'selection_branch_count': selection_pvalues,
+                    'selected_ns_per_site_avg': sum(sig_full_model_nonsyn_branch_lens) / len(sig_full_model_nonsyn_branch_lens) if sig_full_model_nonsyn_branch_lens else None,
+                    'selected_syn_per_site_avg': sum(sig_full_model_syn_branch_lens) / len(sig_full_model_syn_branch_lens) if sig_full_model_syn_branch_lens else None,
+                    'branch_fraction': selection_pvalues / len(json_data['branch attributes']['0']),
                 })
     
     datatable = pd.DataFrame(data)
@@ -88,12 +91,9 @@ def main():
     parser.add_argument('-t','--test_type', help='Type of test')
     args = parser.parse_args()
     
- 
-    if args.id_map:
-        id_map = load_id_map(args.id_map)
         
     if args.test_type == 'absrel':
-        parse_absrel_results(args.directory, id_map)
+        parse_absrel_results(args.directory, args.id_map)
 
 if __name__ == '__main__':
     main()
