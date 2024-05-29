@@ -179,7 +179,6 @@ def validation(data_table, ids_of_interest, structure_db=None):
                 output = map(str, output)
                 print(','.join(output))
    
-
 def make_output_df(data_table):
     
     '''cleans up the results table and returns as a pandas dataframe
@@ -196,7 +195,7 @@ def make_output_df(data_table):
         
         # clean up file name to just have UNIProt ID
         start = 'AF-'
-        end = '-F1'
+        end = '-F'
         target_id = re.search(f'{start}(.*?){end}', row[6]).group(1) if re.search(f'{start}(.*?){end}', row[6]) else row[6]
         query_id = re.search(f'{start}(.*?){end}', row[0]).group(1) if re.search(f'{start}(.*?){end}', row[0]) else row[0].split('_')[0]
         
@@ -232,6 +231,24 @@ def plot_freeliving_fraction_distribution(data_table, output_path):
     # save plot to output path 
     plt.savefig(output_path)
 
+def plot_evorate_stats(data_frame, output_path):
+    # Get the columns for fraction free living aligned and evorate stat
+    fraction_freeliving = data_frame['algn_fraction']
+    evorate_stats = data_frame[['selected nonsyn length avgs', 'branches with selection']]
+    
+    
+    # Create a multipanel scatter plot
+    fig, axes = plt.subplots(nrows=1, ncols=len(evorate_stats.columns), figsize=(15, 5))
+    
+    # Iterate over each evorate stat column
+    for i, column in enumerate(evorate_stats.columns):
+        ax = axes[i]
+        ax.scatter(fraction_freeliving, evorate_stats[column])
+        ax.set_xlabel('Fraction Freeliving')
+        ax.set_ylabel(column)
+    
+    # Save the plot to the output path
+    plt.savefig(output_path)
 def main():
 
     '''Script that determines the overall presence of wMel protein alignments with the free-living control dataset.
@@ -263,12 +280,18 @@ def main():
     # generate alignment stats data table and then clean up the ids
     alignment_table = alignment_stats(args.alignment, control_dictionary)
     alignment_df = make_output_df(alignment_table)
-        
+    
     # parse evorate analysis and add to current datatable
     if args.evorate_analysis:
         evorate_df = parse_hyphy_output.parse_absrel_results(args.evorate_analysis, args.id_map)
         alignment_df = pd.merge(alignment_df, evorate_df, on='query', how='left')
-        
+
+        nan_count = alignment_df['branches with selection'].isna().sum()
+        row_count = alignment_df.shape[0]
+        print(row_count, nan_count)
+        input()
+    
+    plot_evorate_stats(alignment_df, '/storage1/gabe/mimic_screen/main_paper/final_figs/evorate_figs/wmel_multipanel_scatter.png')
     # save dataframe to csv 
     alignment_df.to_csv(args.csv_out, index=False)
         

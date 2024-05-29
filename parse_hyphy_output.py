@@ -31,7 +31,11 @@ def parse_absrel_results(directory, id_map_file):
             filepath = os.path.join(directory, filename)
             
             with open(filepath) as file:
-                json_data = json.load(file)
+                try:
+                    json_data = json.load(file)
+                # catching empty json files from halted or failed snakemake runs
+                except json.JSONDecodeError:
+                    continue
                 
                 # metrics to collect from the json file
                 corrected_pvalues = []
