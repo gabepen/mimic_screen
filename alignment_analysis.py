@@ -267,10 +267,10 @@ def main():
     parser.add_argument('-f','--fid_plot', type=str, help='output path for png of fraction of identical residues histogram')
     parser.add_argument('-j','--json_file', type=str, help='path to a pre-generated json of control alignment stats')
     parser.add_argument('-o','--csv_out',  type=str, help='output csv table of results to provided path')
-    parser.add_argument('-p','--pdb_database', type=str, help='path to database of pdb files used in alignment')
+    parser.add_argument('-d','--pdb_database', type=str, help='path to database of pdb files used in alignment')
     parser.add_argument('-v','--validation_ids', type=str, help='path to a txt file of structure IDs to pull from results')
     parser.add_argument('-e','--evorate_analysis', type=str, help='path to evorateworkflow results directory')
-    paresr.add_argument('-p','--plot_evorate',  type=str, help='path to evorateworkflow results plot')
+    parser.add_argument('-p','--plot_evorate',  type=str, help='path to evorateworkflow results plot')
     parser.add_argument('-i','--id_map', type=str, help='path to id mapping file from uniprot')
     args = parser.parse_args()   
 
