@@ -3,3 +3,6 @@
 /evorate_workflow/logs/
 /evorate_workflow/.snakemake/
 /evorate_workflow/data/*.faa
+__pycache__/
+evorate_workflow/scripts/__pycache__/
+taxon_selection/__pycache__/

@@ -236,7 +236,9 @@ def plot_evorate_stats(data_frame, output_path):
     fraction_freeliving = data_frame['algn_fraction']
     evorate_stats = data_frame[['selected_syn_per_site_avg','selected_ns_per_site_avg', 'branch_fraction']]
     
-    
+    # Filter the data_frame based on branch fraction
+    filtered_data = data_frame[data_frame['branch_fraction'] > 0]
+
     # Create a multipanel scatter plot
     fig, axes = plt.subplots(nrows=1, ncols=len(evorate_stats.columns), figsize=(15, 5))
     
@@ -249,6 +251,7 @@ def plot_evorate_stats(data_frame, output_path):
     
     # Save the plot to the output path
     plt.savefig(output_path)
+    
 def main():
 
     '''Script that determines the overall presence of wMel protein alignments with the free-living control dataset.
@@ -267,6 +270,7 @@ def main():
     parser.add_argument('-p','--pdb_database', type=str, help='path to database of pdb files used in alignment')
     parser.add_argument('-v','--validation_ids', type=str, help='path to a txt file of structure IDs to pull from results')
     parser.add_argument('-e','--evorate_analysis', type=str, help='path to evorateworkflow results directory')
+    paresr.add_argument('-p','--plot_evorate',  type=str, help='path to evorateworkflow results plot')
     parser.add_argument('-i','--id_map', type=str, help='path to id mapping file from uniprot')
     args = parser.parse_args()   
 
@@ -285,8 +289,9 @@ def main():
     if args.evorate_analysis:
         evorate_df = parse_hyphy_output.parse_absrel_results(args.evorate_analysis, args.id_map)
         alignment_df = pd.merge(alignment_df, evorate_df, on='query', how='left')
-
-    plot_evorate_stats(alignment_df, '/storage1/gabe/mimic_screen/main_paper/final_figs/evorate_figs/wmel_multipanel_scatter.png')
+        if args.plot_evorate:
+            plot_evorate_stats(alignment_df, args.plot_evorate)
+        
     # save dataframe to csv 
     alignment_df.to_csv(args.csv_out, index=False)
         

@@ -5,6 +5,26 @@ import zipfile
 import shutil
 import subprocess
 from loguru import logger
+from Bio import SeqIO
+
+def shorten_sequence_names(fasta_file, max_length):
+    
+    # Parse the FASTA file
+    sequences = SeqIO.parse(fasta_file, "fasta")
+
+    # Create a new list to store the modified sequences
+    modified_sequences = []
+
+    # Iterate over each sequence in the file shorten descriptions
+    for seq in sequences:
+        seq.description = seq.description[:max_length]
+
+        # Add the modified sequence to the list
+        modified_sequences.append(seq)
+
+    # Write the modified sequences back to the FASTA file
+    SeqIO.write(modified_sequences, fasta_file, "fasta")
+
 
 def collect_ortholog_seqs(workdir, query_sequence):
     
@@ -39,6 +59,15 @@ def collect_ortholog_seqs(workdir, query_sequence):
         
     # move protein.faa up two directories
     shutil.move(os.path.join(multiseq_fasta, "ncbi_dataset/data/gene.fna"), multiseq_fasta)
+
+    # Read the gene.fa file to get the number of ortholog sequences
+    gene_fa_file = os.path.join(multiseq_fasta, "gene.fna")
+    with open(gene_fa_file, 'r') as f:
+        num_ortholog_seqs = sum(1 for line in f if line.startswith('>'))
+    logger.info(f"Downloaded {num_ortholog_seqs} ortholog sequences for {query_sequence}")
+    
+    # shorten sequence names to prevent hyphy post-msa.bf errors when seq names are too long
+    shorten_sequence_names(gene_fa_file, 20)
     
     # delete the empty ncbi_dataset directory
     shutil.rmtree(os.path.join(multiseq_fasta, "ncbi_dataset"))
