@@ -1,12 +1,13 @@
 # Required files 
-query_proteome: "data/wmel.faa"
-accession_list: "data/wmel_ALL.txt"
+query_proteome: "data/hpylori_26695.faa"
+accession_list: "data/helicobacter_ALL.txt"
 
 # Required values 
-microbe_id: '163164'
-taxon_id: '766'
-work_dir: 'outputs'
-max_genomes: '500'
+microbe_id: '85962'
+taxon_id: '209'
+work_dir: 'hp_outputs'
+max_genomes: '300'
+hyphy_e_number: '0.05' # sets hyphy pre-process.bf acceptance of low homology sequences (lower float = less stringent)
 
 # Logging
 log_path: 'logs/'

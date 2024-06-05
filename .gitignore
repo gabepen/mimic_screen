@@ -3,3 +3,4 @@
 /evorate_workflow/logs/
 /evorate_workflow/.snakemake/
 /evorate_workflow/data/*.faa
+/evorate_workflow/data/*.zip

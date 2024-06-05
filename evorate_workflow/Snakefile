@@ -40,12 +40,14 @@ rule collect_orthologs:
 rule hyphy_codon_preprocess:
     input:
         "{work_dir}/msa_files/{sample}/gene.fna"
+    params:
+        e_number=config["hyphy_e_number"]
     output:
         prot_seqs="{work_dir}/msa_files/{sample}/gene.fna_protein.fas",
         nuc_seqs="{work_dir}/msa_files/{sample}/gene.fna_nuc.fas"
     shell:
         '''
-        hyphy scripts/hyphy/pre-msa.bf --input {input}
+        hyphy scripts/hyphy/pre-msa.bf --input {input} --E {params.e_number}
         '''
 
 rule mafft_align:

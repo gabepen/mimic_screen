@@ -26,7 +26,7 @@ set-resources:
   iqtree:
     slurm_partition: "medium"
     slurm_account: # Same as sbatch -A. Not all clusters use this.
-    runtime: 300 # In minutes
+    runtime: 600 # In minutes
   absrel:
     slurm_partition: "medium"
     slurm_account: # Same as sbatch -A. Not all clusters use this.
