@@ -1,13 +1,13 @@
 # Required files 
-query_proteome: "data/hpylori_26695.faa"
-accession_list: "data/helicobacter_ALL.txt"
+query_proteome: "data/lp.faa"
+accession_list: "data/legionella_ALL.txt"
 
 # Required values 
-microbe_id: '85962'
-taxon_id: '209'
-work_dir: 'hp_outputs'
+microbe_id: '272624'
+taxon_id: '1236'
+work_dir: 'outputs'
 max_genomes: '300'
-hyphy_e_number: '0.05' # sets hyphy pre-process.bf acceptance of low homology sequences (lower float = less stringent)
+hyphy_e_number: '0.04' # sets hyphy pre-process.bf acceptance of low homology sequences (lower float = less stringent)
 
 # Logging
 log_path: 'logs/'

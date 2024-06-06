@@ -45,10 +45,13 @@ def collect_ortholog_seqs(workdir, query_sequence):
         return None
     
     # download ortholog sequences from NCBI datasets as one fasta file 
-    logger.info(f"Downloading {len(ortho_accessions)} ortholog sequences of {query_sequence} from NCBI datasets.")
     output_path = f"{workdir}/msa_files/{query_sequence}_orthologs_dataset.zip"
     download_command = f"datasets download gene accession {' '.join(ortho_accessions)} --include gene --filename {output_path}"
     subprocess.run(download_command, shell=True)
+    
+    # logging 
+    logger.info(f"Downloading {len(ortho_accessions)} ortholog sequences of {query_sequence} from NCBI datasets.")
+    logger.info(f"Ortholog accession list: {ortho_accessions}")
 
     # extract and return path to protein fasta 
     zip_path = os.path.join(output_path)

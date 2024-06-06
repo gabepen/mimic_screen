@@ -6,6 +6,7 @@ import zipfile
 import shutil
 import random
 from loguru import logger
+import datetime
 
 def taxonkit_get_subtree(taxid):
 
@@ -43,6 +44,7 @@ def download_genomes(id_list, max_genome_count, workdir):
     # Download the genomes
     potential_dl_count = min(max_genome_count, len(id_list))
     max_genome_count = min(max_genome_count, len(id_list))
+    genomes_selected = []
     for taxid in tqdm(id_list):
         
         # Break if we have reached the maximum number of genomes
@@ -82,6 +84,10 @@ def download_genomes(id_list, max_genome_count, workdir):
             
             # mark a succesful genome download 
             max_genome_count -= 1
+            
+            # save taxid 
+            genomes_selected.append(taxid)
+            
         else:
             dl_error_message = dl_output.stderr.decode().split('\n')
             dl_error_message = dl_error_message[1].strip().replace('Error:', '')
@@ -90,6 +96,8 @@ def download_genomes(id_list, max_genome_count, workdir):
 
     # Log the number of genomes downloaded
     logger.info(f"Downloaded {potential_dl_count - max_genome_count} genomes of {potential_dl_count} requested")
+    
+    return genomes_selected
     
 def mmseq2_RBH(query_proteome, query_id, workdir, threads=1):
     
@@ -165,15 +173,22 @@ def main():
 
     # initialize logging 
     logger.remove()  # Remove default handler
-    logger.add(args.log + 'find_orthologs.log', rotation="500 MB") # Add a log file handler
+    timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    log_file = args.log + f"find_orthologs_{timestamp}.log"
+    logger.add(log_file, rotation="500 MB") # Add a log file handler
     
     # make workdir
     os.makedirs(args.workdir, exist_ok=True)
     
     # Collect genome fastas for the taxid group
     id_list = taxonkit_get_subtree(args.taxid)
-    download_genomes(id_list, args.max_genome_count, args.workdir)
+    genomes_selected = download_genomes(id_list, args.max_genome_count, args.workdir)
     
+    # Save list of genomes used for downstream analysis 
+    with(open(f"{args.log}/genomes_selected.txt", 'w')) as f:
+        for taxid in genomes_selected:
+            f.write(f"{taxid}\n")
+        
     # Run mmseq2 analysis 
     mmseq2_RBH(args.query_proteome, args.query_id, args.workdir)
 
