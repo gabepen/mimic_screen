@@ -5,6 +5,7 @@ import os
 from tqdm import tqdm
 import json
 import re
+import sys
 from statistics import mean 
 from Bio.PDB import PDBParser
 import matplotlib.pyplot as plt
@@ -20,28 +21,31 @@ def calculate_average_pLDDT(pdb_file):
     '''
 
     # open and read the pdb file
-    with open(pdb_file) as pf:
-        lines = pf.readlines()
+    try:
+        with open(pdb_file) as pf:
+            lines = pf.readlines()
+    except FileNotFoundError:
+        return 'NA'
+    
+    # parse
+    pLDDTs = []
+    for l in lines:
+        flds = l.strip().split()
 
-        # parse
-        pLDDTs = []
-        for l in lines:
-            flds = l.strip().split()
+        # verify line in file represents an atom
+        if flds[0] == 'ATOM':
 
-            # verify line in file represents an atom
-            if flds[0] == 'ATOM':
-
-                # append to pLDDT list catching issues with formatting of line
-                try:
-                    pLDDTs.append(float(flds[-2]))
-                except IndexError:
-                    print('pLDDT ERROR')
-                    print(pdb_file)
-                    return 'ERR' 
-                
-        # return average pDDT for structure
-        return mean(pLDDTs)
- 
+            # append to pLDDT list catching issues with formatting of line
+            try:
+                pLDDTs.append(float(flds[-2]))
+            except IndexError:
+                print('pLDDT ERROR')
+                print(pdb_file)
+                return 'ERR' 
+            
+    # return average pDDT for structure
+    return mean(pLDDTs)
+    
 def generate_control_dictionary(control_dir):
 
     '''Generates and returns control dictionary which contains statistics for each query protein
@@ -154,30 +158,20 @@ def alignment_stats(alignment, control_dict):
     
     return data_table
 
-def validation(data_table, ids_of_interest, structure_db=None):
+def validation(df, ids_of_interest, structure_db=None):
 
     # find validation IDs in results
     average_pLDDTs = {}
-    for row in data_table:
-        if row[-1] == 'filtered':
-            continue
+    for index, row in df.iterrows():
         for uni_id in ids_of_interest:
-            if uni_id in row[0]:
-
-                # want to know the correlation between free living presence and pLDDT
+            if uni_id in row['query']:
+  
+                # calculate structure prediction confidence
                 if uni_id not in average_pLDDTs and structure_db != None:
-                    average_pLDDTs[uni_id] = calculate_average_pLDDT(structure_db + '/' + row[0])
-            
-                # clean up file name to just have UNIProt ID
-                start = 'AF-'
-                end = '-F1'
-                query_id = re.search(f'{start}(.*?){end}', row[0]).group(1) if re.search(f'{start}(.*?){end}', row[0]) else row[0]
-                target_id = re.search(f'{start}(.*?){end}', row[6]).group(1) if re.search(f'{start}(.*?){end}', row[6]) else row[6]
+                    average_pLDDTs[uni_id] = calculate_average_pLDDT(structure_db + '/AF-' + uni_id + '-F1-model_v4.pdb')
 
-                # match order of existing table in paper 
-                output = [query_id, target_id, row[1], row[2], row[3], row[4], row[5], average_pLDDTs[uni_id]]
-                output = map(str, output)
-                print(','.join(output))
+                row_string = row[['query', 'target', 'score', 'tcov', 'qcov', 'fident', 'algn_fraction', 'branch_fraction']].astype(str).str.cat(sep=',') + ',' + str(average_pLDDTs[uni_id])
+                print(row_string)           
    
 def make_output_df(data_table):
     
@@ -287,6 +281,9 @@ def main():
     
     # parse evorate analysis and add to current datatable
     if args.evorate_analysis:
+        if not args.id_map:
+            print('Please provide an id mapping file to parse evorate results')
+            sys.exit(1)
         evorate_df = parse_hyphy_output.parse_absrel_results(args.evorate_analysis, args.id_map)
         alignment_df = pd.merge(alignment_df, evorate_df, on='query', how='left')
         if args.plot_evorate:
@@ -309,7 +306,7 @@ def main():
                 ids_of_interest.add(struct_id.strip())
 
         # find ids and print to std_out in csv format
-        validation(data_table, ids_of_interest, args.pdb_database)
+        validation(alignment_df, ids_of_interest, args.pdb_database)
 
 if __name__ == '__main__':
     main()
