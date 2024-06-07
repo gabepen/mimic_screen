@@ -228,7 +228,8 @@ def plot_freeliving_fraction_distribution(data_table, output_path):
 def plot_evorate_stats(data_frame, output_path):
     # Get the columns for fraction free living aligned and evorate stat
     fraction_freeliving = data_frame['algn_fraction']
-    evorate_stats = data_frame[['selected_syn_per_site_avg','selected_ns_per_site_avg', 'branch_fraction']]
+    #evorate_stats = data_frame[['selected_syn_per_site_avg','selected_ns_per_site_avg', 'branch_fraction']]
+    evorate_stats = data_frame[['branch_fraction','avg_branch_length','branch_fraction_full_norm']]
     
     # Filter the data_frame based on branch fraction
     filtered_data = data_frame[data_frame['branch_fraction'] > 0]
@@ -245,7 +246,29 @@ def plot_evorate_stats(data_frame, output_path):
     
     # Save the plot to the output path
     plt.savefig(output_path)
+
+def plot_evorate_stats_comp(data_frame, output_path):
+    # Get the columns for fraction free living aligned and evorate stat
+    fraction_freeliving = data_frame['branch_fraction']
+    #evorate_stats = data_frame[['selected_syn_per_site_avg','selected_ns_per_site_avg', 'branch_fraction']]
+    evorate_stats = data_frame[['avg_branch_length','total_branch_length']]
     
+    # Filter the data_frame based on branch fraction
+    filtered_data = data_frame[data_frame['branch_fraction'] > 0]
+
+    # Create a multipanel scatter plot
+    fig, axes = plt.subplots(nrows=1, ncols=len(evorate_stats.columns), figsize=(15, 5))
+    
+    # Iterate over each evorate stat column
+    for i, column in enumerate(evorate_stats.columns):
+        ax = axes[i]
+        ax.scatter(fraction_freeliving, evorate_stats[column])
+        ax.set_xlabel('branch_fraction')
+        ax.set_ylabel(column)
+    
+    # Save the plot to the output path
+    plt.savefig(output_path)
+
 def main():
 
     '''Script that determines the overall presence of wMel protein alignments with the free-living control dataset.

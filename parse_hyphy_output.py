@@ -25,6 +25,9 @@ def parse_absrel_results(directory, id_map_file):
     id_map = load_id_map(id_map_file)
     data = []
     
+    # debug stat tracking
+    tree_lengths = []
+    
     # parse directory of absrel result json files
     for filename in os.listdir(directory):
         if filename.endswith('.json'):
@@ -43,6 +46,7 @@ def parse_absrel_results(directory, id_map_file):
                 full_model_syn_branch_lens = [] # Full adaptive model, the branch lengths under this model for synonymous sites
                 sig_full_model_nonsyn_branch_lens = []
                 sig_full_model_syn_branch_lens = []
+                branch_lengths = []
                 selection_pvalues = 0
                 
                 
@@ -54,7 +58,8 @@ def parse_absrel_results(directory, id_map_file):
                     corrected_pvalues.append(json_data['branch attributes']['0'][branch]['Corrected P-value'])
                     full_model_nonsyn_branch_lens.append(json_data['branch attributes']['0'][branch]['Full adaptive model (non-synonymous subs/site)'])
                     full_model_syn_branch_lens.append(json_data['branch attributes']['0'][branch]['Full adaptive model (synonymous subs/site)'])
-                                                      
+                    branch_lengths.append(json_data['branch attributes']['0'][branch]['Full adaptive model'])  
+                                          
                     # values to store for branches with evidence of selection
                     if json_data['branch attributes']['0'][branch]['Corrected P-value'] < 0.05:
                         selection_pvalues += 1
@@ -76,11 +81,14 @@ def parse_absrel_results(directory, id_map_file):
                     'ns_per_site_avg': sum(full_model_nonsyn_branch_lens) / len(full_model_nonsyn_branch_lens) if full_model_nonsyn_branch_lens else None,
                     'syn_per_site_avg': sum(full_model_syn_branch_lens) / len(full_model_syn_branch_lens) if full_model_syn_branch_lens else None,
                     'selection_branch_count': selection_pvalues,
+                    'total_branch_length': sum(branch_lengths),
+                    'avg_branch_length': sum(branch_lengths) / len(branch_lengths),
                     'selected_ns_per_site_avg': (sum(sig_full_model_nonsyn_branch_lens) / len(sig_full_model_nonsyn_branch_lens)) / len(json_data['branch attributes']['0']) if sig_full_model_nonsyn_branch_lens else None,
                     'selected_syn_per_site_avg': (sum(sig_full_model_syn_branch_lens) / len(sig_full_model_syn_branch_lens)) / len(json_data['branch attributes']['0']) if sig_full_model_syn_branch_lens else None,
                     'branch_fraction': selection_pvalues / len(json_data['branch attributes']['0']),
+                    'branch_fraction_full_norm': (selection_pvalues / len(json_data['branch attributes']['0'])) / (sum(branch_lengths) / len(branch_lengths)),
                 })
-    
+                
     datatable = pd.DataFrame(data)
     return datatable
 
