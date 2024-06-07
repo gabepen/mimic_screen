@@ -59,6 +59,7 @@ def download_genomes(id_list, max_genome_count, workdir):
         
         # skip already downloaded genomes
         if os.path.exists(o_file):
+            max_genome_count += 1
             continue
         
         # run dataset download command 
@@ -99,7 +100,7 @@ def download_genomes(id_list, max_genome_count, workdir):
     
     return genomes_selected
     
-def mmseq2_RBH(query_proteome, query_id, workdir, threads=1):
+def mmseq2_RBH(query_proteome, query_id, workdir, genomes_selected, threads):
     
     # create results directory 
     os.makedirs(workdir + '/rbh_results', exist_ok=True)
@@ -108,14 +109,19 @@ def mmseq2_RBH(query_proteome, query_id, workdir, threads=1):
     for file in os.listdir(workdir + '/genomes'):
         if file.endswith(".zip"):
             
-            # Extract the contents of the zip file to a directory with the same name
+            # Establish paths for genome archive extraction
             zip_path = os.path.join(workdir, 'genomes', file)
             extract_dir = os.path.splitext(zip_path)[0]
+            
+            # check that the genome is in the selected list
+            taxid = extract_dir.split('/')[-1].split('_')[0]
+            if taxid not in genomes_selected:
+                continue
+            
+            # Extract the contents of the zip file to a directory with the same name
             with zipfile.ZipFile(zip_path, 'r') as zip_ref:
                 zip_ref.extractall(extract_dir)
             
-            taxid = extract_dir.split('/')[-1].split('_')[0]
-         
             # select target proteome fasta from extracted files 
             data_dir = os.path.join(extract_dir, 'ncbi_dataset', 'data')
             subdirs = [d for d in os.listdir(data_dir) if os.path.isdir(os.path.join(data_dir, d))]
@@ -123,8 +129,15 @@ def mmseq2_RBH(query_proteome, query_id, workdir, threads=1):
             genome_accession = subdir
             t_fasta = os.path.join(data_dir, subdir, 'protein.faa')
             
+            # Establish the path for the RBH output file
+            rbh_output_path = f"{workdir}/rbh_results/{query_id}_{taxid}_{genome_accession}.tsv"
+            
+            # Check if the rbh results already exist
+            if os.path.exists(rbh_output_path):
+                continue
+            
             # Run mmseqs easy-rbh to identify orthologs
-            mmseqs_command = f"mmseqs easy-rbh {query_proteome} {t_fasta} {workdir}/rbh_results/{query_id}_{taxid}_{genome_accession}.tsv {workdir}/tmp --threads {threads} > /dev/null"
+            mmseqs_command = f"mmseqs easy-rbh {query_proteome} {t_fasta} {rbh_output_path} {workdir}/tmp --threads {threads} > /dev/null"
             subprocess.run(mmseqs_command, shell=True)
             # Clean up the extracted files
             shutil.rmtree(extract_dir)
@@ -190,7 +203,7 @@ def main():
             f.write(f"{taxid}\n")
         
     # Run mmseq2 analysis 
-    mmseq2_RBH(args.query_proteome, args.query_id, args.workdir)
+    mmseq2_RBH(args.query_proteome, args.query_id, args.workdir, genomes_selected, args.threads)
 
 if __name__ == "__main__":
     main()
