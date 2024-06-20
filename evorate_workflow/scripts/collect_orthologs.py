@@ -28,6 +28,7 @@ def shorten_sequence_names(fasta_file, max_length):
 
 def collect_ortholog_seqs(workdir, query_sequence):
     
+
     # create output folder 
     os.makedirs(workdir + '/msa_files', exist_ok=True)
     
@@ -47,18 +48,26 @@ def collect_ortholog_seqs(workdir, query_sequence):
     # download ortholog sequences from NCBI datasets as one fasta file 
     output_path = f"{workdir}/msa_files/{query_sequence}_orthologs_dataset.zip"
     download_command = f"datasets download gene accession {' '.join(ortho_accessions)} --include gene --filename {output_path}"
-    subprocess.run(download_command, shell=True)
     
-    # logging 
-    logger.info(f"Downloading {len(ortho_accessions)} ortholog sequences of {query_sequence} from NCBI datasets.")
-    logger.info(f"Ortholog accession list: {ortho_accessions}")
-
-    # extract and return path to protein fasta 
-    zip_path = os.path.join(output_path)
-    extract_dir = os.path.splitext(zip_path)[0]
-    multiseq_fasta = f"{workdir}/msa_files/{query_sequence}"
-    with zipfile.ZipFile(zip_path, 'r') as zip_ref:
-        zip_ref.extract('ncbi_dataset/data/gene.fna',path=multiseq_fasta)
+    # retry loop for downloading ortholog sequences
+    # intended to catch and rerun 'invalid zip archive' errors from NCBIs req system
+    retries = 3
+    while retries > 0:
+        try:
+            subprocess.run(download_command, shell=True)
+            # logging 
+            logger.info(f"Downloading {len(ortho_accessions)} ortholog sequences of {query_sequence} from NCBI datasets.")
+            logger.info(f"Ortholog accession list: {ortho_accessions}")
+            # extract and return path to protein fasta 
+            zip_path = os.path.join(output_path)
+            extract_dir = os.path.splitext(zip_path)[0]
+            multiseq_fasta = f"{workdir}/msa_files/{query_sequence}"
+            with zipfile.ZipFile(zip_path, 'r') as zip_ref:
+                zip_ref.extract('ncbi_dataset/data/gene.fna',path=multiseq_fasta)
+            break 
+        except FileNotFoundError:
+            retries -= 1
+            logger.warning(f"Error downloading ortholog sequences for {query_sequence}. Retrying {retries} more times.")
         
     # move protein.faa up two directories
     shutil.move(os.path.join(multiseq_fasta, "ncbi_dataset/data/gene.fna"), multiseq_fasta)

@@ -16,14 +16,16 @@ default-resources:
 
 set-resources:
   download_and_rbh:
-    slurm_partition: "medium"
+    slurm_partition: "long"
     slurm_account: # Same as sbatch -A. Not all clusters use this.
-    runtime: 600 # In minutes
+    runtime: 1440 # In minutes
   collect_orthologs:
     slurm_partition: "short"
     slurm_accout: # Same as sbatch -A. Not all clusters use this.
     runtime: 60 # In minutes
     cpus_per_task: 1 
+    retries: 5 
+    jobs: 50
   hyphy_codon_preprocess:
     slurm_partition: "medium"
     slurm_account: # Same as sbatch -A. Not all clusters use this.

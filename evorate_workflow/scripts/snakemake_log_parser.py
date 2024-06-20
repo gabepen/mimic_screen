@@ -70,10 +70,30 @@ def parse_snakemake_log_slurm(slurm_log_file):
                     failed_samples[sample] = [rule, status, status_detail]
 
     return failed_samples
-# Usage example
+
+'''
+Script for parsing snakemake log files for failed samples and failuer reasons 
+
+Usage: python snakemake_log_parser.py log_file output_file rule_spec
+    log_file: path to log file
+    output_file: path to output file for sample accession writing 
+    rule_spec: only write samples that failed at a certain rule to output_file 
+    
+'''
+
 log_file = sys.argv[1]
+output_file = sys.argv[2]
+rule_spec = sys.argv[3]
 
 failed_samples = parse_snakemake_log_slurm(log_file)
+
+if output_file:
+    with open(output_file, 'w') as f:
+        for sample, meta in failed_samples.items():
+            if meta[0] == rule_spec:
+                f.write(f"{sample}\n")
+        print(f"Failed samples written to {output_file}")
+        
 print(f"Number of failed samples: {len(failed_samples)}")
 for sample, meta in failed_samples.items():
     print(f"Sample: {sample} Rule: {meta[0]} Status: {meta[1]}, {meta[2]}")

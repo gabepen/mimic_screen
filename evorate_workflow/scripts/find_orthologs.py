@@ -139,8 +139,10 @@ def mmseq2_RBH(query_proteome, query_id, workdir, genomes_selected, threads):
             # Run mmseqs easy-rbh to identify orthologs
             mmseqs_command = f"mmseqs easy-rbh {query_proteome} {t_fasta} {rbh_output_path} {workdir}/tmp --threads {threads} > /dev/null"
             subprocess.run(mmseqs_command, shell=True)
+            
             # Clean up the extracted files
             shutil.rmtree(extract_dir)
+            
     shutil.rmtree(f"{workdir}/tmp")
             
     # Create a dictionary to store the counts of orthologs for each genome

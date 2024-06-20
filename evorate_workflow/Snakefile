@@ -1,4 +1,4 @@
-configfile: "config/config.yaml"
+configfile: "config/hp_config.yaml"
 
 samples = []
 with open(config["accession_list"], 'r') as file:

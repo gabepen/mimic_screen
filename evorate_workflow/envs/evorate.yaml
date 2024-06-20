@@ -1,4 +1,4 @@
-name: evorate_env
+name: evorate
 channels:
   - bioconda
   - conda-forge
@@ -15,8 +15,8 @@ dependencies:
   - brotli-python=1.1.0=py312h30efb56_1
   - bzip2=1.0.8=hd590300_5
   - c-ares=1.28.1=hd590300_0
-  - ca-certificates=2024.2.2=hbcca054_0
-  - certifi=2024.2.2=pyhd8ed1ab_0
+  - ca-certificates=2024.6.2=hbcca054_0
+  - certifi=2024.6.2=pyhd8ed1ab_0
   - charset-normalizer=3.3.2=pyhd8ed1ab_0
   - coin-or-cbc=2.10.10=h9002f0b_0
   - coin-or-cgl=0.60.7=h516709c_0
@@ -95,11 +95,11 @@ dependencies:
   - mpfr=4.2.1=h9458935_1
   - mpi=1.0=openmpi
   - nbformat=5.10.4=pyhd8ed1ab_0
-  - ncbi-datasets-cli=16.6.0=ha770c72_0
+  - ncbi-datasets-cli=16.20.0=ha770c72_0
   - ncurses=6.4.20240210=h59595ed_0
   - numpy=1.26.4=py312heda63a1_0
   - openmpi=4.1.6=hc5af2df_101
-  - openssl=3.3.0=hd590300_0
+  - openssl=3.3.1=h4ab18f5_0
   - packaging=24.0=pyhd8ed1ab_0
   - pandas=2.2.2=py312hfb8ada1_0
   - peppy=0.40.1=pyhd8ed1ab_0
@@ -165,3 +165,5 @@ dependencies:
   - zstd=1.5.6=ha6fb4c9_0
   - pip:
       - loguru==0.7.2
+      - snakemake-executor-plugin-slurm==0.5.1
+      - snakemake-executor-plugin-slurm-jobstep==0.2.1
