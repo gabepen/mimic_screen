@@ -229,7 +229,22 @@ def plot_evorate_stats(data_frame, output_path):
     # Get the columns for fraction free living aligned and evorate stat
     fraction_freeliving = data_frame['algn_fraction']
     #evorate_stats = data_frame[['selected_syn_per_site_avg','selected_ns_per_site_avg', 'branch_fraction']]
-    evorate_stats = data_frame[['branch_fraction','avg_branch_length','branch_fraction_full_norm']]
+    evorate_stats = data_frame[['branch_fraction', 'branch_fraction_full_norm']]
+    
+    # Code for exploring outlier values in evorate stats 
+    
+    '''
+    # Outlier count 
+    outliers = data_frame[data_frame['branch_fraction'] > 0.1]
+    fraction_above_threshold = len(outliers) / len(data_frame)
+    print(fraction_above_threshold, outliers.shape[0], data_frame.shape[0])
+    
+    # Outlier identity
+    for index, row in outliers.iterrows():
+        branch_fraction = row['branch_fraction']
+        algn_fraction = row['algn_fraction']
+        print(f"{row['query']}: branch_fraction={branch_fraction}, algn_fraction={algn_fraction}")
+    '''
     
     # Filter the data_frame based on branch fraction
     filtered_data = data_frame[data_frame['branch_fraction'] > 0]
@@ -242,10 +257,10 @@ def plot_evorate_stats(data_frame, output_path):
         ax = axes[i]
         ax.scatter(fraction_freeliving, evorate_stats[column])
         ax.set_xlabel('Fraction Freeliving')
-        ax.set_ylabel(column)
+        ax.set_ylabel(' '.join([word.capitalize() for word in column.split('_')]))
     
     # Save the plot to the output path
-    plt.savefig(output_path)
+    plt.savefig(output_path, dpi=600)
 
 def plot_evorate_stats_comp(data_frame, output_path):
     # Get the columns for fraction free living aligned and evorate stat
@@ -308,12 +323,16 @@ def main():
             print('Please provide an id mapping file to parse evorate results')
             sys.exit(1)
         evorate_df = parse_hyphy_output.parse_absrel_results(args.evorate_analysis, args.id_map)
-        alignment_df = pd.merge(alignment_df, evorate_df, on='query', how='left')
-        if args.plot_evorate:
-            plot_evorate_stats(alignment_df, args.plot_evorate)
         
+        # merge all evorate stats into alignment_df for plotting
+        if args.plot_evorate:
+            evorate_alignment_df = pd.merge(alignment_df, evorate_df, on='query', how='left')
+            plot_evorate_stats(evorate_alignment_df, args.plot_evorate)
+        
+        # merge branch fraction into alignment_df for results table
+        results_alignment_df = pd.merge(alignment_df, evorate_df[['query', 'branch_fraction']], on='query', how='left')
     # save dataframe to csv 
-    alignment_df.to_csv(args.csv_out, index=False)
+    results_alignment_df.to_csv(args.csv_out, index=False)
         
     # plot histogram of freeliving fraction values for alignment
     if args.fid_plot:

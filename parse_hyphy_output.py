@@ -85,7 +85,7 @@ def parse_absrel_results(directory, id_map_file):
                     'avg_branch_length': sum(branch_lengths) / len(branch_lengths),
                     'selected_ns_per_site_avg': (sum(sig_full_model_nonsyn_branch_lens) / len(sig_full_model_nonsyn_branch_lens)) / len(json_data['branch attributes']['0']) if sig_full_model_nonsyn_branch_lens else None,
                     'selected_syn_per_site_avg': (sum(sig_full_model_syn_branch_lens) / len(sig_full_model_syn_branch_lens)) / len(json_data['branch attributes']['0']) if sig_full_model_syn_branch_lens else None,
-                    'branch_fraction': selection_pvalues / len(json_data['branch attributes']['0']),
+                    'branch_fraction': selection_pvalues / len(json_data['branch attributes']['0']) if selection_pvalues > 1 else 0,
                     'branch_fraction_full_norm': (selection_pvalues / len(json_data['branch attributes']['0'])) / (sum(branch_lengths) / len(branch_lengths)),
                 })
                 
