@@ -1,0 +1,3 @@
+[submodule "evorate_workflow/scripts/hyphy-analyses"]
+	path = evorate_workflow/scripts/hyphy-analyses
+	url = https://github.com/veg/hyphy-analyses

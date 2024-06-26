@@ -1,5 +1,7 @@
 import re
+from tqdm import tqdm
 import sys
+import os
 
 def parse_snakemake_log(log_file):
     failed_samples = {}
@@ -28,6 +30,7 @@ def parse_snakemake_log_slurm(slurm_log_file):
     failed_samples = {}
     
     # parse slurm master log file
+    
     with open(slurm_log_file, 'r') as file:
         for line in file:
             

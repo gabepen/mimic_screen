@@ -1,4 +1,4 @@
-configfile: "config/hp_config.yaml"
+configfile: "config/wmel_config.yaml"
 
 samples = []
 with open(config["accession_list"], 'r') as file:
@@ -47,7 +47,7 @@ rule hyphy_codon_preprocess:
         nuc_seqs="{work_dir}/msa_files/{sample}/gene.fna_nuc.fas"
     shell:
         '''
-        hyphy scripts/hyphy/pre-msa.bf --input {input} --E {params.e_number}
+        hyphy scripts/hyphy-analyses/codon-msa/lib/pre-msa.bf --input {input} --E {params.e_number}
         '''
 
 rule mafft_align:
@@ -68,7 +68,7 @@ rule hyphy_codon_postprocess:
         "{work_dir}/msa_files/{sample}/{sample}_codon.msa"
     shell:
         '''
-        hyphy scripts/hyphy/post-msa.bf --protein-msa {input.prot_msa} --nucleotide-sequences {input.nuc_seqs} --output {output}
+        hyphy scripts/hyphy-analyses/codon-msa/lib/post-msa.bf --protein-msa {input.prot_msa} --nucleotide-sequences {input.nuc_seqs} --output {output}
         '''
 
 rule iqtree:

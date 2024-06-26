@@ -1,0 +1,16 @@
+# Required files 
+query_proteome: "data/wmel.faa"
+accession_list: "data/wmel_ALL.txt"
+
+# Required values 
+microbe_id: '163164'
+taxon_id: '766'
+work_dir: 'wmel_outputs'
+max_genomes: '300'
+hyphy_e_number: '0.04' # sets hyphy pre-process.bf acceptance of low homology sequences (lower float = less stringent)
+
+# Logging
+log_path: 'wmel_outputs/logs/'
+
+#Resource values
+mmseq_threads: '80'
