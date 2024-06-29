@@ -121,7 +121,33 @@ def collect_ortholog_accesssions(query_sequence, query_id, workdir):
                         if fields[0] == query_sequence and fields[1] not in collected_accessions:
                             collected_accessions.add(fields[1])
                             o.write('\t'.join(fields[1:]) + '\n')
-                    
+
+def count_orthologs(workdir):
+    
+    # Create a dictionary to store the counts of orthologs for each genome
+    ortholog_counts = {}
+
+    # Iterate over the RBH result files
+    for file in os.listdir(workdir + '/rbh_results'):
+        if file.endswith(".tsv"):
+            
+            # Extract the taxid and genome accession from the file name
+            taxid = file.split('_')[1]
+            genome_accession = file.split('_')[3].split('.')[0]
+            
+            # Read the RBH result file and count the number of lines
+            with open(os.path.join(workdir, 'rbh_results', file), 'r') as f:
+                ortholog_count = sum(1 for line in f)
+            
+            # Store the count in the dictionary
+            ortholog_counts[genome_accession] = ortholog_count
+
+    # Create the completion marking file
+    with open(os.path.join(workdir, 'collected_orthologs.txt'), 'w') as f:
+        # Write the counts to the file
+        for genome_accession, count in ortholog_counts.items():
+            f.write(f"{taxid}\t{genome_accession}\t{count}\n")
+            
 def main():
     
     

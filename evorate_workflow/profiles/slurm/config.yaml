@@ -15,10 +15,14 @@ default-resources:
   mem_mb: 30000 # In MB
 
 set-resources:
-  download_and_rbh:
+  download_genomes:
     slurm_partition: "long"
     slurm_account: # Same as sbatch -A. Not all clusters use this.
     runtime: 1440 # In minutes
+  mmseq_rbh:
+    slurm_partition: "short"
+    slurm_account: # Same as sbatch -A. Not all clusters use this.
+    runtime: 30 # In minutes
   collect_orthologs:
     slurm_partition: "short"
     slurm_accout: # Same as sbatch -A. Not all clusters use this.
@@ -41,7 +45,8 @@ set-resources:
     runtime: 600 # In minutes
 
 set-threads:
-  download_and_rbh: 80
+  download_genomes: 1
+  mmseq_rbh: 80
   collect_orthologs: 1
   iqtree: 20
   absrel: 1

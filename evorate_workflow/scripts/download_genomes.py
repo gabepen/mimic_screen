@@ -99,74 +99,6 @@ def download_genomes(id_list, max_genome_count, workdir):
     logger.info(f"Downloaded {potential_dl_count - max_genome_count} genomes of {potential_dl_count} requested")
     
     return genomes_selected
-    
-def mmseq2_RBH(query_proteome, query_id, workdir, genomes_selected, threads):
-    
-    # create results directory 
-    os.makedirs(workdir + '/rbh_results', exist_ok=True)
-    
-    # generate list of orthologs between the query proteome and all proteomes in a workdir 
-    for file in os.listdir(workdir + '/genomes'):
-        if file.endswith(".zip"):
-            
-            # Establish paths for genome archive extraction
-            zip_path = os.path.join(workdir, 'genomes', file)
-            extract_dir = os.path.splitext(zip_path)[0]
-            
-            # check that the genome is in the selected list
-            taxid = extract_dir.split('/')[-1].split('_')[0]
-            if taxid not in genomes_selected:
-                continue
-            
-            # Extract the contents of the zip file to a directory with the same name
-            with zipfile.ZipFile(zip_path, 'r') as zip_ref:
-                zip_ref.extractall(extract_dir)
-            
-            # select target proteome fasta from extracted files 
-            data_dir = os.path.join(extract_dir, 'ncbi_dataset', 'data')
-            subdirs = [d for d in os.listdir(data_dir) if os.path.isdir(os.path.join(data_dir, d))]
-            subdir = subdirs[0]
-            genome_accession = subdir
-            t_fasta = os.path.join(data_dir, subdir, 'protein.faa')
-            
-            # Establish the path for the RBH output file
-            rbh_output_path = f"{workdir}/rbh_results/{query_id}_{taxid}_{genome_accession}.tsv"
-            
-            # Check if the rbh results already exist
-            if os.path.exists(rbh_output_path):
-                continue
-            
-            # Run mmseqs easy-rbh to identify orthologs
-            mmseqs_command = f"mmseqs easy-rbh {query_proteome} {t_fasta} {rbh_output_path} {workdir}/tmp --threads {threads} > /dev/null"
-            subprocess.run(mmseqs_command, shell=True)
-            
-            # Clean up the extracted files
-            shutil.rmtree(extract_dir)
-            
-    shutil.rmtree(f"{workdir}/tmp")
-            
-    # Create a dictionary to store the counts of orthologs for each genome
-    ortholog_counts = {}
-
-    # Iterate over the RBH result files
-    for file in os.listdir(workdir + '/rbh_results'):
-        if file.endswith(".tsv"):
-            # Extract the taxid and genome accession from the file name
-            taxid = file.split('_')[1]
-            genome_accession = file.split('_')[3].split('.')[0]
-            
-            # Read the RBH result file and count the number of lines
-            with open(os.path.join(workdir, 'rbh_results', file), 'r') as f:
-                ortholog_count = sum(1 for line in f)
-            
-            # Store the count in the dictionary
-            ortholog_counts[genome_accession] = ortholog_count
-
-    # Create the completion marking file
-    with open(os.path.join(workdir, 'collected_orthologs.txt'), 'w') as f:
-        # Write the counts to the file
-        for genome_accession, count in ortholog_counts.items():
-            f.write(f"{taxid}\t{genome_accession}\t{count}\n")
 
 def main():
 
@@ -189,7 +121,7 @@ def main():
     # initialize logging 
     logger.remove()  # Remove default handler
     timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-    log_file = args.log + f"find_orthologs_{timestamp}.log"
+    log_file = args.log + f"ncbi_genome_download_{timestamp}.log"
     logger.add(log_file, rotation="500 MB") # Add a log file handler
     
     # make workdir
@@ -203,9 +135,6 @@ def main():
     with(open(f"{args.log}/genomes_selected.txt", 'w')) as f:
         for taxid in genomes_selected:
             f.write(f"{taxid}\n")
-        
-    # Run mmseq2 analysis 
-    mmseq2_RBH(args.query_proteome, args.query_id, args.workdir, genomes_selected, args.threads)
-
+    
 if __name__ == "__main__":
     main()

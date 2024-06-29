@@ -1,33 +1,83 @@
-configfile: "config/wmel_config.yaml"
+import glob
+
+configfile: "config/hp_config.yaml"
 
 samples = []
 with open(config["accession_list"], 'r') as file:
     for line in file:
         samples.append(line.strip())
 work_dir = config["work_dir"]
+log_file=config["log_path"]
 
 rule all:
     input:
         expand("{work_dir}/results/{sample}_absrel.json", work_dir=config["work_dir"], sample=samples)
         
-rule download_and_rbh:
+checkpoint download_genomes:
     input:
         query_proteome=config["query_proteome"]
     params:
-        threads=config["mmseq_threads"],
         microbe_id=config["microbe_id"],
         taxon_id=config["taxon_id"],
         work_dir=config["work_dir"],
         max_genomes=config["max_genomes"],
         log_file=config["log_path"]
     output:
-        "{work_dir}/collected_orthologs.txt"    
+        genomes=directory("{work_dir}/genomes"), 
+        marker=touch("{work_dir}/genomes/.done")
     shell:
-        'python scripts/find_orthologs.py -p {input.query_proteome} -t {params.threads} -i {params.microbe_id} -x {params.taxon_id} -w {params.work_dir} -m {params.max_genomes} -l {params.log_file}'
+        """
+        python scripts/download_genomes.py \
+            -p {input.query_proteome} \
+            -i {params.microbe_id} \
+            -x {params.taxon_id} \
+            -w {params.work_dir} \
+            -m {params.max_genomes} \
+            -l {params.log_file}
+        """
+    
+def wait_for_genomes(wc): # cade better than snakemake docs 
+    from pathlib import Path
+    checkpoint_output = checkpoints.download_genomes.get(**wc).output[0]
+    genomes = [f.stem for f in Path(checkpoint_output).glob("*.zip")]
+    return expand("{work_dir}/rbh_results/{genome}.tsv", work_dir=wc.work_dir, genome=genomes)
+        
+rule mmseq_rbh:
+    input:
+        genomes="{work_dir}/genomes/{genome}.zip",#lambda wildcards: glob.glob("{work_dir}/genomes/*".format(work_dir=config["work_dir"])),
+        marker="{work_dir}/genomes/.done"
+    params:
+        query_proteome=config["query_proteome"],
+        threads=config["mmseq_threads"],
+        microbe_id=config["microbe_id"],
+        taxon_id=config["taxon_id"],
+        work_dir=config["work_dir"],
+        max_genomes=config["max_genomes"],
+        log_file=lambda wildcards: config["log_path"],
+        genome_ids=lambda wildcards: "{}genomes_selected.txt".format(config["log_path"])
+    output:
+        "{work_dir}/rbh_results/{genome}.tsv" 
+    shell:
+        """
+        python scripts/mmseq_rbh.py \
+            -p {params.query_proteome} \
+            -t {params.threads} \
+            -i {params.microbe_id} \
+            -s {params.genome_ids} \
+            -w {params.work_dir} \
+            -l {params.log_file} \
+            -g {input.genomes}
+        """
 
+rule collect_mmseq:
+    input:
+        wait_for_genomes
+    output:
+        touch("{work_dir}/rbh_results/.done")
+        
 rule collect_orthologs:
     input:
-        rules.download_and_rbh.output,
+        rules.collect_mmseq.output,
     params:
         microbe_id=config["microbe_id"],
         work_dir=config["work_dir"],
@@ -35,7 +85,13 @@ rule collect_orthologs:
     output:
         "{work_dir}/msa_files/{sample}/gene.fna"
     shell:
-        'python scripts/collect_orthologs.py -i {params.microbe_id} -s {wildcards.sample} -w {params.work_dir} -l {params.log_file}' 
+        """
+        python scripts/collect_orthologs.py \
+            -i {params.microbe_id} \
+            -s {wildcards.sample} \
+            -w {params.work_dir} \
+            -l {params.log_file}
+        """
 
 rule hyphy_codon_preprocess:
     input:
