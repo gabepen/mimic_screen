@@ -1,9 +1,0 @@
-
-Error:Could not read batch file '/private/groups/corbettlab/gabe/mimic_screen/evorate_workflow/scripts/hyphy-analyses/codon-msa/lib/pre-msa.bf'.
-Path stack:
-	/private/groups/corbettlab/gabe/miniforge3/envs/evorate/share/hyphy/
-	/private/groups/corbettlab/gabe/mimic_screen/evorate_workflow/scripts/hyphy-analyses/codon-msa/lib/
-Could not read batch file '/private/groups/corbettlab/gabe/mimic_screen/evorate_workflow/scripts/hyphy-analyses/codon-msa/lib/pre-msa.bf'.
-Path stack:
-	/private/groups/corbettlab/gabe/miniforge3/envs/evorate/share/hyphy/
-	/private/groups/corbettlab/gabe/mimic_screen/evorate_workflow/scripts/hyphy-analyses/codon-msa/lib/
