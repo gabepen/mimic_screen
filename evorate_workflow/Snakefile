@@ -74,28 +74,43 @@ rule collect_mmseq:
         wait_for_genomes
     output:
         touch("{work_dir}/rbh_results/.done")
-        
-rule collect_orthologs:
+
+def wait_for_genes(wc):
+    from pathlib import Path
+    checkpoint_output = checkpoints.collect_orthologs.get(**wc).output[0]
+    genes = [f.parent.name for f in Path(checkpoint_output).rglob("*.fna")]
+    return expand("{work_dir}/msa_files/{sample}/ortholog_seqs.fna", work_dir=wc.work_dir, sample=genes)
+
+checkpoint collect_orthologs:
     input:
         rules.collect_mmseq.output,
     params:
         microbe_id=config["microbe_id"],
         work_dir=config["work_dir"],
-        log_file=config["log_path"]
+        log_file=config["log_path"],
+        candidates=config["accession_list"]
     output:
-        "{work_dir}/msa_files/{sample}/gene.fna"
+        ortholog_fastas=directory("{work_dir}/msa_files/"),
+        marker=touch("{work_dir}/msa_files/.done")
     shell:
         """
         python scripts/collect_orthologs.py \
             -i {params.microbe_id} \
-            -s {wildcards.sample} \
+            -c {params.candidates} \
             -w {params.work_dir} \
-            -l {params.log_file}
+            -j {params.work_dir}/genomes/genome_accession_map.json \
+            -l {params.log_file} 
         """
+
+rule collect_gene_datasets:
+    input:
+        wait_for_genes
+    output:
+        touch("{work_dir}/.ortholog_collection_done")
 
 rule hyphy_codon_preprocess:
     input:
-        "{work_dir}/msa_files/{sample}/gene.fna"
+        rules.collect_gene_datasets.output
     params:
         e_number=config["hyphy_e_number"]
     output:
@@ -103,7 +118,7 @@ rule hyphy_codon_preprocess:
         nuc_seqs="{work_dir}/msa_files/{sample}/gene.fna_nuc.fas"
     shell:
         '''
-        hyphy scripts/hyphy-analyses/codon-msa/lib/pre-msa.bf --input {input} --E {params.e_number}
+        hyphy scripts/hyphy-analyses/codon-msa/lib/pre-msa.bf --input {wildcards.sample} --E {params.e_number}
         '''
 
 rule mafft_align:
