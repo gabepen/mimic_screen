@@ -27,7 +27,7 @@ checkpoint download_genomes:
         marker=touch("{work_dir}/genomes/.done")
     shell:
         """
-        python scripts/download_genomes.py \
+        python scripts/download_genomes_multi.py \
             -p {input.query_proteome} \
             -i {params.microbe_id} \
             -x {params.taxon_id} \
@@ -118,7 +118,7 @@ rule hyphy_codon_preprocess:
         nuc_seqs="{work_dir}/msa_files/{sample}/gene.fna_nuc.fas"
     shell:
         '''
-        hyphy scripts/hyphy-analyses/codon-msa/lib/pre-msa.bf --input {wildcards.sample} --E {params.e_number}
+        hyphy scripts/hyphy-analyses/codon-msa/pre-msa.bf --input {wildcards.sample} --E {params.e_number}
         '''
 
 rule mafft_align:
@@ -139,7 +139,7 @@ rule hyphy_codon_postprocess:
         "{work_dir}/msa_files/{sample}/{sample}_codon.msa"
     shell:
         '''
-        hyphy scripts/hyphy-analyses/codon-msa/lib/post-msa.bf --protein-msa {input.prot_msa} --nucleotide-sequences {input.nuc_seqs} --output {output}
+        hyphy scripts/hyphy-analyses/codon-msa/post-msa.bf --protein-msa {input.prot_msa} --nucleotide-sequences {input.nuc_seqs} --output {output}
         '''
 
 rule iqtree:

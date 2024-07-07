@@ -5,12 +5,12 @@ accession_list: "data/hp_all_candidates.txt"
 # Required values 
 microbe_id: '85962'
 taxon_id: '1236'
-work_dir: 'hp_rework_outputs'
+work_dir: 'hp_outputs'
 max_genomes: '200'
 hyphy_e_number: '0.04' # sets hyphy pre-process.bf acceptance of low homology sequences (lower float = less stringent)
 
 # Logging
-log_path: 'testing_rework_outputs/logs/'
+log_path: 'hp_outputs/logs/'
 
 #Resource values
 mmseq_threads: '80'

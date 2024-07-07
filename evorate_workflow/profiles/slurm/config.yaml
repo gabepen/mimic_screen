@@ -2,7 +2,7 @@ executor: slurm
 use-conda: False
 jobs: 100 # Have up to N jobs submitted at any given time
 latency-wait: 30 # Wait N seconds for output files due to latency
-retries: 2 # Retry jobs N times.
+retries: 0 # Retry jobs N times.
 max-jobs-per-second: 5
 max-status-checks-per-second: 5
 keep-going: True
@@ -45,7 +45,7 @@ set-resources:
     runtime: 600 # In minutes
 
 set-threads:
-  download_genomes: 1
+  download_genomes: 30
   mmseq_rbh: 80
   collect_orthologs: 1
   iqtree: 20

@@ -140,7 +140,6 @@ def download_genomes(id_list, max_genome_count, workdir):
             # save taxid - genome record map
             map_id_to_genome(taxid, o_file) 
             
-            
         else:
             dl_error_message = dl_output.stderr.decode().split('\n')
             #dl_error_message = dl_error_message[1].strip().replace('Error:', '')
