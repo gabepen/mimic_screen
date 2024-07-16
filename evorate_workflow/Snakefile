@@ -36,7 +36,7 @@ checkpoint download_genomes:
             -l {params.log_file}
         """
     
-def wait_for_genomes(wc): # cade better than snakemake docs 
+def wait_for_genomes(wc): 
     from pathlib import Path
     checkpoint_output = checkpoints.download_genomes.get(**wc).output[0]
     genomes = [f.stem for f in Path(checkpoint_output).glob("*.zip")]
@@ -79,7 +79,7 @@ def wait_for_genes(wc):
     from pathlib import Path
     checkpoint_output = checkpoints.collect_orthologs.get(**wc).output[0]
     genes = [f.parent.name for f in Path(checkpoint_output).rglob("*.fna")]
-    return expand("{work_dir}/msa_files/{sample}/ortholog_seqs.fna", work_dir=wc.work_dir, sample=genes)
+    return expand("{work_dir}/msa_files/{sample}/{sample}.fna", work_dir=wc.work_dir, sample=genes)
 
 checkpoint collect_orthologs:
     input:
@@ -90,7 +90,7 @@ checkpoint collect_orthologs:
         log_file=config["log_path"],
         candidates=config["accession_list"]
     output:
-        ortholog_fastas=directory("{work_dir}/msa_files/"),
+        ortholog_fastas=expand("{{work_dir}}/msa_files/{sample}/{sample}.fna", sample=samples),
         marker=touch("{work_dir}/msa_files/.done")
     shell:
         """
@@ -110,7 +110,8 @@ rule collect_gene_datasets:
 
 rule hyphy_codon_preprocess:
     input:
-        rules.collect_gene_datasets.output
+        ortholog_seqs="{work_dir}/msa_files/{sample}/{sample}.fna",
+        marker="{work_dir}/.ortholog_collection_done"
     params:
         e_number=config["hyphy_e_number"]
     output:
@@ -118,7 +119,7 @@ rule hyphy_codon_preprocess:
         nuc_seqs="{work_dir}/msa_files/{sample}/gene.fna_nuc.fas"
     shell:
         '''
-        hyphy scripts/hyphy-analyses/codon-msa/pre-msa.bf --input {wildcards.sample} --E {params.e_number}
+        hyphy scripts/hyphy-analyses/codon-msa/pre-msa.bf --input {input.ortholog_seqs} --E {params.e_number}
         '''
 
 rule mafft_align:

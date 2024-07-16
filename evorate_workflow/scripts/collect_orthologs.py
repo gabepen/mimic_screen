@@ -7,6 +7,7 @@ import subprocess
 from loguru import logger
 from Bio import SeqIO
 import json
+import multiprocessing as mp
 
 
 def shorten_sequence_names(fasta_file, max_length):
@@ -27,113 +28,110 @@ def shorten_sequence_names(fasta_file, max_length):
     # Write the modified sequences back to the FASTA file
     SeqIO.write(modified_sequences, fasta_file, "fasta")
 
-def download_gene_data_package(query_dict, taxon_dict, accession_dict, workdir, retries=3):
+def download_gene_data(taxid, taxon_dict, accession_dict, workdir):
     
-    # parse each taxon key to generate the download command 
-    issue_taxa = []
-    for taxid in taxon_dict:
+    # manage race conditions with lock 
+    # need multiple locks for each potential target fasta 
+    locks = {}
+    
+    def write_to_target_fasta(target_fasta, header, gene_seq):
         
-        if taxid != '2774015':
-            continue
+        if target_fasta not in locks:
+            locks[target_fasta] = mp.Lock()
         
-        # get the query accessions for the taxon
-        accessions = taxon_dict[taxid]
-        
-        # log
-        logger.info(f"Downloading ortholog sequences for taxon: {taxid}")
-        logger.info(f"Orthologs: {accessions}")
-        
-        # format download command 
-        output_path = f"{workdir}/orthologs/{taxid}_orthologs_dataset.zip"
-        ncbi_datasets_command = f"datasets download gene accession {accessions} --include gene --filename {output_path} --taxon-filter {taxid}"
-        
-        # retry loop for downloading ortholog sequences
-        valid_zip = False
-        while retries > 0:
-            try:
-            
-                # run downlaod command
-                result = subprocess.run(ncbi_datasets_command, shell=True, capture_output=True, text=True)
-                error_output = result.stderr
+        with locks[target_fasta]:
+            with open(target_fasta, 'a+') as m:
+                m.write(header)
+                m.write(gene_seq)
                 
-                # extract protein sequence fasta  
-                zip_path = os.path.join(output_path)
-                extract_dir = os.path.splitext(zip_path)[0]
-                packet_fasta = f"{workdir}/orthologs/{taxid}"
-                with zipfile.ZipFile(zip_path, 'r') as zip_ref:
-                    zip_ref.extract('ncbi_dataset/data/gene.fna',path=packet_fasta)
+        
+    # get the query accessions for the taxon
+    accessions = taxon_dict[taxid]
+    
+    # log
+    logger.info(f"Downloading ortholog sequences for taxon: {taxid}")
+    logger.info(f"Orthologs: {accessions}")
+    
+    # format download command 
+    output_path = f"{workdir}/orthologs/{taxid}_orthologs_dataset.zip"
+    ortho_accessions = [t[1] for t in accessions]
+    ncbi_datasets_command = f"datasets download gene accession {','.join(ortho_accessions)} --include gene --filename {output_path} --taxon-filter {taxid}"
+       
+    # run downlaod command
+    result = subprocess.run(ncbi_datasets_command, shell=True, capture_output=True, text=True)
+    error_output = result.stderr
+    
+    # extract protein sequence fasta to taxid folder in orthologs folder 
+    zip_path = os.path.join(output_path)
+    extract_dir = os.path.splitext(zip_path)[0]
+    packet_fasta = f"{workdir}/orthologs/{taxid}"
+    with zipfile.ZipFile(zip_path, 'r') as zip_ref:
+        zip_ref.extract('ncbi_dataset/data/gene.fna',path=packet_fasta)
+    
+    try:
+        # move packet multiseq file up two directories
+        shutil.move(os.path.join(packet_fasta, "ncbi_dataset/data/gene.fna"), packet_fasta)
+    except shutil.Error:
+        # file exists, thats ok dont panic and keep going 
+        pass
+        
+    # downloading by WP accession obtains all gene records annotated across all genomes
+    # there could be multiple chromosome accessions for a single genome
+    refseq_chr_accessions = accession_dict[taxid]['refseq_chr_accessions'] 
+    
+    # append sequences to appropriate fasta file
+    gene_fa_file = os.path.join(packet_fasta, "gene.fna")
+    with open(gene_fa_file, 'r') as f:
+        acc_matched = False
+        for line in f:
+            
+            # identify the accession number connected to the nucleotide sequence
+            if line.startswith('>'):
+                
+                # check for annotation match 
+                annotation_accession = line.split('>')[-1].split(':')[0]
+                if annotation_accession in refseq_chr_accessions:
+                    acc_matched = True
                     
-                # remove packet archive 
-                os.remove(os.path.join(output_path))
-                
-                # if no errors break out of retry loop
-                valid_zip = True
-                break 
-            
-            except FileNotFoundError:
-                
-                retries -= 1
-                
-                # no gene data for taxon, no point in retrying
-                if error_output.startswith("Error: The taxonomy ID"):
-                    logger.error(f"\t{error_output.split('\n')[0]}")
-                    break
-                
-                # other error, log and retry 
-                logger.error(f"\t{error_output}")
-                logger.info(f"\tRetrying...")
-        
-        # check if a valid zip archive was downloaded for the packet      
-        if valid_zip:
-            
-            # move packet multiseq file up two directories
-            shutil.move(os.path.join(packet_fasta, "ncbi_dataset/data/gene.fna"), packet_fasta)
-            
-            # downloading by WP accession obtains all gene records annotated across all genomes
-            # there could be multiple chromosome accessions for a single genome
-            refseq_chr_accessions = accession_dict[taxid]['refseq_chr_accessions'] 
-          
-            # append sequences to appropriate fasta file
-            gene_fa_file = os.path.join(packet_fasta, "gene.fna")
-            with open(gene_fa_file, 'r') as f:
-                matched = False
-                for line in f:
+                    try:
+                        # valid annotation accession now get the WP accession to append to the correct fasta file
+                        ortho_wp_accession = line.split('protein_accession=')[1].split(']')[0]
                     
-                    # identify the accession number connected to the nucleotide sequence
-                    if line.startswith('>'):
+                    except IndexError:
+                        logger.info(f"Error: No WP accessions found in fasta for taxid: {taxid}")
+                        break
+        
                         
-                        # check for annotation match 
-                        annotation_accession = line.split('>')[-1].split(':')[0]
-                        if annotation_accession in refseq_chr_accessions:
-                            
-                            # valid annotation accession now get the WP accession to append to the correct fasta file
-                            wp_accession = line.split('protein_accession=')[1].split(']')[0]
-                            target_fasta = f"{workdir}/msa_files/{wp_accession}/ortholog_seqs.fna"
+                    # find the source WP accession that the ortho accession is associated with
+                    source_wp_accession = [t[0] for t in accessions if t[1] == ortho_wp_accession][0]
+                    
+                    # set output fasta file path
+                    target_fasta = f"{workdir}/msa_files/{source_wp_accession}/{source_wp_accession}.fna"
+                    
+                    # create candidate folder for storing gene seqs 
+                    os.makedirs(workdir + '/msa_files/' + source_wp_accession, exist_ok=True)
 
-                            # append sequences to multiseq fasta file  
-                            with open(target_fasta, 'a+') as m:
-                                m.write(line)
-                                m.write(next(f))
-                                matched = True
-                            break
-                        
-                # thanks ncbi... (this shouldnt happen)
-                if not matched:
-                    scratch_path = f"{workdir}/orthologs/{taxid}_debug_orthologs_dataset.zip"
-                    logger.error(f"Error: No matching accession found for taxid: {taxid}")
-                    logger.info(f"Testing single accession error message:")
-                    debug_datasets_command = f"datasets download gene accession {accessions[0]} --include gene --filename {output_path} --taxon-filter {taxid}"
-                     # run downlaod command
-                    result = subprocess.run(debug_datasets_command, shell=True, capture_output=True, text=True)
-                    error_output = result.stderr
-                    logger.error(f"\t{error_output}")
-                    issue_taxa.append(taxid)
-                    
+                    # append sequences to multiseq fasta file 
+                    write_to_target_fasta(target_fasta, line, next(f))
+                    logger.info(f"Wrote {ortho_wp_accession} gene sequence to {target_fasta}")
                 
-            # delete the empty ncbi_dataset directory
-            shutil.rmtree(os.path.join(target_fasta, "ncbi_dataset"))
-    
-    logger.info(f"Taxa issues ({len(issue_taxa)}): {issue_taxa}")
+                   
+        if not acc_matched:
+            logger.info(f"Error: No matching assembly accession found for taxid: {taxid}")
+        
+    # remove gene dataset file 
+    shutil.rmtree(packet_fasta)
+
+def download_gene_data_packages(taxon_dict, accession_dict, workdir):
+        
+    with mp.Pool(processes=mp.cpu_count()) as pool:
+        logger.info("Started multiprocessing ortholog collection with {} processes".format(mp.cpu_count()))
+        results = [pool.apply_async(download_gene_data, args=(taxid, taxon_dict, accession_dict, workdir))
+                                        for taxid in taxon_dict.keys()]
+        pool.close()
+        pool.join()
+        
+    logger.info("Pool closed")
     
 def collect_ortholog_accesssions(query_id, candidate_list, workdir):
     
@@ -143,6 +141,9 @@ def collect_ortholog_accesssions(query_id, candidate_list, workdir):
     # dictionaries for sorting accessions 
     query_dict = {}
     taxon_dict = {}
+    
+    # set for storing candidate IDs where at least one ortholog seq was identified
+    candidate_sources = set()
     
     for file in os.listdir(workdir + '/rbh_results'):
         if file.endswith(".tsv"):
@@ -165,20 +166,20 @@ def collect_ortholog_accesssions(query_id, candidate_list, workdir):
                     # Write out rbh hits to the query accession number
                     if fields[0] in candidate_list:
                         
+                        # candidate has at least one ortholog seq
+                        candidate_sources.add(fields[0]) 
+                          
                         # map candidate accession to its orthologs 
                         if fields[0] not in query_dict:
                             query_dict[fields[0]] = [fields[1]]
-                            
-                            # create candidate folder for storing gene seqs 
-                            os.makedirs(workdir + '/msa_files/' + fields[0], exist_ok=True)
-                                                    
+                                               
                         else:
                             query_dict[fields[0]].append(fields[1])
                         
                         # map taxid to its orthologs 
-                        taxon_dict[taxid].append(fields[1])
+                        taxon_dict[taxid].append((fields[0],fields[1]))
 
-    return query_dict, taxon_dict
+    return query_dict, taxon_dict, candidate_sources
    
 
 def count_orthologs(workdir):
@@ -189,7 +190,6 @@ def count_orthologs(workdir):
     # Iterate over the RBH result files
     for file in os.listdir(workdir + '/rbh_results'):
         if file.endswith(".tsv"):
-            
             # Extract the taxid and genome accession from the file name
             taxid = file.split('_')[1]
             genome_accession = file.split('_')[3].split('.')[0]
@@ -222,7 +222,7 @@ def main():
     
     # initialize logging 
     logger.remove()  # Remove default handler
-    logger.add(f"{args.log}/orthologs_collection_debug.log", rotation="500 MB") # Add a log file handler
+    logger.add(f"{args.log}/orthologs_collection_debug.log", enqueue=True, rotation="10 MB") # Add a log file handler
     
     # load candidate accessions
     with open(args.candidate_list, 'r') as f:
@@ -231,14 +231,24 @@ def main():
     logger.info(f"Collecting {len(candidate_list)} ortholog datasets for {args.query_id}...")
     
     # collect ortholog accessions for the query sequence
-    query_dict, taxon_dict = collect_ortholog_accesssions(args.query_id, candidate_list, args.workdir)
+    query_dict, taxon_dict, candidate_sources = collect_ortholog_accesssions(args.query_id, candidate_list, args.workdir)
    
     # load genome record json
     with open(args.genome_record_json, 'r') as f:
         genome_accession_dict = json.load(f)
-        
+    
+    # Check for candidate IDs not in the candidate source list 
+    missing_ids = set(candidate_list) - set(candidate_sources)
+    
+    # Create dummy files for candidate IDs that had no orthologs within any of the selected taxon
+    # These will fail at the next rule but will not stop the workflow
+    for missing_id in missing_ids:
+        with open(f"{args.workdir}/msa_files/{missing_id}/{missing_id}.fna", 'w') as f:
+            f.write('>no_orthologs_found\n')
+            f.write('X\n')
+            
     # download
-    download_gene_data_package(query_dict, taxon_dict, genome_accession_dict, args.workdir)
+    download_gene_data_packages(taxon_dict, genome_accession_dict, args.workdir)
               
     # shorten sequence names to prevent hyphy post-msa.bf errors when seq names are too long
     for root, dirs, files in os.walk(args.workdir + '/msa_files'):

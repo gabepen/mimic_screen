@@ -1,9 +1,3 @@
 
-Error:Could not read batch file '/private/groups/corbettlab/gabe/mimic_screen/evorate_workflow/scripts/hyphy-analyses/codon-msa/lib/pre-msa.bf'.
-Path stack:
-	/private/groups/corbettlab/gabe/miniforge3/envs/evorate/share/hyphy/
-	/private/groups/corbettlab/gabe/mimic_screen/evorate_workflow/scripts/hyphy-analyses/codon-msa/lib/
-Could not read batch file '/private/groups/corbettlab/gabe/mimic_screen/evorate_workflow/scripts/hyphy-analyses/codon-msa/lib/pre-msa.bf'.
-Path stack:
-	/private/groups/corbettlab/gabe/miniforge3/envs/evorate/share/hyphy/
-	/private/groups/corbettlab/gabe/mimic_screen/evorate_workflow/scripts/hyphy-analyses/codon-msa/lib/
+Error:Invalid matrix index [0][4306] in an 1 by 64 matrix.
+Invalid matrix index [0][4306] in an 1 by 64 matrix.
