@@ -26,7 +26,7 @@ set-resources:
   collect_orthologs:
     slurm_partition: "medium"
     slurm_accout: # Same as sbatch -A. Not all clusters use this.
-    runtime: 180 # In minutes
+    runtime: 600 # In minutes
   hyphy_codon_preprocess:
     slurm_partition: "medium"
     slurm_account: # Same as sbatch -A. Not all clusters use this.
