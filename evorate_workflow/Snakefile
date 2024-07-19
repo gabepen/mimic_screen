@@ -1,6 +1,6 @@
 import glob
 
-configfile: "config/hp_config.yaml"
+configfile: "config/lp_config.yaml"
 
 samples = []
 with open(config["accession_list"], 'r') as file:
@@ -115,8 +115,8 @@ rule hyphy_codon_preprocess:
     params:
         e_number=config["hyphy_e_number"]
     output:
-        prot_seqs="{work_dir}/msa_files/{sample}/gene.fna_protein.fas",
-        nuc_seqs="{work_dir}/msa_files/{sample}/gene.fna_nuc.fas"
+        prot_seqs="{work_dir}/msa_files/{sample}/{sample}.fna_protein.fas",
+        nuc_seqs="{work_dir}/msa_files/{sample}/{sample}.fna_nuc.fas"
     shell:
         '''
         hyphy scripts/hyphy-analyses/codon-msa/pre-msa.bf --input {input.ortholog_seqs} --E {params.e_number}
@@ -124,7 +124,7 @@ rule hyphy_codon_preprocess:
 
 rule mafft_align:
     input:
-        "{work_dir}/msa_files/{sample}/gene.fna_protein.fas"
+        "{work_dir}/msa_files/{sample}/{sample}.fna_protein.fas"
     output:
         "{work_dir}/msa_files/{sample}/{sample}_protein.msa"
     shell:
@@ -135,7 +135,7 @@ rule mafft_align:
 rule hyphy_codon_postprocess:
     input:
         prot_msa="{work_dir}/msa_files/{sample}/{sample}_protein.msa",
-        nuc_seqs="{work_dir}/msa_files/{sample}/gene.fna_nuc.fas"
+        nuc_seqs="{work_dir}/msa_files/{sample}/{sample}.fna_nuc.fas"
     output:
         "{work_dir}/msa_files/{sample}/{sample}_codon.msa"
     shell:

@@ -12,7 +12,7 @@ import time
 import traceback
 
 
-def shorten_sequence_names(fasta_file, max_length):
+def shorten_sequence_names(fasta_file):
     
     # Parse the FASTA file
     sequences = SeqIO.parse(fasta_file, "fasta")
@@ -22,7 +22,7 @@ def shorten_sequence_names(fasta_file, max_length):
 
     # Iterate over each sequence in the file shorten descriptions
     for seq in sequences:
-        seq.description = seq.description[:max_length]
+        seq.description = ']'.join(seq.description.split(']')[:2]) + ']'
 
         # Add the modified sequence to the list
         modified_sequences.append(seq)
@@ -89,6 +89,7 @@ def download_gene_data(taxid, taxon_dict, accession_dict, seq_dict, workdir):
     acc_matched = False
     logger.info("Parsing gene dataset file for taxon {}".format(taxid))
     parse_start_time = time.time()
+ 
     for seq_record in SeqIO.parse(gene_fa_file, "fasta"):
         
         # Get the accession number connected to the nucleotide sequence
@@ -118,18 +119,16 @@ def download_gene_data(taxid, taxon_dict, accession_dict, seq_dict, workdir):
 
             # sequence information stored in tuple
             seq_content = (f">{seq_record.description}\n", str(seq_record.seq) + "\n")
+
+            # Append sequences to multiseq fasta file 
+            if target_fasta not in seq_dict:
+                seq_dict[target_fasta] = [seq_content]
+            else:
+                current_list = seq_dict.get(target_fasta, [])
+                current_list.append(seq_content)
+                seq_dict[target_fasta] = current_list
             
-            try:
             
-                # Append sequences to multiseq fasta file 
-                if target_fasta not in seq_dict:
-                    seq_dict[target_fasta] = [seq_content]
-                else:
-                    seq_dict[target_fasta].append(seq_content)
-                    
-            except Exception as e: 
-                logger.info(f"Error: {e}")  
-                continue 
                    
     if not acc_matched:
         logger.info(f"Error: No matching assembly accession found for taxid: {taxid}")   
@@ -143,7 +142,7 @@ def download_gene_data_packages(taxon_dict, accession_dict, workdir):
     
     with mp.Manager() as manager:
         seq_dict = manager.dict() 
-        with mp.Pool(processes=mp.cpu_count()) as pool:
+        with mp.Pool(processes=1) as pool:
             logger.info("Started multiprocessing ortholog collection with {} processes".format(mp.cpu_count()))
             results = [pool.apply_async(download_gene_data, args=(taxid, taxon_dict, accession_dict, seq_dict, workdir))
                                                 for taxid in taxon_dict.keys()]
@@ -293,7 +292,7 @@ def main():
     for root, dirs, files in os.walk(args.workdir + '/msa_files'):
         for file in files:
             if file.endswith(".fna"):
-                shorten_sequence_names(os.path.join(root, file), 20)
+                shorten_sequence_names(os.path.join(root, file))
     
     # collect ortholog sequences into a single fasta file 
     #ortholog_seq_fasta = collect_ortholog_seqs(args.workdir, args.query_sequence)

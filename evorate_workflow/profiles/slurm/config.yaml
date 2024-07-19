@@ -42,9 +42,9 @@ set-resources:
     runtime: 600 # In minutes
 
 set-threads:
-  download_genomes: 30
+  download_genomes: 55
   mmseq_rbh: 80
-  collect_orthologs: 100
+  collect_orthologs: 105
   iqtree: 20
   absrel: 1
 

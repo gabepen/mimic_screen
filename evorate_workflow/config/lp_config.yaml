@@ -1,16 +1,16 @@
 # Required files 
 query_proteome: "data/lp.faa"
-accession_list: "data/legionella_known_mimics.txt"
+accession_list: "data/legionella_ALL.txt"
 
 # Required values 
 microbe_id: '272624'
 taxon_id: '1236'
-work_dir: 'lp_validation_outputs'
-max_genomes: '1000'
+work_dir: 'lp_outputs'
+max_genomes: '300'
 hyphy_e_number: '0.04' # sets hyphy pre-process.bf acceptance of low homology sequences (lower float = less stringent)
 
 # Logging
-log_path: 'lp_validation_outputs/logs/'
+log_path: 'lp_outputs/logs/'
 
 #Resource values
 mmseq_threads: '80'

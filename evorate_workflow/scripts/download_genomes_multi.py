@@ -176,7 +176,7 @@ def download_genomes(id_list, max_genome_count, workdir, log_file):
         terminate_event = manager.Event()  
         
         # create processes
-        with mp.Pool(processes=25) as pool:
+        with mp.Pool(processes=50) as pool:
             
             # start log listener process
             #listener = mp.Process(target=log_listener, args=(log_queue, log_file))
@@ -220,7 +220,7 @@ def download_genomes(id_list, max_genome_count, workdir, log_file):
         
         logger.info(f"Downloaded {len(genomes_selected)} genomes of {max_genome_count} requested")
         # return first taxids selected up untill max_genome_count incase there where more downloaded after the pool termination 
-        return genomes_selected[:max_genome_count], dict(taxid_genome_map) 
+        return genomes_selected, dict(taxid_genome_map) 
 
 def main():
 
@@ -253,8 +253,6 @@ def main():
     # Collect genome fastas for the taxid group
     id_list = taxonkit_get_subtree(args.taxid)
     genomes_selected, genome_accession_map = download_genomes(id_list, args.max_genome_count, args.workdir, log_file)
-    
-  
     
     # Save genome_accession_map to a json file 
     with open(f"{args.workdir}/genomes/genome_accession_map.json", 'w') as f:
