@@ -33,7 +33,7 @@ def parse_snakemake_log_slurm(slurm_log_file):
     
     with open(slurm_log_file, 'r') as file:
         for line in file:
-            
+        
             # search for each rule error
             match = re.search(r'Error in rule (.+)', line)
             if match:
@@ -62,7 +62,7 @@ def parse_snakemake_log_slurm(slurm_log_file):
                         # open job specific log file and search for error details
                         with open(log_path, 'r') as rule_log_file:
                             for rl in rule_log_file:
-                                error_match = re.search(r'ERROR: (.+)', rl)
+                                error_match = re.search(r'(?i)ERROR: (.+)', rl)
                                 if error_match:
                                     status_detail = error_match.group(1)
                                     break
