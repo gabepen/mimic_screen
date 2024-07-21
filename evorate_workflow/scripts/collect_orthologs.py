@@ -118,6 +118,7 @@ def download_gene_data(taxid, taxon_dict, accession_dict, seq_dict, workdir):
             os.makedirs(workdir + '/msa_files/' + source_wp_accession, exist_ok=True)
 
             # sequence information stored in tuple
+            seq_record.description =  seq_record.description = ']'.join(seq_record.description.split(']')[:1]) + '] ' + taxid
             seq_content = (f">{seq_record.description}\n", str(seq_record.seq) + "\n")
 
             # Append sequences to multiseq fasta file 
@@ -142,7 +143,7 @@ def download_gene_data_packages(taxon_dict, accession_dict, workdir):
     
     with mp.Manager() as manager:
         seq_dict = manager.dict() 
-        with mp.Pool(processes=mp.cpu_count()) as pool:
+        with mp.Pool(processes=1) as pool:
             logger.info("Started multiprocessing ortholog collection with {} processes".format(mp.cpu_count()))
             results = [pool.apply_async(download_gene_data, args=(taxid, taxon_dict, accession_dict, seq_dict, workdir))
                                                 for taxid in taxon_dict.keys()]
@@ -289,11 +290,12 @@ def main():
     
               
     # shorten sequence names to prevent hyphy post-msa.bf errors when seq names are too long
+    '''
     for root, dirs, files in os.walk(args.workdir + '/msa_files'):
         for file in files:
             if file.endswith(".fna"):
                 shorten_sequence_names(os.path.join(root, file))
-    
+    '''
     # collect ortholog sequences into a single fasta file 
     #ortholog_seq_fasta = collect_ortholog_seqs(args.workdir, args.query_sequence)
     
