@@ -178,10 +178,6 @@ def download_genomes(id_list, max_genome_count, workdir, log_file):
         # create processes
         with mp.Pool(processes=50) as pool:
             
-            # start log listener process
-            #listener = mp.Process(target=log_listener, args=(log_queue, log_file))
-            #listener.start()
-            
             # Start the monitor_downloads function in a separate thread
             monitor_process = mp.Process(target=monitor_downloads, args=(max_genome_event, terminate_event, pool))
             monitor_process.start()
@@ -190,17 +186,6 @@ def download_genomes(id_list, max_genome_count, workdir, log_file):
             results = [pool.apply_async(dataset_download, args=(download_command, taxid, taxid_genome_map, 
                                                                 counter, success_queue, genomes_selected, max_genome_count, max_genome_event)) 
                        for download_command, taxid in zip(download_commands, taxids_used)]
-
-            # multi-threaded download starmap
-            '''
-            pool.starmap(dataset_download, zip(download_commands, taxids_used, [taxid_genome_map] * len(download_commands), 
-                                        [counter] * len(download_commands), 
-                                        [success_queue] * len(download_commands), 
-                                        [max_genome_count] * len(download_commands), 
-                                        [max_genome_event] * len(download_commands)), chunksize=1)
-                                        #[log_file] * len(download_commands),
-                                        #[log_queue] * len(download_commands)))
-            '''
             
             # moinitor monitoring loop 
             while True:
@@ -209,18 +194,22 @@ def download_genomes(id_list, max_genome_count, workdir, log_file):
                     pool.terminate()
                     pool.join()
                     break
+                elif all(result.ready() for result in results):
+                    logger.info("All possible downloads attempted")
+                    pool.terminate()
+                    pool.join()
+                    break
                 time.sleep(2) # check every two seconds
             
             # stop monitor 
             monitor_process.join()
             
-            # target genome count was not reached need to close pool 
-            pool.close()
-            pool.join()
-        
-        logger.info(f"Downloaded {len(genomes_selected)} genomes of {max_genome_count} requested")
-        # return first taxids selected up untill max_genome_count incase there where more downloaded after the pool termination 
-        return genomes_selected, dict(taxid_genome_map) 
+            
+            
+            logger.info(f"Downloaded {len(genomes_selected)} genomes of {max_genome_count} requested")
+            # return first taxids selected up until max_genome_count in case there were more downloaded after the pool termination 
+            return list(genomes_selected), dict(taxid_genome_map)
+        return list(genomes_selected), dict(taxid_genome_map) 
 
 def main():
 

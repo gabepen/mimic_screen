@@ -142,7 +142,7 @@ def download_gene_data_packages(taxon_dict, accession_dict, workdir):
     
     with mp.Manager() as manager:
         seq_dict = manager.dict() 
-        with mp.Pool(processes=1) as pool:
+        with mp.Pool(processes=mp.cpu_count()) as pool:
             logger.info("Started multiprocessing ortholog collection with {} processes".format(mp.cpu_count()))
             results = [pool.apply_async(download_gene_data, args=(taxid, taxon_dict, accession_dict, seq_dict, workdir))
                                                 for taxid in taxon_dict.keys()]
