@@ -41,4 +41,4 @@ symbiotes = check_for_symbiosis(tax_id_list)
 
 with open(output_file, 'w+') as f:
     for tax_id in symbiotes:
-        f.write(tax_id + '\n')
+        f.write(tax_id)
