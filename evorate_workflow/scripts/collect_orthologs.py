@@ -139,7 +139,7 @@ def download_gene_data(taxid, taxon_dict, accession_dict, seq_dict, workdir):
     # remove gene dataset file 
     shutil.rmtree(packet_fasta)
 
-def download_gene_data_packages(taxon_dict, accession_dict, workdir):
+def download_gene_data_packages(taxon_dict, accession_dict, max_ortho_seqs, workdir):
     
     with mp.Manager() as manager:
         seq_dict = manager.dict() 
@@ -156,7 +156,9 @@ def download_gene_data_packages(taxon_dict, accession_dict, workdir):
         # seq_dict should contain all sequences to be written to all target fasta files in the form of tuples
         for target_fasta in seq_dict:
             with open(target_fasta, 'a+') as m:
-                for seq_content in seq_dict[target_fasta]:
+                seq_content_list = seq_dict[target_fasta]
+                random.shuffle(seq_content_list)
+                for seq_content in seq_content_list[:max_ortho_seqs+1]:
                     m.write(seq_content[0])
                     m.write(seq_content[1])
     
@@ -248,12 +250,13 @@ def main():
     parser.add_argument("-c", "--candidate_list", help="List of candidate accessions to search for orthologs")
     parser.add_argument("-w", "--workdir", help="Path to the working directory")
     parser.add_argument("-j", "--genome_record_json", help="Path to the genome record JSON file for mapping taxids to GCF accessions")
+    parser.add_argument("-m", "--max_ortho_seqs",default=120, help="Maximum number of ortholog sequences to collect per candidate")
     parser.add_argument("-l", "--log", default='logs/', help="Path to the log file")
     args = parser.parse_args()
     
     # initialize logging 
     logger.remove()  # Remove default handler
-    logger.add(f"{args.log}/orthologs_collection_debug.log", enqueue=True, rotation="10 MB") # Add a log file handler
+    logger.add(f"{args.log}/orthologs_collection.log", enqueue=True, rotation="10 MB") # Add a log file handler
     
     # load candidate accessions
     with open(args.candidate_list, 'r') as f:
@@ -262,7 +265,7 @@ def main():
     logger.info(f"Collecting {len(candidate_list)} ortholog datasets for {args.query_id}...")
     
     # collect ortholog accessions for the query sequence
-    query_dict, taxon_dict, candidate_sources = collect_ortholog_accesssions(args.query_id, candidate_list, args.workdir)
+    query_dict, taxon_dict, candidate_sources = collect_ortholog_accesssions(args.query_id, candidate_list, args.max_ortho_seqs, args.workdir)
    
     # load genome record json
     with open(args.genome_record_json, 'r') as f:

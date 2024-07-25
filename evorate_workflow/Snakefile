@@ -88,7 +88,8 @@ checkpoint collect_orthologs:
         microbe_id=config["microbe_id"],
         work_dir=config["work_dir"],
         log_file=config["log_path"],
-        candidates=config["accession_list"]
+        candidates=config["accession_list"],
+        max_ortho_seqs=config["max_ortho_seqs"]
     output:
         ortholog_fastas=expand("{{work_dir}}/msa_files/{sample}/{sample}.fna", sample=samples),
         marker=touch("{work_dir}/msa_files/.done")
@@ -99,7 +100,8 @@ checkpoint collect_orthologs:
             -c {params.candidates} \
             -w {params.work_dir} \
             -j {params.work_dir}/genomes/genome_accession_map.json \
-            -l {params.log_file} 
+            -l {params.log_file} \
+            -m {params.max_ortho_seqs}
         """
 
 rule collect_gene_datasets:

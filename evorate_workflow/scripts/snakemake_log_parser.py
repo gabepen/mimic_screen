@@ -38,7 +38,6 @@ def parse_snakemake_log_slurm(slurm_log_file):
             match = re.search(r'Error in rule (.+)', line)
             if match:
                 rule = match.group(1).strip(':')
-                
                 # with error found search for details 
                 status = 'NA'
                 for line in file:
@@ -51,7 +50,10 @@ def parse_snakemake_log_slurm(slurm_log_file):
                     # determine the sample name
                     output_match = re.search(r'output: (.+)', line)
                     if output_match:
-                        sample = line.split('/')[-2]
+                        if rule == 'absrel':
+                            sample = line.split('/')[-1]
+                        else:
+                            sample = line.split('/')[-2]
                         
                     # determine path to job specific log file to find error details 
                     log_match = re.search(r'log: (.+)', line)

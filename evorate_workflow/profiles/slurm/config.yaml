@@ -32,16 +32,15 @@ set-resources:
     slurm_account: # Same as sbatch -A. Not all clusters use this.
     runtime: 120 # In minutes
     mem_mb: 60000 # In MB
-    retries: 2
-    cpus-per-task: 2
+    cpus_per_task: 2
   iqtree:
     slurm_partition: "medium"
     slurm_account: # Same as sbatch -A. Not all clusters use this.
     runtime: 600 # In minutes
-  absreld:
+  absrel:
     slurm_partition: "long"
     slurm_account: # Same as sbatch -A. Not all clusters use this.
-    runtime: 1440 # In minutes
+    runtime: 4500 # In minutes
 
 set-threads:
   download_genomes: 55

@@ -92,6 +92,8 @@ def parse_absrel_results(directory, id_map_file):
     datatable = pd.DataFrame(data)
     return datatable
 
+def 
+
 def main():
     parser = argparse.ArgumentParser(description='Parse JSON files')
     parser.add_argument('-d','--directory', help='Path to the directory containing JSON files')
