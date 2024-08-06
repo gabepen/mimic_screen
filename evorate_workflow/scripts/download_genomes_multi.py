@@ -196,6 +196,7 @@ def download_genomes(id_list, max_genome_count, workdir, log_file):
                     break
                 elif all(result.ready() for result in results):
                     logger.info("All possible downloads attempted")
+                    terminate_event.set()
                     pool.terminate()
                     pool.join()
                     break
