@@ -252,12 +252,17 @@ def plot_evorate_stats(data_frame, output_path):
     # Create a multipanel scatter plot
     fig, axes = plt.subplots(nrows=1, ncols=len(evorate_stats.columns), figsize=(15, 5))
     
+   if 'p-value' in data_frame.columns:
+        # coloring by significance based on BUSTED resultss
+        colors = ['red' if val > 0.05 else 'blue' for val in data_frame['p-value']]
+        
     # Iterate over each evorate stat column
-    for i, column in enumerate(evorate_stats.columns):
+    for i, column in enumerate(evorate_stats.columns[:2]):
         ax = axes[i]
-        ax.scatter(fraction_freeliving, evorate_stats[column])
+        ax.scatter(fraction_freeliving, evorate_stats[column], c=colors)
         ax.set_xlabel('Fraction Freeliving')
         ax.set_ylabel(' '.join([word.capitalize() for word in column.split('_')]))
+    
     
     # Save the plot to the output path
     plt.savefig(output_path, dpi=600)
@@ -293,7 +298,6 @@ def main():
     '''
 
     parser = argparse.ArgumentParser()
-
     parser.add_argument('-a','--alignment', type=str, help='path to a foldseek alignment result file')
     parser.add_argument('-c','--controls', type=str, help='paths to a directory of control alignments')
     parser.add_argument('-f','--fid_plot', type=str, help='output path for png of fraction of identical residues histogram')
@@ -302,6 +306,7 @@ def main():
     parser.add_argument('-d','--pdb_database', type=str, help='path to database of pdb files used in alignment')
     parser.add_argument('-v','--validation_ids', type=str, help='path to a txt file of structure IDs to pull from results')
     parser.add_argument('-e','--evorate_analysis', type=str, help='path to evorateworkflow results directory')
+    parser.add_argument('-b','--busted_analysis', default=None, type=str, help='path to busted results directory')
     parser.add_argument('-p','--plot_evorate',  type=str, help='path to evorateworkflow results plot')
     parser.add_argument('-i','--id_map', type=str, help='path to id mapping file from uniprot')
     args = parser.parse_args()   
@@ -324,6 +329,10 @@ def main():
             sys.exit(1)
         evorate_df = parse_hyphy_output.parse_absrel_results(args.evorate_analysis, args.id_map)
         
+        if args.busted_analysis:
+            busted_df = parse_hyphy_output.parse_busted_results(args.busted_analysis, args.id_map)
+            evorate_df = pd.merge(evorate_df, busted_df, on='query', how='left')
+    
         # merge all evorate stats into alignment_df for plotting
         if args.plot_evorate:
             evorate_alignment_df = pd.merge(alignment_df, evorate_df, on='query', how='left')

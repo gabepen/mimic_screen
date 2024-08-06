@@ -10,7 +10,7 @@ import json
 import multiprocessing as mp
 import time
 import traceback
-
+import random
 
 def shorten_sequence_names(fasta_file):
     
@@ -163,8 +163,7 @@ def download_gene_data_packages(taxon_dict, accession_dict, max_ortho_seqs, work
                     m.write(seq_content[1])
     
             # log fasta size
-            logger.info(f"Wrote {len(seq_dict[target_fasta])} sequences to {target_fasta}")
-        
+            logger.info(f"Wrote {len(seq_dict[target_fasta])} sequences to {target_fasta}") 
     
 def collect_ortholog_accesssions(query_id, candidate_list, workdir):
     
@@ -242,7 +241,6 @@ def count_orthologs(workdir):
             
 def main():
     
-    
     # Parse command line arguments
     parser = argparse.ArgumentParser(description="")
     parser.add_argument("-i", "--query_id", help="ID of the query microbe")
@@ -265,14 +263,14 @@ def main():
     logger.info(f"Collecting {len(candidate_list)} ortholog datasets for {args.query_id}...")
     
     # collect ortholog accessions for the query sequence
-    query_dict, taxon_dict, candidate_sources = collect_ortholog_accesssions(args.query_id, candidate_list, args.max_ortho_seqs, args.workdir)
+    query_dict, taxon_dict, candidate_sources = collect_ortholog_accesssions(args.query_id, candidate_list, args.workdir)
    
     # load genome record json
     with open(args.genome_record_json, 'r') as f:
         genome_accession_dict = json.load(f)
             
     # download
-    download_gene_data_packages(taxon_dict, genome_accession_dict, args.workdir)
+    download_gene_data_packages(taxon_dict, genome_accession_dict, int(args.max_ortho_seqs), args.workdir)
     
     # Check for candidate IDs not in the candidate source list 
     missing_ids = set(candidate_list) - set(candidate_sources)
