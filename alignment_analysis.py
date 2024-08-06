@@ -252,9 +252,9 @@ def plot_evorate_stats(data_frame, output_path):
     # Create a multipanel scatter plot
     fig, axes = plt.subplots(nrows=1, ncols=len(evorate_stats.columns), figsize=(15, 5))
     
-   if 'p-value' in data_frame.columns:
+    if 'p_value' in data_frame.columns:
         # coloring by significance based on BUSTED resultss
-        colors = ['red' if val > 0.05 else 'blue' for val in data_frame['p-value']]
+        colors = ['red' if val < 0.05 else 'blue' for val in data_frame['p_value']]
         
     # Iterate over each evorate stat column
     for i, column in enumerate(evorate_stats.columns[:2]):
