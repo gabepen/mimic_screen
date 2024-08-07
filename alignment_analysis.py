@@ -252,14 +252,30 @@ def plot_evorate_stats(data_frame, output_path):
     # Create a multipanel scatter plot
     fig, axes = plt.subplots(nrows=1, ncols=len(evorate_stats.columns), figsize=(15, 5))
     
-    if 'p_value' in data_frame.columns:
-        # coloring by significance based on BUSTED resultss
-        colors = ['red' if val < 0.05 else 'blue' for val in data_frame['p_value']]
+    
+    # coloring by significance based on BUSTED results
+    red_indices = []
+    blue_indices = []
+    grey_indices = []
+    for index, row in data_frame.iterrows():
+        if row['test_shared_p_value'] < 0.05:
+            if row['test_p_value'] > row['background_p_value']:
+                red_indices.append(index)
+            else:
+                blue_indices.append(index)
+        else:
+            grey_indices.append(index)
+        
         
     # Iterate over each evorate stat column
     for i, column in enumerate(evorate_stats.columns[:2]):
         ax = axes[i]
-        ax.scatter(fraction_freeliving, evorate_stats[column], c=colors)
+        # Plot untested points first 
+        ax.scatter(fraction_freeliving[grey_indices], evorate_stats[column][grey_indices], c='grey', zorder=1)
+        # Plot blue points next 
+        ax.scatter(fraction_freeliving[blue_indices], evorate_stats[column][blue_indices], c='blue', zorder=2)
+        # Plot red points on top
+        ax.scatter(fraction_freeliving[red_indices], evorate_stats[column][red_indices], c='red', zorder=3)
         ax.set_xlabel('Fraction Freeliving')
         ax.set_ylabel(' '.join([word.capitalize() for word in column.split('_')]))
     
@@ -330,7 +346,7 @@ def main():
         evorate_df = parse_hyphy_output.parse_absrel_results(args.evorate_analysis, args.id_map)
         
         if args.busted_analysis:
-            busted_df = parse_hyphy_output.parse_busted_results(args.busted_analysis, args.id_map)
+            busted_df = parse_hyphy_output.parse_busted_ph_results(args.busted_analysis, args.id_map)
             evorate_df = pd.merge(evorate_df, busted_df, on='query', how='left')
     
         # merge all evorate stats into alignment_df for plotting

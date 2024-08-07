@@ -135,6 +135,53 @@ def parse_busted_results(directory, id_map_file):
     datatable = pd.DataFrame(data)
     return datatable      
 
+def parse_busted_ph_results(directory, id_map_file):
+    
+    if id_map_file:
+        id_map = load_id_map(id_map_file)
+    
+    data = []
+    
+     # parse directory of busted result json files
+    for filename in os.listdir(directory):
+        if filename.endswith('.json'):
+            filepath = os.path.join(directory, filename)
+            
+            with open(filepath) as file:
+                try:
+                    json_data = json.load(file)
+                # catching empty json files from halted or failed snakemake runs
+                except json.JSONDecodeError:
+                    continue
+                
+                # counter number of branches included in the foreground set
+                number_of_foregound_branches = 0 
+                for tested_node in json_data['tested']['0']:
+                    if json_data['tested']['0'][tested_node] == 'test':
+                        number_of_foregound_branches += 1
+                    
+                # convert seq id to uniprot id if id_map is provided
+                refseq_accession = os.path.splitext(filename)[0].replace('_flagged.treefile_busted', '')
+                try:
+                    prot_id = id_map[refseq_accession]
+                except KeyError:
+                    prot_id = refseq_accession
+                    
+                # determine significance
+                data.append({
+                    'query': prot_id,
+                    'foreground_branches': number_of_foregound_branches,
+                    'test_p_value': json_data['test results']['p-value'],
+                    'test_LRT': json_data['test results']['LRT'],
+                    'background_p_value': json_data['test results background']['p-value'],
+                    'background_LRT': json_data['test results background']['LRT'],
+                    'test_shared_p_value': json_data['test results shared distributions']['p-value'],
+                    'test_shared_LRT': json_data['test results shared distributions']['LRT']
+                })
+                
+    datatable = pd.DataFrame(data)
+    return datatable      
+
 def main():
     parser = argparse.ArgumentParser(description='Parse hyphy JSON files')
     parser.add_argument('-d','--directory', help='Path to the directory containing JSON files')
@@ -149,10 +196,13 @@ def main():
             symbiont_ids = file.read().splitlines()
         
     if args.test_type == 'absrel':
-        parse_absrel_results(args.directory, args.id_map, symbiont_ids).to_csv(args.output + '/absrel_results.csv', index=False)
+        parse_absrel_results(args.directory, args.id_map).to_csv(args.output + '/absrel_results.csv', index=False)
 
     if args.test_type == 'busted':
         parse_busted_results(args.directory, args.id_map).to_csv(args.output + '/busted_results.csv', index=False)
+    
+    if args.test_type == 'busted-ph':
+        parse_busted_ph_results(args.directory, args.id_map).to_csv(args.output + '/busted-ph_results.csv', index=False)
     
     
 if __name__ == '__main__':
