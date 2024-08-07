@@ -6,7 +6,7 @@ accession_list: "data/legionella_ALL.txt"
 microbe_id: '272624'
 taxon_id: '1236'
 work_dir: 'lp_outputs'
-max_genomes: '300'
+max_genomes: '200'
 hyphy_e_number: '0.04' # sets hyphy pre-process.bf acceptance of low homology sequences (lower float = less stringent)
 
 # Logging

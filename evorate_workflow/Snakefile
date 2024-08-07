@@ -1,6 +1,6 @@
 import glob
 
-configfile: "config/hp_config.yaml"
+configfile: "config/lp_config.yaml"
 
 samples = []
 with open(config["accession_list"], 'r') as file:

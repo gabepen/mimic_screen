@@ -157,8 +157,20 @@ def download_gene_data_packages(taxon_dict, accession_dict, max_ortho_seqs, work
         for target_fasta in seq_dict:
             with open(target_fasta, 'a+') as m:
                 seq_content_list = seq_dict[target_fasta]
+                
+                # identify source seq for target fasta
+                source_wp_accession = target_fasta.split('/')[-2]
+                for seq_content in seq_content_list:
+                    if seq_content[0].split('protein_accession=')[-1].split(']') == source_wp_accession:
+                        
+                        # write source seq first
+                        m.write(seq_content[0])
+                        m.write(seq_content[1])
+                        break
+                
+                # write up to max_ortho_seqs ortholog sequences
                 random.shuffle(seq_content_list)
-                for seq_content in seq_content_list[:max_ortho_seqs+1]:
+                for seq_content in seq_content_list[:max_ortho_seqs]:
                     m.write(seq_content[0])
                     m.write(seq_content[1])
     
@@ -184,7 +196,7 @@ def collect_ortholog_accesssions(query_id, candidate_list, workdir):
             taxid = file.split('_')[0]
             
             # prep taxon dict 
-            taxon_dict[taxid] = []
+            taxon_dict[taxid] = [(fields[0], fields[0])]
             
             # Open the rbh file for the query sequence
             with open(os.path.join(workdir, 'rbh_results', file), 'r') as f:
@@ -203,7 +215,7 @@ def collect_ortholog_accesssions(query_id, candidate_list, workdir):
                           
                         # map candidate accession to its orthologs 
                         if fields[0] not in query_dict:
-                            query_dict[fields[0]] = [fields[1]]
+                            query_dict[fields[0]] = [fields[0],fields[1]]
                                                
                         else:
                             query_dict[fields[0]].append(fields[1])

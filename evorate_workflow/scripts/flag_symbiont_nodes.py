@@ -16,10 +16,12 @@ def flag_nodes(treefile, id_list):
                 if tax_id in id_list:
                 # flag the node with the FG flag for BUSTED 
                     node.name += '{FG}'
+                else:
+                    node.name += '{BG}'
 
             except IndexError:
                 print(node.name)
-                input()
+                print('Error in parsing tax id')
             
             
         
