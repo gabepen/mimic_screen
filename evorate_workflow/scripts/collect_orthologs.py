@@ -195,11 +195,18 @@ def collect_ortholog_accesssions(query_id, candidate_list, workdir):
             # get target organism tax id
             taxid = file.split('_')[0]
             
-            # prep taxon dict 
-            taxon_dict[taxid] = [(fields[0], fields[0])]
-            
             # Open the rbh file for the query sequence
             with open(os.path.join(workdir, 'rbh_results', file), 'r') as f:
+                
+                # Read the first line to skip the header
+                header = f.readline()
+                fields = header.strip().split()  
+                
+                # prep taxon dict
+                taxon_dict[taxid] = [(fields[0], fields[0])]
+                
+                # Reset the file pointer to the beginning
+                f.seek(0)
                 
                 # Parse the file line by line
                 for line in f:
@@ -208,7 +215,7 @@ def collect_ortholog_accesssions(query_id, candidate_list, workdir):
                     fields = line.strip().split()
                     
                     # Write out rbh hits to the query accession number
-                    if fields[0] in candidate_list:
+                    if fields[0] in candidate_list: 
                         
                         # candidate has at least one ortholog seq
                         candidate_sources.add(fields[0]) 

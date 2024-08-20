@@ -11,10 +11,12 @@ import json
 import multiprocessing as mp
 from queue import Queue
 from functools import partial
-import pdb
 import time
+import urllib.request
+import ordered_replicon
+from io import TextIOWrapper
 
-def taxonkit_get_subtree(taxid):
+def taxonkit_get_subtree(taxid: str) -> list:
 
     '''Uses taxonkit to generate a list of subspecies for a given taxid'''
     taxonkit_command = f"taxonkit list --ids {taxid} --indent '' -r"
@@ -31,13 +33,34 @@ def taxonkit_get_subtree(taxid):
         
     return species_taxids          
 
-def dataset_download(dl_command, taxid, taxon_genome_map, 
-                     counter, success_queue, genomes_selected, max_genome_count, 
-                     max_genome_event):
+def dataset_download(dl_command, taxid, taxon_genome_map,
+                     success_queue, fg_genomes_selected, 
+                     bg_genomes_selected, max_genome_count, 
+                     max_genome_event, macsyfinder_workdir):
     
-    #configure_mp_logger(log_queue, log_file)
-    
-    def map_id_to_genome(taxid, archive_path):
+    def run_macsyfinder_TXSScan(proteome_file: str, output_dir: str) -> bool:
+        
+        macsyfinder_argument = ["macsyfinder", "--sequence-db", proteome_file, "-o", output_dir,
+                                "--models", "TXSScan", "all", "--db-type", "ordered_replicon",
+                                "-w", "4", "--models-dir", "macsyfinder_models",  "--mute"]
+        
+        # Run macsyfinder subprocess
+        subprocess.run(macsyfinder_argument)
+        
+        # check for output file 
+        if not os.path.exists(output_dir + '/best_solution.tsv'):
+            return False
+        
+        # check output for identified secretion systems
+        best_solution_tsv = output_dir + '/best_solution.tsv'
+        with open(best_solution_tsv, 'r') as f:
+            lines = f.readlines()
+            if "# No Systems found" in lines[3]:
+                return False
+            else:
+                return True
+        
+    def map_id_to_genome(taxid: str, archive_path: str) -> dict:
         
         ''' nested to be called for both existing archives and new archives'''
         # Open the zip archive
@@ -84,14 +107,70 @@ def dataset_download(dl_command, taxid, taxon_genome_map,
         dl_error_message = dl_error_message[1].strip().split('[')[0]
         logger.info(f"{dl_error_message} for taxid {taxid}")
         
-        # save taxid 
-        genomes_selected.append(taxid)
-        
+        # extract gff and proteome files for macsyfinder analysis 
+       
+        with zipfile.ZipFile(o_file, 'r') as zip_ref:
+            logger.info(o_file)
+            
+            
+            # Get the list of files in the archive
+            file_list = zip_ref.namelist()
+            
+            # find the protein and gff files
+            for file_name in file_list:
+                if file_name.endswith('protein.faa'):
+                    protein_file = file_name
+                elif file_name.endswith('genomic.gff'):
+                    gff_file = file_name
+           
+            # check if the genome contains secretion systems
+            ordered_replicon_fasta_output = macsyfinder_workdir + f"/{taxid}_ordered_replicon.fasta"
+            try:
+                with zip_ref.open(protein_file) as protein_fasta, zip_ref.open(gff_file) as gff3:
+                    logger.info('running ordered replicon')
+                    ordered_replicon.order_proteins_by_gene_annotation(
+                        TextIOWrapper(gff3, encoding='utf-8'),
+                        TextIOWrapper(protein_fasta, encoding='utf-8'), 
+                        ordered_replicon_fasta_output
+                    )
+            except Exception as e:
+                logger.info(f"Failed to extract protein and gff files for taxid {taxid}, {e}")
+                return
+      
+            # run macsyfinder on the ordered replicon
+            try:
+                has_phenotype = run_macsyfinder_TXSScan(ordered_replicon_fasta_output, macsyfinder_workdir+f"/{taxid}")
+            except Exception as e:
+                logger.warning(f"Failed to run macsyfinder on taxid {taxid}, {e}")
+                has_phenotype = False
+            logger.info(f"Taxid {taxid} has phenotype: {has_phenotype}")  
+              
+            if has_phenotype:
+                # save taxid if forground genomes are not over half of the max genome count
+                if len(fg_genomes_selected) < int(max_genome_count / 2):
+                    fg_genomes_selected.append(taxid)
+                    logger.info(f"Taxid {taxid} is a fg genome")
+                    # increment the success count
+                    success_queue.put(1)
+                else:
+                    logger.info(f"Max foreground genomes reached skipping taxid {taxid}")
+                    os.remove(o_file)
+                    return
+            else:
+                if len(bg_genomes_selected) < int(max_genome_count / 2):
+                    bg_genomes_selected.append(taxid)
+                    logger.info(f"Taxid {taxid} is a bg genome")
+                    # increment the success count
+                    success_queue.put(1)
+                else:
+                    logger.info(f"Max background genomes reached skipping taxid {taxid}")
+                    os.remove(o_file)
+                    return
+                
         # save taxid - genome record map
         taxon_genome_map[taxid] = map_id_to_genome(taxid, o_file) 
         
-        # increment the success count
-        success_queue.put(1)
+       
         if success_queue.qsize() >= max_genome_count:
             max_genome_event.set()
             logger.info('Max genome number reached')
@@ -101,6 +180,7 @@ def dataset_download(dl_command, taxid, taxon_genome_map,
         dl_error_message = dl_output.stderr.decode().split('\n')
         dl_error_message = dl_error_message[1].strip().replace('Error:', '')
         logger.warning(f"Failed to download genome for taxid {taxid}, {dl_error_message}")
+        
     
 
 def monitor_downloads(max_genome_event, terminate_event, pool): 
@@ -114,12 +194,17 @@ def monitor_downloads(max_genome_event, terminate_event, pool):
             break
         time.sleep(2)  
 
-def download_genomes(id_list, max_genome_count, workdir, log_file):
+def download_genomes(id_list: list, max_genome_count: int, workdir: str, log_file: str) -> (list, dict):
     
     '''uses ncbi datasets to download genomes for a list of taxids'''
     
     # Create a directory to store the genomes
     os.makedirs(workdir + '/genomes', exist_ok=True)
+    
+    # Create temporary directory to store macsyfinder results
+    macsyfinder_workdir = workdir + '/tmp_macsyfinder'
+    os.makedirs(macsyfinder_workdir, exist_ok=True)
+    
     
     # shuffle taxid list 
     random.shuffle(id_list)
@@ -128,7 +213,7 @@ def download_genomes(id_list, max_genome_count, workdir, log_file):
     download_command = [
         "datasets", "download", "genome", "taxon", "taxid",
         "--filename", f"workdir/genomes/taxid_dataset.zip",
-        "--include", "seq-report,protein", "--annotated",
+        "--include", "seq-report,protein,gff3", "--annotated",
         "--assembly-source", "RefSeq", "--assembly-level", "complete",
         "--assembly-version", "latest", "--released-after", "01/01/2016",
         "--reference"
@@ -153,7 +238,7 @@ def download_genomes(id_list, max_genome_count, workdir, log_file):
         download_command = [
             "datasets", "download", "genome", "taxon", str(taxid),
             "--filename", f"{workdir}/genomes/{taxid}_dataset.zip",
-            "--include", "seq-report,protein", "--annotated",
+            "--include", "seq-report,protein,gff3", "--annotated",
             "--assembly-source", "RefSeq", "--assembly-level", "complete",
             "--assembly-version", "latest", "--released-after", "01/01/2016",
             "--reference"
@@ -167,16 +252,16 @@ def download_genomes(id_list, max_genome_count, workdir, log_file):
     # control a server process with a Manager to track succes_queue changes 
     with mp.Manager() as manager:
         success_queue = manager.Queue() 
-        genomes_selected = manager.list()
+        fg_genomes_selected = manager.list()
+        bg_genomes_selected = manager.list()
         taxid_genome_map = manager.dict()
          # for tracking downloads 
         max_genome_event = manager.Event()
-        counter = manager.Value('i', 0)
         log_queue = manager.Queue()
         terminate_event = manager.Event()  
         
         # create processes
-        with mp.Pool(processes=50) as pool:
+        with mp.Pool(processes=100) as pool:
             
             # Start the monitor_downloads function in a separate thread
             monitor_process = mp.Process(target=monitor_downloads, args=(max_genome_event, terminate_event, pool))
@@ -184,7 +269,8 @@ def download_genomes(id_list, max_genome_count, workdir, log_file):
             
             # multi-threaded download ansyn 
             results = [pool.apply_async(dataset_download, args=(download_command, taxid, taxid_genome_map, 
-                                                                counter, success_queue, genomes_selected, max_genome_count, max_genome_event)) 
+                                                                success_queue, fg_genomes_selected, bg_genomes_selected, 
+                                                                max_genome_count, max_genome_event, macsyfinder_workdir)) 
                        for download_command, taxid in zip(download_commands, taxids_used)]
             
             # moinitor monitoring loop 
@@ -197,20 +283,27 @@ def download_genomes(id_list, max_genome_count, workdir, log_file):
                 elif all(result.ready() for result in results):
                     logger.info("All possible downloads attempted")
                     terminate_event.set()
+                    max_genome_event.set()
+                    pool.close()
+                    logger.info("Pool Closed")
                     pool.terminate()
+                    logger.info("Pool Terminated")
                     pool.join()
+                    logger.info("Pool Joined")
                     break
                 time.sleep(2) # check every two seconds
             
+            logger.info("Terminating monitor process")
             # stop monitor 
             monitor_process.join()
+            logger.info("Terminated monitor process")
             
             
             
-            logger.info(f"Downloaded {len(genomes_selected)} genomes of {max_genome_count} requested")
-            # return first taxids selected up until max_genome_count in case there were more downloaded after the pool termination 
-            return list(genomes_selected), dict(taxid_genome_map)
-        return list(genomes_selected), dict(taxid_genome_map) 
+            logger.info(f"Downloaded {len(fg_genomes_selected)} foreground genomes and {len(bg_genomes_selected)} background genomes of {max_genome_count} requested")
+        # return first taxids selected up until max_genome_count in case there were more downloaded after the pool termination 
+        
+        return list(fg_genomes_selected)+list(bg_genomes_selected), dict(taxid_genome_map) 
 
 def main():
 
@@ -234,7 +327,7 @@ def main():
     logger.remove()  # Remove default handler
     timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
     log_file = args.log + f"ncbi_genome_download_{timestamp}.log"
-    logger.add(log_file, enqueue=True, rotation="500 MB") # Add a log file handler
+    logger.add(log_file, enqueue=True, rotation="10 MB") # Add a log file handler
     
     
     # make workdir
@@ -250,8 +343,11 @@ def main():
     
     # Save list of genomes used for downstream analysis 
     with(open(f"{args.log}/genomes_selected.txt", 'w')) as f:
-        for taxid in genomes_selected:
+        # Write all file names of zip files in the genomes directory
+        zip_files = [file for file in os.listdir(f"{args.workdir}/genomes/") if file.endswith(".zip")]
+        for zip_file in zip_files:
+            taxid = zip_file.split('_')[0]
             f.write(f"{taxid}\n")
-    
+            
 if __name__ == "__main__":
     main()
