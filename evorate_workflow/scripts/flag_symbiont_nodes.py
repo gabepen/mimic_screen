@@ -3,9 +3,10 @@ import argparse
 import os
 import json
 from tqdm import tqdm
+import sys
 
 def flag_nodes(treefile, fg_id_list):
-
+    
     # load tree
     tree = Tree(treefile)
     # print tree nodes
@@ -53,7 +54,7 @@ def generate_id_list(genome_selected_file: str, results_dir: str) -> (list, list
                 continue
     
     return fg_ids, bg_ids
-    
+   
     
 
 def main():
@@ -62,15 +63,19 @@ def main():
     parser.add_argument('-t','--tree_file_dir', default=None, help='Path to the newick tree')
     parser.add_argument('-g','--genome_selected_file', default=None, help='Path to the genome selected file')
     parser.add_argument('-r','--results_dir', default=None, help='Path to the results directory')
+    parser.add_argument('-f','--foreground_ids', default=None, help='Path to the foreground ids file, all other ids will be considered background')
     args = parser.parse_args()
 
     if args.id_file :
         with open(args.id_file) as file:
             symbiont_ids = file.read().splitlines()
     
-    if args.genome_selected_file:
+    if args.genome_selected_file and not args.foreground_ids:
         fg_ids, bg_ids = generate_id_list(args.genome_selected_file, args.results_dir)
-    
+    elif args.foreground_ids:
+        with open(args.foreground_ids) as file:
+            fg_ids = file.read().splitlines()
+
     for sample_dir in os.listdir(args.tree_file_dir):
         tree_file_path = os.path.join(args.tree_file_dir, sample_dir, sample_dir + '.treefile')
         if os.path.exists(tree_file_path):
