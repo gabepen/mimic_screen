@@ -14,7 +14,7 @@ def flag_nodes(treefile, fg_id_list):
         if node.is_leaf():
             try:
                 tax_id = node.name.split('_')[-2]
-                if tax_id in fg_id_list:
+                if tax_id in fg_id_list or tax_id == 'CANDIDATE':
                 # flag the node with the FG flag for BUSTED 
                     node.name += '{FG}'
                 else:
