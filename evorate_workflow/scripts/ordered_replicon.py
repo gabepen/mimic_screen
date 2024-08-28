@@ -14,7 +14,7 @@ def order_proteins_by_gene_annotation(gff3_file, proteome_fasta, output):
     features = [l for l in gff3_file.readlines() if not l.startswith("#")]
     for feature in features:
         fields = feature.split("\t")
-        if fields[1] == "Protein Homology":
+        if fields[1] == "Protein Homology" or fields[1] == "GeneMarkS-2+":
             protein_id = fields[8].split(";")[0].split("=")[1].split('-')[1]
             gene_info = pd.concat([gene_info, pd.DataFrame({"chromosome": [fields[0]], "start": [int(fields[3])], "end": [fields[4]], "protein_id": [protein_id]})], ignore_index=True)
     
