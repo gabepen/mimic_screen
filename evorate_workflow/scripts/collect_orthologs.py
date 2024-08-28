@@ -119,8 +119,13 @@ def download_gene_data(taxid, taxon_dict, accession_dict, seq_dict, workdir):
 
             # sequence information stored in tuple
             seq_record.description =  seq_record.description = ']'.join(seq_record.description.split(']')[:1]) + '] ' + taxid
-            seq_content = (f">{seq_record.description}\n", str(seq_record.seq) + "\n")
-
+            
+            # if the source_wp_accession matches the ortho accessission this is the mimic candidate gene
+            if source_wp_accession == ortho_wp_accession:
+                seq_content = (f">{seq_record.description}_MIMIC_CANDIDATE\n", str(seq_record.seq) + "\n")
+            else:
+                seq_content = (f">{seq_record.description}\n", str(seq_record.seq) + "\n")
+                
             # Append sequences to multiseq fasta file 
             if target_fasta not in seq_dict:
                 seq_dict[target_fasta] = [seq_content]
@@ -139,7 +144,7 @@ def download_gene_data(taxid, taxon_dict, accession_dict, seq_dict, workdir):
     # remove gene dataset file 
     shutil.rmtree(packet_fasta)
 
-def download_gene_data_packages(taxon_dict, accession_dict, max_ortho_seqs, workdir):
+def download_gene_data_packages(query_id, taxon_dict, accession_dict, max_ortho_seqs, workdir):
     
     with mp.Manager() as manager:
         seq_dict = manager.dict() 
@@ -153,20 +158,10 @@ def download_gene_data_packages(taxon_dict, accession_dict, max_ortho_seqs, work
         logger.info("Pool closed")
         
         
-        # seq_dict should contain all sequences to be written to all target fasta files in the form of tuples
+        # seq_dict contains all sequences to be written to all target fasta files in the form of tuples
         for target_fasta in seq_dict:
             with open(target_fasta, 'a+') as m:
                 seq_content_list = seq_dict[target_fasta]
-                
-                # identify source seq for target fasta
-                source_wp_accession = target_fasta.split('/')[-2]
-                for seq_content in seq_content_list:
-                    if seq_content[0].split('protein_accession=')[-1].split(']') == source_wp_accession:
-                        
-                        # write source seq first
-                        m.write(seq_content[0])
-                        m.write(seq_content[1])
-                        break
                 
                 # write up to max_ortho_seqs ortholog sequences
                 random.shuffle(seq_content_list)
@@ -185,6 +180,7 @@ def collect_ortholog_accesssions(query_id, candidate_list, workdir):
     # dictionaries for sorting accessions 
     query_dict = {}
     taxon_dict = {}
+    taxon_dict[query_id] = []
     
     # set for storing candidate IDs where at least one ortholog seq was identified
     candidate_sources = set()
@@ -198,16 +194,6 @@ def collect_ortholog_accesssions(query_id, candidate_list, workdir):
             # Open the rbh file for the query sequence
             with open(os.path.join(workdir, 'rbh_results', file), 'r') as f:
                 
-                # Read the first line to skip the header
-                header = f.readline()
-                fields = header.strip().split()  
-                
-                # prep taxon dict
-                taxon_dict[taxid] = [(fields[0], fields[0])]
-                
-                # Reset the file pointer to the beginning
-                f.seek(0)
-                
                 # Parse the file line by line
                 for line in f:
                     
@@ -216,6 +202,9 @@ def collect_ortholog_accesssions(query_id, candidate_list, workdir):
                     
                     # Write out rbh hits to the query accession number
                     if fields[0] in candidate_list: 
+                        
+                        # storing all mimic candidate accessions in the taxon_dict
+                        taxon_dict[query_id].append((fields[0],fields[0]))
                         
                         # candidate has at least one ortholog seq
                         candidate_sources.add(fields[0]) 
@@ -228,7 +217,10 @@ def collect_ortholog_accesssions(query_id, candidate_list, workdir):
                             query_dict[fields[0]].append(fields[1])
                         
                         # map taxid to its orthologs 
-                        taxon_dict[taxid].append((fields[0],fields[1]))
+                        if taxid not in taxon_dict:
+                            taxon_dict[taxid] = [(fields[0],fields[1])]
+                        else:
+                            taxon_dict[taxid].append((fields[0],fields[1]))
 
     return query_dict, taxon_dict, candidate_sources
    
@@ -289,7 +281,7 @@ def main():
         genome_accession_dict = json.load(f)
             
     # download
-    download_gene_data_packages(taxon_dict, genome_accession_dict, int(args.max_ortho_seqs), args.workdir)
+    download_gene_data_packages(args.query_id, taxon_dict, genome_accession_dict, int(args.max_ortho_seqs), args.workdir)
     
     # Check for candidate IDs not in the candidate source list 
     missing_ids = set(candidate_list) - set(candidate_sources)
