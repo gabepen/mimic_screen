@@ -1,6 +1,6 @@
 import glob
 
-configfile: "config/lp_config.yaml"
+configfile: "config/wmel_config.yaml"
 
 samples = []
 with open(config["accession_list"], 'r') as file:
@@ -40,7 +40,7 @@ def wait_for_genomes(wc):
     from pathlib import Path
     checkpoint_output = checkpoints.download_genomes.get(**wc).output[0]
     genomes = [f.stem for f in Path(checkpoint_output).glob("*.zip")]
-    return expand("{work_dir}/rbh_results/{genome}.tsv", work_dir=wc.work_dir, genome=genomes)
+    return expand("{work_dir}/rbh_results/{genome}_filtered.tsv", work_dir=wc.work_dir, genome=genomes)
         
 rule mmseq_rbh:
     input:
@@ -56,7 +56,7 @@ rule mmseq_rbh:
         log_file=lambda wildcards: config["log_path"],
         genome_ids=lambda wildcards: "{}genomes_selected.txt".format(config["log_path"])
     output:
-        "{work_dir}/rbh_results/{genome}.tsv" 
+        "{work_dir}/rbh_results/{genome}_filtered.tsv" 
     shell:
         """
         python scripts/mmseq_rbh.py \
@@ -101,7 +101,7 @@ checkpoint collect_orthologs:
             -w {params.work_dir} \
             -j {params.work_dir}/genomes/genome_accession_map.json \
             -l {params.log_file} \
-            -m {params.max_ortho_seqs}
+            -m {params.max_ortho_seqs} 
         """
 
 rule collect_gene_datasets:
@@ -145,9 +145,19 @@ rule hyphy_codon_postprocess:
         hyphy scripts/hyphy-analyses/codon-msa/post-msa.bf --protein-msa {input.prot_msa} --nucleotide-sequences {input.nuc_seqs} --output {output}
         '''
 
-rule iqtree:
+rule trimAL:
     input:
         "{work_dir}/msa_files/{sample}/{sample}_codon.msa"
+    output:
+        "{work_dir}/msa_files/{sample}/{sample}_codon_trimmed.msa"
+    shell:
+        '''
+        trimal -in {input} -out {output} -automated1
+        '''
+
+rule iqtree:
+    input:
+        "{work_dir}/msa_files/{sample}/{sample}_codon_trimmed.msa"
     output:
         "{work_dir}/tree_files/{sample}/{sample}.treefile"
     shell:
