@@ -4,6 +4,7 @@ import subprocess
 import shutil
 import argparse
 from loguru import logger
+import filter_rbh_results
 
 def mmseq2_RBH(query_proteome, query_id, workdir, genome_archive, genomes_selected, threads):
     
@@ -33,19 +34,29 @@ def mmseq2_RBH(query_proteome, query_id, workdir, genome_archive, genomes_select
     
     # Establish the path for the RBH output file
     rbh_output_path = f"{workdir}/rbh_results/{taxid}_dataset.tsv"
+    rbh_filtered_output_path = f"{workdir}/rbh_results/{taxid}_dataset_filtered.tsv"
+    
+    # Set output format 
+    output_fields = '"query,target,fident,alnlen,mismatch,tlen,qlen,qcov,tcov,evalue"'
     
     # Check if the rbh results already exist
+    '''
     if os.path.exists(rbh_output_path):
         # Clean up the extracted files
         shutil.rmtree(extract_dir)
         return
+    '''
     
     # Run mmseqs easy-rbh to identify orthologs
-    mmseqs_command = f"mmseqs easy-rbh {query_proteome} {t_fasta} {rbh_output_path} {workdir}/tmp_{taxid} --threads {threads} > /dev/null"
+    mmseqs_command = f"mmseqs easy-rbh {query_proteome} {t_fasta} {rbh_output_path} {workdir}/tmp_{taxid} --threads {threads} --format-output {output_fields}" #> /dev/null"
     subprocess.run(mmseqs_command, shell=True)
     
     # log mmseq genome usage 
     logger.info(f"{taxid} | {genome_accession}")
+    
+    # filtering the results
+    filtered_line_counts = filter_rbh_results.filter_rbh_results(rbh_output_path, rbh_filtered_output_path)
+    logger.info(f"evalue filtered: {filtered_line_counts[0]} | coverage filtered: {filtered_line_counts[1]}")
     
     # Clean up the extracted files
     shutil.rmtree(extract_dir)

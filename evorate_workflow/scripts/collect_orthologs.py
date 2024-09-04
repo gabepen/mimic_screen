@@ -186,7 +186,7 @@ def collect_ortholog_accesssions(query_id, candidate_list, workdir):
     candidate_sources = set()
     
     for file in os.listdir(workdir + '/rbh_results'):
-        if file.endswith(".tsv"):
+        if file.endswith("_filtered.tsv"):
             
             # get target organism tax id
             taxid = file.split('_')[0]
