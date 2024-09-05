@@ -374,7 +374,7 @@ def main():
    # multi_panel_alignmentspace(data_table1, data_table2, 'Legionella - Human', 'wMel - Drosophila', )
     mp_label_array = [['tcov', 'tcov'],
                       ['tm-score', 'tm-score']]
-    multi_panel_hist_scatter(data_table1, data_table2, mp_label_array, 'Helicobacter pylori - Human', 'Legionella - Human', args.output_path)
+    multi_panel_hist_scatter(data_table1, data_table2, mp_label_array, 'Legionella - Acanthamoeba', 'Legionella - Human', args.output_path)
 
 if __name__ == '__main__':
     main()
