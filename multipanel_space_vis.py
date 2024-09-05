@@ -20,7 +20,7 @@ def draw_box_around_region(xmin, xmax, ymin, ymax, color, plt):
 
 def table_to_frame(data_table):
 
-    df = pd.DataFrame(data_table, columns = ['id','tm-score','tcov','fident','algn_fraction','target','classification'])
+    df = pd.DataFrame(data_table, columns = ['id','tm-score','tcov','qcov','fident','algn_fraction','target','classification'])
     df = df.sort_values(by=['classification'], ascending=False)
     a = df.classification=='candidate'
     cdf = df[a] # controlled alignment data frame
