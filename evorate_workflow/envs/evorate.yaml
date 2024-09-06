@@ -1,16 +1,21 @@
-name: evorate
+name: evorate2
 channels:
-  - bioconda
   - biocore
+  - genomedk
+  - anaconda
+  - bioconda
   - conda-forge
 dependencies:
   - _libgcc_mutex=0.1=conda_forge
   - _openmp_mutex=4.5=2_gnu
+  - _sysroot_linux-64_curr_repodata_hack=3=h69a702a_16
   - amply=0.1.6=pyhd8ed1ab_0
   - appdirs=1.4.4=pyh9f0ad1d_0
   - argparse-dataclass=2.0.0=pyhd8ed1ab_0
   - aria2=1.37.0=h347180d_1
   - attmap=0.13.2=pyhd8ed1ab_0
+  - binutils_impl_linux-64=2.40=ha885e6a_0
+  - binutils_linux-64=2.40=hb3c18ed_9
   - biopython=1.83=py312h98912ed_0
   - brotli-python=1.1.0=py312h30efb56_1
   - bzip2=1.0.8=hd590300_5
@@ -19,6 +24,7 @@ dependencies:
   - certifi=2024.8.30=pyhd8ed1ab_0
   - cffi=1.17.0=py312h1671c18_0
   - charset-normalizer=3.3.2=pyhd8ed1ab_0
+  - clustalw=2.1=h4ac6f70_10
   - coin-or-cbc=2.10.10=h9002f0b_0
   - coin-or-cgl=0.60.7=h516709c_0
   - coin-or-clp=1.17.8=h1ee7a9c_0
@@ -34,12 +40,18 @@ dependencies:
   - dpath=2.1.6=pyha770c72_0
   - eido=0.2.2=pyhd8ed1ab_0
   - exceptiongroup=1.2.0=pyhd8ed1ab_2
+  - expat-cos6-x86_64=2.0.1=4
+  - expat-devel-cos6-x86_64=2.0.1=4
   - gawk=5.3.0=ha916aea_0
+  - gcc_impl_linux-64=13.2.0=h9eb54c0_13
+  - gcc_linux-64=13.2.0=h50dba11_9
+  - gdbm=1.18=h0a1914f_2
   - gettext=0.22.5=h59595ed_2
   - gettext-tools=0.22.5=h59595ed_2
   - gitdb=4.0.11=pyhd8ed1ab_0
   - gitpython=3.1.43=pyhd8ed1ab_0
   - gmp=6.3.0=h59595ed_1
+  - guidance=2.02=1
   - h2=4.1.0=pyhd8ed1ab_0
   - hmmer=3.1b2=0
   - hpack=4.0.0=pyh9f0ad1d_0
@@ -57,6 +69,7 @@ dependencies:
   - jupyter_core=5.7.2=py312h7900ff3_0
   - kalign3=3.4.0=hdbdd923_0
   - kcalign=1.0.2=py_0
+  - kernel-headers_linux-64=3.10.0=h4a8ded7_16
   - keyutils=1.6.1=h166bdaf_0
   - krb5=1.21.2=h659d440_0
   - ld_impl_linux-64=2.40=h55db66e_0
@@ -65,16 +78,19 @@ dependencies:
   - libblas=3.9.0=22_linux64_openblas
   - libcblas=3.9.0=22_linux64_openblas
   - libcurl=8.7.1=hca28451_0
+  - libdb=6.2.32=h9c3ff4c_0
   - libedit=3.1.20191231=he28a2e2_2
   - libev=4.33=hd590300_2
   - libexpat=2.6.2=h59595ed_0
   - libffi=3.4.2=h7f98852_5
-  - libgcc-ng=13.2.0=h77fa898_7
+  - libgcc=14.1.0=h77fa898_1
+  - libgcc-devel_linux-64=13.2.0=hdb50d1a_113
+  - libgcc-ng=14.1.0=h69a702a_1
   - libgettextpo=0.22.5=h59595ed_2
   - libgettextpo-devel=0.22.5=h59595ed_2
   - libgfortran-ng=13.2.0=h69a702a_7
   - libgfortran5=13.2.0=hca663fb_7
-  - libgomp=13.2.0=h77fa898_7
+  - libgomp=14.1.0=h77fa898_1
   - libiconv=1.17=hd590300_2
   - libidn2=2.3.7=hd590300_0
   - liblapack=3.9.0=22_linux64_openblas
@@ -82,6 +98,7 @@ dependencies:
   - libnghttp2=1.58.0=h47da74e_1
   - libnsl=2.0.1=hd590300_0
   - libopenblas=0.3.27=pthreads_h413a1c8_0
+  - libsanitizer=13.2.0=h6ddb7a1_13
   - libsqlite=3.45.3=h2797004_0
   - libssh2=1.11.0=h0841786_0
   - libstdcxx-ng=13.2.0=hc0a3c3a_7
@@ -94,25 +111,28 @@ dependencies:
   - mafft=7.525=h031d066_1
   - markdown-it-py=3.0.0=pyhd8ed1ab_0
   - mdurl=0.1.2=pyhd8ed1ab_0
-  - mmseqs2=15.6f452=pl5321h6a68c12_2
   - mpfr=4.2.1=h9458935_1
   - mpi=1.0=openmpi
+  - muscle=5.1=h4ac6f70_3
   - nbformat=5.10.4=pyhd8ed1ab_0
   - ncbi-datasets-cli=16.23.0=ha770c72_0
   - ncurses=6.4.20240210=h59595ed_0
   - numpy=1.26.4=py312heda63a1_0
   - openmpi=4.1.6=hc5af2df_101
-  - openssl=3.3.1=h4bc722e_2
+  - openssl=3.3.2=hb9d3cd8_0
   - packaging=24.0=pyhd8ed1ab_0
   - pandas=2.2.2=py312hfb8ada1_0
   - peppy=0.40.1=pyhd8ed1ab_0
   - perl=5.32.1=7_hd590300_perl5
+  - perl-db-file=1.855=pl5321h779adbc_1
+  - perl-dbi=1.643=pl5321hec16e2b_1
   - pigz=2.8=h2797004_0
   - pip=24.0=pyhd8ed1ab_0
   - pkgutil-resolve-name=1.3.10=pyhd8ed1ab_1
   - plac=1.4.3=pyhd8ed1ab_0
   - platformdirs=4.2.1=pyhd8ed1ab_0
   - pluggy=1.5.0=pyhd8ed1ab_0
+  - prank=170427=h4ac6f70_0
   - psutil=5.9.8=py312h98912ed_0
   - pulp=2.8.0=py312h7900ff3_0
   - pycparser=2.22=pyhd8ed1ab_0
@@ -132,6 +152,7 @@ dependencies:
   - reretry=0.11.8=pyhd8ed1ab_0
   - rich=13.7.1=pyhd8ed1ab_0
   - rpds-py=0.18.1=py312h4413252_0
+  - ruby=3.2.2=h983345b_1
   - six=1.16.0=pyh6c4a22f_0
   - slack-sdk=3.27.1=pyha770c72_0
   - slack_sdk=3.27.1=hd8ed1ab_0
@@ -144,6 +165,7 @@ dependencies:
   - snakemake-interface-storage-plugins=3.2.2=pyhdfd78af_0
   - snakemake-minimal=8.11.3=pyhdfd78af_0
   - stopit=1.1.2=py_0
+  - sysroot_linux-64=2.17=h4a8ded7_16
   - tabulate=0.9.0=pyhd8ed1ab_1
   - throttler=1.2.2=pyhd8ed1ab_0
   - tk=8.6.13=noxft_h4845f30_101
@@ -187,4 +209,3 @@ dependencies:
       - snakemake-executor-plugin-slurm==0.5.1
       - snakemake-executor-plugin-slurm-jobstep==0.2.1
       - urllib3==1.26.15
-prefix: /private/groups/corbettlab/gabe/miniforge3/envs/evorate

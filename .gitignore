@@ -7,3 +7,4 @@
 __pycache__/
 evorate_workflow/scripts/__pycache__/
 taxon_selection/__pycache__/
+evorate_workflow/macsyfinder_models/
