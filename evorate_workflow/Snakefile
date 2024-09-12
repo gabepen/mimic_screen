@@ -1,6 +1,6 @@
 import glob
 
-configfile: "config/wmel_config2.yaml"
+configfile: "config/hp_config.yaml"
 
 samples = []
 with open(config["accession_list"], 'r') as file:
@@ -142,7 +142,7 @@ rule iqtree:
 
 rule absrel:
     input:
-        alignment="{work_dir}/msa_files/{sample}/{sample}_final_align_NT_renamed.aln",
+        alignment="{work_dir}/msa_files/{sample}/{sample}_final_align_NT.aln",
         tree="{work_dir}/tree_files/{sample}/{sample}.treefile"
     output:
         "{work_dir}/results/{sample}_absrel.json"
