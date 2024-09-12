@@ -1,3 +1,6 @@
 [submodule "evorate_workflow/scripts/hyphy-analyses"]
 	path = evorate_workflow/scripts/hyphy-analyses
 	url = https://github.com/veg/hyphy-analyses
+[submodule "evorate_workflow/scripts/MACSE_V2_PIPELINES"]
+	path = evorate_workflow/scripts/MACSE_V2_PIPELINES
+	url = https://github.com/ranwez/MACSE_V2_PIPELINES

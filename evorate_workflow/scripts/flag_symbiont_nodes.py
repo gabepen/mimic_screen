@@ -13,7 +13,7 @@ def flag_nodes(treefile, fg_id_list):
     for node in tree.traverse():
         if node.is_leaf():
             try:
-                tax_id = node.name.split('_')[-2]
+                tax_id = node.name.split('_')[-1]
                 if tax_id in fg_id_list or tax_id == 'CANDIDATE':
                 # flag the node with the FG flag for BUSTED 
                     node.name += '{FG}'
@@ -60,7 +60,7 @@ def generate_id_list(genome_selected_file: str, results_dir: str) -> (list, list
 def main():
     parser = argparse.ArgumentParser() 
     parser.add_argument('-i','--id_file', help='Path to the symbiont id file')
-    parser.add_argument('-t','--tree_file_dir', default=None, help='Path to the newick tree')
+    parser.add_argument('-t','--tree_file_dir', default=None, help='Path to evorate tree_files directory')
     parser.add_argument('-g','--genome_selected_file', default=None, help='Path to the genome selected file')
     parser.add_argument('-r','--results_dir', default=None, help='Path to the results directory')
     parser.add_argument('-f','--foreground_ids', default=None, help='Path to the foreground ids file, all other ids will be considered background')

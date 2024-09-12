@@ -15,7 +15,9 @@ def check_for_symbiosis(tax_id_list):
             reports = reports.replace('true', 'True')
             report_dict = eval(reports)
             sci_name = report_dict["reports"][0]["taxonomy"]["current_scientific_name"]["name"]
-            if "symbiont" in sci_name:
+            if 'symbiont' in sci_name.lower():
+                symbiotes.append(tax_id)
+            if 'candidatus' in sci_name.lower():
                 symbiotes.append(tax_id)
         except:
             print(f"Error with {tax_id}")
@@ -55,7 +57,7 @@ with open(tax_ids) as f:
     tax_id_list = f.readlines()
 
 #symbiotes = check_for_symbiosis(tax_id_list)
-infectious_bacs = check_for_infectious(tax_id_list)
+symbiotes = check_for_symbiosis(tax_id_list)
 
 with open(output_file, 'w+') as f:
     for tax_id in symbiotes:
