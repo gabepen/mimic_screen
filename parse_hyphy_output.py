@@ -20,11 +20,15 @@ def load_id_map(id_map_file):
 
     return id_map
     
-def parse_absrel_results(directory, id_map_file):
+def parse_absrel_results(directory, symbiont_ids, id_map_file):
     
     if id_map_file:
         id_map = load_id_map(id_map_file)
     data = []
+    
+    if symbiont_ids:
+        with open(symbiont_ids) as file:
+            symbiont_ids = file.readlines()
     
     # debug stat tracking
     tree_lengths = []
@@ -48,6 +52,13 @@ def parse_absrel_results(directory, id_map_file):
                 sig_full_model_nonsyn_branch_lens = []
                 sig_full_model_syn_branch_lens = []
                 branch_lengths = []
+                branch_dnds = []
+                symbiont_branch_dnds = []
+                symbiont_branch_dn = []
+                symbiont_branch_ds = []
+                non_symbiont_branch_dnds = []
+                non_symbiont_branch_dn = []
+                non_symbiont_branch_ds = []
                 selection_pvalues = 0
                 
                 # parse each branch in the json file for appropriate info 
@@ -58,6 +69,20 @@ def parse_absrel_results(directory, id_map_file):
                     full_model_nonsyn_branch_lens.append(json_data['branch attributes']['0'][branch]['Full adaptive model (non-synonymous subs/site)'])
                     full_model_syn_branch_lens.append(json_data['branch attributes']['0'][branch]['Full adaptive model (synonymous subs/site)'])
                     branch_lengths.append(json_data['branch attributes']['0'][branch]['Full adaptive model'])  
+                    branch_dnds.append(full_model_nonsyn_branch_lens[-1] / full_model_syn_branch_lens[-1])
+                        
+                    try:
+                        if branch.split('_')[-1] in symbiont_ids:
+                            symbiont_branch_dnds.append(full_model_nonsyn_branch_lens[-1] / full_model_syn_branch_lens[-1])
+                            symbiont_branch_dn.append(json_data['branch attributes']['0'][branch]['Full adaptive model (non-synonymous subs/site)'])
+                            symbiont_branch_ds.append(json_data['branch attributes']['0'][branch]['Full adaptive model (synonymous subs/site)'])
+                        else:
+                            non_symbiont_branch_dnds.append(full_model_nonsyn_branch_lens[-1] / full_model_syn_branch_lens[-1])
+                            non_symbiont_branch_dn.append(json_data['branch attributes']['0'][branch]['Full adaptive model (non-synonymous subs/site)'])
+                            non_symbiont_branch_ds.append(json_data['branch attributes']['0'][branch]['Full adaptive model (synonymous subs/site)'])
+                    except IndexError:
+                        # internal node dont inlcude in the dnds calculation
+                        pass
                                           
                     # values to store for branches with evidence of selection
                     if json_data['branch attributes']['0'][branch]['Corrected P-value'] < 0.05:
@@ -67,25 +92,31 @@ def parse_absrel_results(directory, id_map_file):
 
                 # convert file name to samplename if id_map is provided
                 if id_map_file:
-                    refseq_accession = os.path.splitext(filename)[0].replace('_absrel', '')
+                    refseq_accession = os.path.splitext(filename)[0].replace('.treefile_absrel', '')
                     try:
                         prot_id = id_map[refseq_accession]
                     except KeyError:
                         prot_id = refseq_accession
                     
                 
-                # add to data frame 
+                # add to data frame     
                 data.append({
                     'query': prot_id,
+                    'accession': refseq_accession,
                     'ns_per_site_avg': sum(full_model_nonsyn_branch_lens) / len(full_model_nonsyn_branch_lens) if full_model_nonsyn_branch_lens else None,
                     'syn_per_site_avg': sum(full_model_syn_branch_lens) / len(full_model_syn_branch_lens) if full_model_syn_branch_lens else None,
+                    'dnds_tree_avg': sum(branch_dnds) / len(branch_dnds) if branch_dnds else None,
+                    'symbiont_branch_dnds_avg': (sum(symbiont_branch_dn) / sum(symbiont_branch_ds)) if symbiont_branch_dnds else None,
+                    'symbiont_tree_dnds_avg': sum(symbiont_branch_dnds) / len(symbiont_branch_dnds) if symbiont_branch_dnds else None,
+                    'non_symbiont_branch_dnds_avg': (sum(non_symbiont_branch_dn) / sum(non_symbiont_branch_ds)) / len(non_symbiont_branch_dnds) if non_symbiont_branch_dnds else None,
+                    'non_symbiont_tree_dnds_avg': sum(non_symbiont_branch_dnds) / len(non_symbiont_branch_dnds) if non_symbiont_branch_dnds else None,
                     'selection_branch_count': selection_pvalues,
                     'total_branch_length': sum(branch_lengths),
                     'avg_branch_length': sum(branch_lengths) / len(branch_lengths),
                     'selected_ns_per_site_avg': (sum(sig_full_model_nonsyn_branch_lens) / len(sig_full_model_nonsyn_branch_lens)) / len(json_data['branch attributes']['0']) if sig_full_model_nonsyn_branch_lens else None,
                     'selected_syn_per_site_avg': (sum(sig_full_model_syn_branch_lens) / len(sig_full_model_syn_branch_lens)) / len(json_data['branch attributes']['0']) if sig_full_model_syn_branch_lens else None,
                     'branch_fraction': selection_pvalues / len(json_data['branch attributes']['0']) if selection_pvalues > 1 else 0,
-                    'branch_fraction_full_norm': (selection_pvalues / len(json_data['branch attributes']['0'])) / (sum(branch_lengths) / len(branch_lengths))
+                    'branch_fraction_full_norm': (selection_pvalues / len(json_data['branch attributes']['0'])) / (sum(branch_lengths) / len(branch_lengths)) if sum(branch_lengths) > 0 else 0,
                 })
                 
     datatable = pd.DataFrame(data)
@@ -135,7 +166,7 @@ def parse_busted_results(directory, id_map_file):
     datatable = pd.DataFrame(data)
     return datatable      
 
-def parse_busted_ph_results(directory, id_map_file):
+def parse_busted_ph_results(directory: str, id_map_file: str=None) -> pd.DataFrame:
     
     if id_map_file:
         id_map = load_id_map(id_map_file)
@@ -156,27 +187,47 @@ def parse_busted_ph_results(directory, id_map_file):
                 
                 # counter number of branches included in the foreground set
                 number_of_foregound_branches = 0 
+                number_of_backgound_branches = 0
                 for tested_node in json_data['tested']['0']:
                     if json_data['tested']['0'][tested_node] == 'test':
                         number_of_foregound_branches += 1
-                    
+                    elif json_data['tested']['0'][tested_node] == 'background':
+                        number_of_backgound_branches += 1
+                try:
+                    test_ratio = number_of_foregound_branches / (number_of_backgound_branches + number_of_foregound_branches)
+                    if test_ratio == 0:
+                        print(f'No foreground: {filename}')
+   
+                except ZeroDivisionError:
+                    print(f'No background: {filename}')
+                    test_ratio = 0
+                
+                
                 # convert seq id to uniprot id if id_map is provided
                 refseq_accession = os.path.splitext(filename)[0].replace('_flagged.treefile_busted', '')
-                try:
-                    prot_id = id_map[refseq_accession]
-                except KeyError:
+                if id_map_file:
+                    try:
+                        prot_id = id_map[refseq_accession]
+                    except KeyError:
+                        prot_id = refseq_accession
+                else:
                     prot_id = refseq_accession
-                    
+                        
+                
                 # determine significance
                 data.append({
                     'query': prot_id,
                     'foreground_branches': number_of_foregound_branches,
+                    'background_branches': number_of_backgound_branches,
+                    'test_ratio': test_ratio,
                     'test_p_value': json_data['test results']['p-value'],
                     'test_LRT': json_data['test results']['LRT'],
                     'background_p_value': json_data['test results background']['p-value'],
                     'background_LRT': json_data['test results background']['LRT'],
                     'test_shared_p_value': json_data['test results shared distributions']['p-value'],
-                    'test_shared_LRT': json_data['test results shared distributions']['LRT']
+                    'test_shared_LRT': json_data['test results shared distributions']['LRT'],
+                    'dnds_background': json_data['fits']['MG94xREV with separate rates for branch sets']['Rate Distributions']['non-synonymous/synonymous rate ratio for *background*'][0][0],
+                    'dnds_foreground': json_data['fits']['MG94xREV with separate rates for branch sets']['Rate Distributions']['non-synonymous/synonymous rate ratio for *test*'][0][0]
                 })
                 
     datatable = pd.DataFrame(data)
