@@ -38,6 +38,42 @@ def dataset_download(dl_command, taxid, taxon_genome_map,
                      bg_genomes_selected, max_genome_count, 
                      max_genome_event, macsyfinder_workdir):
     
+    def check_symbiosis(taxid: str) -> bool:
+        
+        try:
+            retries = 3
+            while retries > 0:
+                logger.info(f"Checking for symbiosis in taxid {taxid}")
+                result = subprocess.run(f"datasets summary taxonomy taxon {taxid}", shell=True, capture_output=True, text=True)
+                reports = result.stdout
+                try:
+                    # process stdout into dictionary 
+                    reports = reports.replace('true', 'True')
+                    report_dict = eval(reports)
+                    
+                    # obtain scientific name from result dict 
+                    sci_name = report_dict["reports"][0]["taxonomy"]["current_scientific_name"]["name"]
+                    
+                    # both conditions are clear indications of a symbiotic taxa
+                    if 'symbiont' in sci_name.lower():
+                        return True 
+                    elif 'candidatus' in sci_name.lower():
+                        return True 
+                    else:
+                        return False
+
+                # this will occur if the taxid does not return a valid result
+                # which should only occur with transient errors in the dataset query 
+                # so logging the error and retrying is appropriate
+                except:
+                    logger.warning(f"Symbiosis check for {taxid} error, {result}")
+                    retries -= 1
+                
+            return False
+        except Exception as e:
+            logger.warning(f"Failed to check for symbiosis in taxid {taxid}, {e}")
+            return False
+        
     def run_macsyfinder_TXSScan(proteome_file: str, output_dir: str) -> bool:
         
         macsyfinder_argument = ["macsyfinder", "--sequence-db", proteome_file, "-o", output_dir,
@@ -124,6 +160,7 @@ def dataset_download(dl_command, taxid, taxon_genome_map,
                     gff_file = file_name
            
             # check if the genome contains secretion systems
+            # first order the proteome based on GFF coords 
             ordered_replicon_fasta_output = macsyfinder_workdir + f"/{taxid}_ordered_replicon.fasta"
             try:
                 with zip_ref.open(protein_file) as protein_fasta, zip_ref.open(gff_file) as gff3:
@@ -144,8 +181,9 @@ def dataset_download(dl_command, taxid, taxon_genome_map,
                 logger.warning(f"Failed to run macsyfinder on taxid {taxid}, {e}")
                 has_phenotype = False
             logger.info(f"Taxid {taxid} has phenotype: {has_phenotype}")  
-              
-            if has_phenotype:
+            
+            # the taxid has a secretion system, check if it is a symbiont
+            if check_symbiosis(taxid):
                 # save taxid if forground genomes are not over half of the max genome count
                 if len(fg_genomes_selected) < int(max_genome_count / 2):
                     fg_genomes_selected.append(taxid)
@@ -156,7 +194,9 @@ def dataset_download(dl_command, taxid, taxon_genome_map,
                     logger.info(f"Max foreground genomes reached skipping taxid {taxid}")
                     os.remove(o_file)
                     return
-            else:
+
+            elif has_phenotype == False:   
+                # if its not add it to bg genome list
                 if len(bg_genomes_selected) < int(max_genome_count / 2):
                     bg_genomes_selected.append(taxid)
                     logger.info(f"Taxid {taxid} is a bg genome")
@@ -166,11 +206,15 @@ def dataset_download(dl_command, taxid, taxon_genome_map,
                     logger.info(f"Max background genomes reached skipping taxid {taxid}")
                     os.remove(o_file)
                     return
+            else:
+                logger.info(f"Taxid {taxid} is a not explicity a symbiont, but has a secretion system")
+                os.remove(o_file)
+                return
                 
         # save taxid - genome record map
         taxon_genome_map[taxid] = map_id_to_genome(taxid, o_file) 
         
-       
+        # monitor success queue to check if max_genome_count has been reached
         if success_queue.qsize() >= max_genome_count:
             max_genome_event.set()
             logger.info('Max genome number reached')
@@ -215,8 +259,7 @@ def download_genomes(id_list: list, max_genome_count: int, workdir: str, log_fil
         "--filename", f"workdir/genomes/taxid_dataset.zip",
         "--include", "seq-report,protein,gff3", "--annotated",
         "--assembly-source", "RefSeq", "--assembly-level", "complete",
-        "--assembly-version", "latest", "--released-after", "01/01/2016",
-        "--reference"
+        "--assembly-version", "latest", "--released-after", "01/01/2012"
     ]
     download_command = ' '.join(download_command)
     logger.info("ncbi datasets download command:" + download_command)
