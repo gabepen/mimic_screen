@@ -1,6 +1,6 @@
 import glob
 
-configfile: "config/wmel_config.yaml"
+configfile: "config/hp_config2.yaml"
 
 samples = []
 with open(config["accession_list"], 'r') as file:
@@ -110,54 +110,29 @@ rule collect_gene_datasets:
     output:
         touch("{work_dir}/.ortholog_collection_done")
 
-rule hyphy_codon_preprocess:
+rule format_seq_names:
     input:
-        ortholog_seqs="{work_dir}/msa_files/{sample}/{sample}.fna",
-        marker="{work_dir}/.ortholog_collection_done"
-    params:
-        e_number=config["hyphy_e_number"]
+        "{work_dir}/msa_files/{sample}/{sample}.fna"
     output:
-        prot_seqs="{work_dir}/msa_files/{sample}/{sample}.fna_protein.fas",
-        nuc_seqs="{work_dir}/msa_files/{sample}/{sample}.fna_nuc.fas"
+        "{work_dir}/msa_files/{sample}/{sample}.renamed.fna"
     shell:
         '''
-        hyphy scripts/hyphy-analyses/codon-msa/pre-msa.bf --input {input.ortholog_seqs} --E {params.e_number}
+        sed -e 's/:/_/g' -e 's/\./_/g' -e 's/\[/_/g' -e 's/\]/_/g' -e 's/\=/_/g' {input} > {output}
         '''
 
-rule mafft_align:
+rule macse_hmmcleaner:
     input:
-        "{work_dir}/msa_files/{sample}/{sample}.fna_protein.fas"
+        "{work_dir}/msa_files/{sample}/{sample}.renamed.fna"
     output:
-        "{work_dir}/msa_files/{sample}/{sample}_protein.msa"
+        "{work_dir}/msa_files/{sample}/{sample}_final_align_NT.aln"
     shell:
         '''
-        mafft --auto {input} > {output}
-        '''
-
-rule hyphy_codon_postprocess:
-    input:
-        prot_msa="{work_dir}/msa_files/{sample}/{sample}_protein.msa",
-        nuc_seqs="{work_dir}/msa_files/{sample}/{sample}.fna_nuc.fas"
-    output:
-        "{work_dir}/msa_files/{sample}/{sample}_codon.msa"
-    shell:
-        '''
-        hyphy scripts/hyphy-analyses/codon-msa/post-msa.bf --protein-msa {input.prot_msa} --nucleotide-sequences {input.nuc_seqs} --output {output}
-        '''
-
-rule trimAL:
-    input:
-        "{work_dir}/msa_files/{sample}/{sample}_codon.msa"
-    output:
-        "{work_dir}/msa_files/{sample}/{sample}_codon_trimmed.msa"
-    shell:
-        '''
-        trimal -in {input} -out {output} -automated1
+        bash scripts/MACSE_HMMCleaner.sh --in_seq_file {input} --out_dir "{work_dir}/msa_files/{wildcards.sample}" --out_file_prefix {wildcards.sample} --genetic_code_number 11
         '''
 
 rule iqtree:
     input:
-        "{work_dir}/msa_files/{sample}/{sample}_codon_trimmed.msa"
+        "{work_dir}/msa_files/{sample}/{sample}_final_align_NT.aln"
     output:
         "{work_dir}/tree_files/{sample}/{sample}.treefile"
     shell:
@@ -167,11 +142,11 @@ rule iqtree:
 
 rule absrel:
     input:
-        alignment="{work_dir}/msa_files/{sample}/{sample}_codon.msa",
+        alignment="{work_dir}/msa_files/{sample}/{sample}_final_align_NT.aln",
         tree="{work_dir}/tree_files/{sample}/{sample}.treefile"
     output:
         "{work_dir}/results/{sample}_absrel.json"
     shell:
         '''
-        hyphy absrel --alignment {input.alignment} --tree {input.tree} --output {output}
+        hyphy absrel --alignment {input.alignment} --tree {input.tree} --output {output} --srv Yes --syn-rates 3 --multiple-hits Double+Triple
         '''

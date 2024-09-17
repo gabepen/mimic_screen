@@ -30,7 +30,7 @@ def shorten_sequence_names(fasta_file):
     # Write the modified sequences back to the FASTA file
     SeqIO.write(modified_sequences, fasta_file, "fasta")
 
-def download_gene_data(taxid, taxon_dict, accession_dict, seq_dict, workdir):
+def download_gene_data(taxid, query_id, taxon_dict, accession_dict, seq_dict, workdir):
     
     # manage race conditions with lock 
     # need multiple locks for each potential target fasta 
@@ -120,6 +120,9 @@ def download_gene_data(taxid, taxon_dict, accession_dict, seq_dict, workdir):
             # sequence information stored in tuple
             seq_record.description =  seq_record.description = ']'.join(seq_record.description.split(']')[:1]) + '] ' + taxid
             
+            # replace spaces with underscores in sequence description
+            seq_record.description = seq_record.description.replace(' ', '_')
+        
             # if the source_wp_accession matches the ortho accessission this is the mimic candidate gene
             if source_wp_accession == ortho_wp_accession:
                 seq_content = (f">{seq_record.description}_MIMIC_CANDIDATE\n", str(seq_record.seq) + "\n")
@@ -150,7 +153,7 @@ def download_gene_data_packages(query_id, taxon_dict, accession_dict, max_ortho_
         seq_dict = manager.dict() 
         with mp.Pool(processes=mp.cpu_count()) as pool:
             logger.info("Started multiprocessing ortholog collection with {} processes".format(mp.cpu_count()))
-            results = [pool.apply_async(download_gene_data, args=(taxid, taxon_dict, accession_dict, seq_dict, workdir))
+            results = [pool.apply_async(download_gene_data, args=(taxid, query_id, taxon_dict, accession_dict, seq_dict, workdir))
                                                 for taxid in taxon_dict.keys()]
             pool.close()
             pool.join()
