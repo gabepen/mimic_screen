@@ -13,8 +13,7 @@ from queue import Queue
 from functools import partial
 import time
 import urllib.request
-import ordered_replicon
-from io import TextIOWrapper
+import globi_db_queries
 
 def taxonkit_get_subtree(taxid: str) -> list:
 
@@ -31,74 +30,109 @@ def taxonkit_get_subtree(taxid: str) -> list:
     
     logger.info(f"Number of species in subtree for taxid {taxid} is {len(species_taxids)}")
         
-    return species_taxids          
+    return species_taxids 
 
+def get_scientific_name(taxid: str, retries: int) -> str:     
+    
+        
+    retries = retries
+    while retries > 0:
+        result = subprocess.run(f"datasets summary taxonomy taxon {taxid}", shell=True, capture_output=True, text=True)
+        reports = result.stdout
+        try:
+            # process stdout into dictionary 
+            reports = reports.replace('true', 'True')
+            report_dict = eval(reports)
+            
+            # obtain scientific name from result dict 
+            sci_name = report_dict["reports"][0]["taxonomy"]["current_scientific_name"]["name"]
+            return sci_name
+        # this will occur if the taxid does not return a valid result
+        # which should only occur with transient errors in the dataset query 
+        # so logging the error and retrying is appropriate
+        except:
+            logger.warning(f"Symbiosis check for {taxid} error, {result}")
+            retries -= 1
+
+def check_sciname_for_symbiosis(sci_name: str) -> bool:
+    
+    # both conditions are clear indications of a symbiotic taxa
+    if 'symbiont' in sci_name.lower():
+        return True 
+    elif 'candidatus' in sci_name.lower():
+        return True 
+    else:
+        return False
+
+def validate_globi_results(taxid: str, rows: list):
+    
+    '''Parses the rows returned in from a GloBI query to determine if a valid interaction has been observed'''
+    
+    # initialize citation logger 
+    logger_citations = logger.bind(task="citations")
+    
+    # no interaction results found
+    if len(rows) == 0:
+        return False
+
+    # interactions found, check citations 
+    found_interactions = set()
+    for r in rows:
+        
+        # only save citations for unique interactions
+        if (r[38],r[42]) not in target_organisms:
+            ref_citation = r[84]
+            source_citation = r[85]
+            logger_citations.info(f"{taxid} | {r[38]} | {r[42]} | {ref_citation} | {source_citation}")
+            found_interactions.add((r[38], r[42]))
+    
+    return True 
+    
+    
 def dataset_download(dl_command, taxid, taxon_genome_map,
                      success_queue, fg_genomes_selected, 
                      bg_genomes_selected, max_genome_count, 
-                     max_genome_event, macsyfinder_workdir):
+                     max_genome_event, globi_db_path):
     
-    def check_symbiosis(taxid: str) -> bool:
+    
+    def add_taxa_to_selected_group(taxid: str, selected_list: list, list_name: str) -> bool:  
         
-        try:
-            retries = 3
-            while retries > 0:
-                logger.info(f"Checking for symbiosis in taxid {taxid}")
-                result = subprocess.run(f"datasets summary taxonomy taxon {taxid}", shell=True, capture_output=True, text=True)
-                reports = result.stdout
-                try:
-                    # process stdout into dictionary 
-                    reports = reports.replace('true', 'True')
-                    report_dict = eval(reports)
-                    
-                    # obtain scientific name from result dict 
-                    sci_name = report_dict["reports"][0]["taxonomy"]["current_scientific_name"]["name"]
-                    
-                    # both conditions are clear indications of a symbiotic taxa
-                    if 'symbiont' in sci_name.lower():
-                        return True 
-                    elif 'candidatus' in sci_name.lower():
-                        return True 
-                    else:
-                        return False
-
-                # this will occur if the taxid does not return a valid result
-                # which should only occur with transient errors in the dataset query 
-                # so logging the error and retrying is appropriate
-                except:
-                    logger.warning(f"Symbiosis check for {taxid} error, {result}")
-                    retries -= 1
-                
+        """
+        Add a taxid to the selected group if the number of selected genomes is less than half of the max genome count.
+        Parameters:
+        - taxid (str): The taxid to be added to the selected group.
+        - selected_list (list): The list of selected taxids.
+        - list_name (str): The name of the list for logging purposes.
+        Returns:
+        - bool: True if the taxid was successfully added, False otherwise.
+        """
+        
+        # save taxid if forground genomes are not over half of the max genome count
+        if len(selected_list) < int(max_genome_count / 2):
+            logger.info(f"Adding taxid {taxid} to {list_name} genomes")
+            selected_list.append(taxid)
+            # increment the success count
+            success_queue.put(1)
+            return True 
+        else:
+            logger.info(f"Max {list_name} genomes reached skipping taxid {taxid}")
             return False
-        except Exception as e:
-            logger.warning(f"Failed to check for symbiosis in taxid {taxid}, {e}")
-            return False
-        
-    def run_macsyfinder_TXSScan(proteome_file: str, output_dir: str) -> bool:
-        
-        macsyfinder_argument = ["macsyfinder", "--sequence-db", proteome_file, "-o", output_dir,
-                                "--models", "TXSScan", "all", "--db-type", "ordered_replicon",
-                                "-w", "4", "--models-dir", "macsyfinder_models",  "--mute"]
-        
-        # Run macsyfinder subprocess
-        subprocess.run(macsyfinder_argument)
-        
-        # check for output file 
-        if not os.path.exists(output_dir + '/best_solution.tsv'):
-            return False
-        
-        # check output for identified secretion systems
-        best_solution_tsv = output_dir + '/best_solution.tsv'
-        with open(best_solution_tsv, 'r') as f:
-            lines = f.readlines()
-            if "# No Systems found" in lines[3]:
-                return False
-            else:
-                return True
-        
+      
     def map_id_to_genome(taxid: str, archive_path: str) -> dict:
         
-        ''' nested to be called for both existing archives and new archives'''
+        """
+        Maps a taxid to the corresponding GCF accession and refseq chromosome accessions.
+        Args:
+            taxid (str): The taxid to map.
+            archive_path (str): The path to the zip archive containing the genome files.
+        Returns:
+            dict: A dictionary containing the mapped GCF accession and refseq chromosome accessions.
+        Raises:
+            FileNotFoundError: If the zip archive specified by archive_path does not exist.
+            IndexError: If the zip archive does not contain a sequence_report.jsonl file.
+        """
+        
+        
         # Open the zip archive
         with zipfile.ZipFile(archive_path, 'r') as zip_ref:
             
@@ -142,76 +176,51 @@ def dataset_download(dl_command, taxid, taxon_genome_map,
         dl_error_message = dl_output.stderr.decode().split('\n')
         dl_error_message = dl_error_message[1].strip().split('[')[0]
         logger.info(f"{dl_error_message} for taxid {taxid}")
+            
+        # check for biological interactions using GloBI database 
         
-        # extract gff and proteome files for macsyfinder analysis 
-       
-        with zipfile.ZipFile(o_file, 'r') as zip_ref:
-            logger.info(o_file)
+        # GloBI does not seem to include 'X endosymbiont of Y' or 'Candidatus X' in their taxa names
+        # so we will check the taxid name for these terms which indicate expiremental confidence of symbiosis 
+        
+        sci_name = get_scientific_name(taxid, 3)
+        
+        logger.info(f"Taxid {taxid} scientific name is {sci_name}")
+        if check_sciname_for_symbiosis(sci_name):
+            logger.info(f"Taxid {taxid} is a symbiont based on scientific name")
             
-            
-            # Get the list of files in the archive
-            file_list = zip_ref.namelist()
-            
-            # find the protein and gff files
-            for file_name in file_list:
-                if file_name.endswith('protein.faa'):
-                    protein_file = file_name
-                elif file_name.endswith('genomic.gff'):
-                    gff_file = file_name
-           
-            # check if the genome contains secretion systems
-            # first order the proteome based on GFF coords 
-            ordered_replicon_fasta_output = macsyfinder_workdir + f"/{taxid}_ordered_replicon.fasta"
-            try:
-                with zip_ref.open(protein_file) as protein_fasta, zip_ref.open(gff_file) as gff3:
-                    logger.info('running ordered replicon')
-                    ordered_replicon.order_proteins_by_gene_annotation(
-                        TextIOWrapper(gff3, encoding='utf-8'),
-                        TextIOWrapper(protein_fasta, encoding='utf-8'), 
-                        ordered_replicon_fasta_output
-                    )
-            except Exception as e:
-                logger.info(f"Failed to extract protein and gff files for taxid {taxid}, {e}")
-                return
-      
-            # run macsyfinder on the ordered replicon
-            try:
-                has_phenotype = run_macsyfinder_TXSScan(ordered_replicon_fasta_output, macsyfinder_workdir+f"/{taxid}")
-            except Exception as e:
-                logger.warning(f"Failed to run macsyfinder on taxid {taxid}, {e}")
-                has_phenotype = False
-            logger.info(f"Taxid {taxid} has phenotype: {has_phenotype}")  
-            
-            # the taxid has a secretion system, check if it is a symbiont
-            if check_symbiosis(taxid):
-                # save taxid if forground genomes are not over half of the max genome count
-                if len(fg_genomes_selected) < int(max_genome_count / 2):
-                    fg_genomes_selected.append(taxid)
-                    logger.info(f"Taxid {taxid} is a fg genome")
-                    # increment the success count
-                    success_queue.put(1)
-                else:
-                    logger.info(f"Max foreground genomes reached skipping taxid {taxid}")
-                    os.remove(o_file)
-                    return
-
-            elif has_phenotype == False:   
-                # if its not add it to bg genome list
-                if len(bg_genomes_selected) < int(max_genome_count / 2):
-                    bg_genomes_selected.append(taxid)
-                    logger.info(f"Taxid {taxid} is a bg genome")
-                    # increment the success count
-                    success_queue.put(1)
-                else:
-                    logger.info(f"Max background genomes reached skipping taxid {taxid}")
-                    os.remove(o_file)
-                    return
-            else:
-                logger.info(f"Taxid {taxid} is a not explicity a symbiont, but has a secretion system")
+            # add to the foreground genomes if possible
+            if not add_taxa_to_selected_group(taxid, fg_genomes_selected, 'foreground'):
+                # if the max fg genomes have been reached delete the archive and return
                 os.remove(o_file)
                 return
-                
-        # save taxid - genome record map
+
+        # If the scientific name does not indicate symbiosis, check GloBI database for interactions
+        query = {
+            'sourceTaxonName': sci_name, 
+            'interactionTypeName': ['parasiteOf','hasHost','pathogenOf']
+        }
+        results = globi_db_queries.multi_column_search('interactions', query, globi_db_path)
+        if validate_globi_results(taxid, results):
+            
+            logger.info(f"Taxid {taxid} is a symbiont/pathogen based on GloBI results")
+            # add to the foreground genomes if possible
+            if not add_taxa_to_selected_group(taxid, fg_genomes_selected, 'foreground'):
+                # if the max fg genomes have been reached delete the archive and return
+                os.remove(o_file)
+                return
+        
+        # Need to verify freeliving through isolation source 
+        
+        # scientific name and GloBI results do not indicate symbiosis add to background genomes with confidence
+        else:  
+            
+            logger.info(f"Taxid {taxid} is not a symbiont based on GloBI results")
+            if not add_taxa_to_selected_group(taxid, bg_genomes_selected, 'background'):
+                # if the max bg genomes have been reached delete the archive and return
+                os.remove(o_file)
+                return
+        
+        # taxid was succesfully added to a selected list, add to the taxon_genome_map
         taxon_genome_map[taxid] = map_id_to_genome(taxid, o_file) 
         
         # monitor success queue to check if max_genome_count has been reached
@@ -223,10 +232,8 @@ def dataset_download(dl_command, taxid, taxon_genome_map,
     else:
         dl_error_message = dl_output.stderr.decode().split('\n')
         dl_error_message = dl_error_message[1].strip().replace('Error:', '')
-        logger.warning(f"Failed to download genome for taxid {taxid}, {dl_error_message}")
+        #logger.warning(f"Failed to download genome for taxid {taxid}, {dl_error_message}")
         
-    
-
 def monitor_downloads(max_genome_event, terminate_event, pool): 
     '''Monitor the download processes and increment the success count'''
     logger.info('Monitor initiated')
@@ -244,12 +251,7 @@ def download_genomes(id_list: list, max_genome_count: int, workdir: str, log_fil
     
     # Create a directory to store the genomes
     os.makedirs(workdir + '/genomes', exist_ok=True)
-    
-    # Create temporary directory to store macsyfinder results
-    macsyfinder_workdir = workdir + '/tmp_macsyfinder'
-    os.makedirs(macsyfinder_workdir, exist_ok=True)
-    
-    
+      
     # shuffle taxid list 
     random.shuffle(id_list)
     
@@ -303,6 +305,9 @@ def download_genomes(id_list: list, max_genome_count: int, workdir: str, log_fil
         log_queue = manager.Queue()
         terminate_event = manager.Event()  
         
+        # HARD CODING FOR TESTING REMOVE AND MOVE TO CONFIG FILE 
+        globi_db_path = '/private/groups/corbettlab/gabe/evorate_debug_clutter/GloBI_tests/globi.db'
+        
         # create processes
         with mp.Pool(processes=100) as pool:
             
@@ -313,7 +318,7 @@ def download_genomes(id_list: list, max_genome_count: int, workdir: str, log_fil
             # multi-threaded download ansyn 
             results = [pool.apply_async(dataset_download, args=(download_command, taxid, taxid_genome_map, 
                                                                 success_queue, fg_genomes_selected, bg_genomes_selected, 
-                                                                max_genome_count, max_genome_event, macsyfinder_workdir)) 
+                                                                max_genome_count, max_genome_event, globi_db_path)) 
                        for download_command, taxid in zip(download_commands, taxids_used)]
             
             # moinitor monitoring loop 
@@ -369,8 +374,10 @@ def main():
     # old logging config
     logger.remove()  # Remove default handler
     timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-    log_file = args.log + f"ncbi_genome_download_{timestamp}.log"
-    logger.add(log_file, enqueue=True, rotation="10 MB") # Add a log file handler
+    dl_log_file = args.log + f"ncbi_genome_download_{timestamp}.log"
+    citation_log_file = args.log + f"GloBI_citations_{timestamp}.log"
+    logger.add(dl_log_file, enqueue=True, rotation="10 MB")
+    logger.add(citation_log_file, enqueue=True, rotation="10 MB", filter=lambda record: record["extra"].get("task")== "citations") # Add a log file handler
     
     
     # make workdir
@@ -378,7 +385,7 @@ def main():
     
     # Collect genome fastas for the taxid group
     id_list = taxonkit_get_subtree(args.taxid)
-    genomes_selected, genome_accession_map = download_genomes(id_list, args.max_genome_count, args.workdir, log_file)
+    genomes_selected, genome_accession_map = download_genomes(id_list, args.max_genome_count, args.workdir, dl_log_file)
     
     # Save genome_accession_map to a json file 
     with open(f"{args.workdir}/genomes/genome_accession_map.json", 'w') as f:
