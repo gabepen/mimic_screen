@@ -88,22 +88,7 @@ def main():
         'sourceTaxonName': 'Vibrio crassostreae',
         'interactionTypeName': ['parasiteOf','hasHost','pathogenOf']
     }
-    result = multi_column_search('interactions', conditions, '/private/groups/corbettlab/gabe/evorate_debug_clutter/GloBI_tests/globi.db')
-    print(len(result))
-    lastrow = []
-    for row in result:
-        
-        '''if lastrow:
-            equal, diff = compare_rows(lastrow, row)
-            if not equal:
-                print(diff)
-                for i in diff:
-                    print(lastrow[i], row[i])
-        lastrow = row'''
-        print(row[0], row[1], row[2], row[23], row[24], row[42], row[38], row[39], row[90])
-        print('refDoi:', row[85], 'refCie:', row[84]) # row[83:])
-        #print(row[83:])
-        input()
+    result = multi_column_search('interactions', conditions, '/path/to/globi.db')
         
 if __name__ == '__main__':
     main()   
