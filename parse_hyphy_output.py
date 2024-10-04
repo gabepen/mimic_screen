@@ -28,7 +28,7 @@ def parse_absrel_results(directory, symbiont_ids, id_map_file):
     
     if symbiont_ids:
         with open(symbiont_ids) as file:
-            symbiont_ids = file.readlines()
+            symbiont_ids = [l.strip() for l in file.readlines()]
     
     # debug stat tracking
     tree_lengths = []
@@ -72,7 +72,10 @@ def parse_absrel_results(directory, symbiont_ids, id_map_file):
                     branch_dnds.append(full_model_nonsyn_branch_lens[-1] / full_model_syn_branch_lens[-1])
                         
                     try:
-                        if branch.split('_')[-1] in symbiont_ids:
+                        branch_taxid = branch.split('_')[-1]
+                        if branch_taxid == 'CANDIDATE':
+                            branch_taxid = branch.split('_')[-3]
+                        if branch_taxid in symbiont_ids:
                             symbiont_branch_dnds.append(full_model_nonsyn_branch_lens[-1] / full_model_syn_branch_lens[-1])
                             symbiont_branch_dn.append(json_data['branch attributes']['0'][branch]['Full adaptive model (non-synonymous subs/site)'])
                             symbiont_branch_ds.append(json_data['branch attributes']['0'][branch]['Full adaptive model (synonymous subs/site)'])
@@ -92,7 +95,7 @@ def parse_absrel_results(directory, symbiont_ids, id_map_file):
 
                 # convert file name to samplename if id_map is provided
                 if id_map_file:
-                    refseq_accession = os.path.splitext(filename)[0].replace('.treefile_absrel', '')
+                    refseq_accession = os.path.splitext(filename)[0].replace('_absrel', '')
                     try:
                         prot_id = id_map[refseq_accession]
                     except KeyError:

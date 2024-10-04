@@ -372,14 +372,20 @@ def plot_evorate_stats_comp(data_frame, output_path):
     # Save the plot to the output path
     plt.savefig(output_path)
 
-def plot_aBSREL_comparisons_candidates(data_frame, output_path):
-    
-    print(data_frame['symbiont_branch_dnds_avg'])
+def plot_aBSREL_comparisons_candidates(data_frame, output_path, title):
+
     # Filter the data_frame based on algn_fraction
     no_outlier_data = data_frame[(data_frame['symbiont_branch_dnds_avg'] < 20) & (data_frame['non_symbiont_branch_dnds_avg'] < 20)]
     outliers = data_frame[(data_frame['symbiont_branch_dnds_avg'] > 20) | (data_frame['non_symbiont_branch_dnds_avg'] > 20)]
     num_rows_excluded = len(outliers)
     print("Number of rows excluded:", num_rows_excluded)
+    print("High symbiont dn/ds:")
+    ids = []
+    for r in no_outlier_data[no_outlier_data['symbiont_branch_dnds_avg'] > 1].iterrows():
+        print(r)
+        ids.append(r[1]['query'])
+    print(ids)
+        
     
     filtered_data_low = no_outlier_data[no_outlier_data['algn_fraction'] <= 0.5]
     filtered_data_high = no_outlier_data[no_outlier_data['algn_fraction'] > 0.5]
@@ -391,7 +397,7 @@ def plot_aBSREL_comparisons_candidates(data_frame, output_path):
     plt.scatter(filtered_data_high['symbiont_branch_dnds_avg'], filtered_data_high['non_symbiont_branch_dnds_avg'], color='blue', label='algn_fraction > 0.5', zorder=1)
     plt.xlabel('Symbiont Branch dN/dS Average')
     plt.ylabel('Non-Symbiont Branch dN/dS Average')
-    plt.title('Symbiont vs Non-Symbiont Branch dN/dS Averages, helicobacter pylori candidates')
+    plt.title(title)
     plt.legend()
     
     plt.savefig(output_path)
@@ -524,18 +530,22 @@ def main():
             
             # statistical comparison of dn/ds rates between two evorate analyses
             absrel_df2 = parse_hyphy_output.parse_absrel_results(args.evorate_analysis2, args.symbiont_ids, args.id_map)
-            #rate_distribution_comparison(absrel_df, absrel_df2, args.plot_evorate)
-            #relative_rate_comparison(absrel_df, absrel_df2, args.plot_evorate)
-            alignment_stat_tests.LDA_QDA_analysis(absrel_df, absrel_df2)
+            rate_distribution_comparison(absrel_df, absrel_df2, args.plot_evorate)
+            relative_rate_comparison(absrel_df, absrel_df2, args.plot_evorate)
+            #alignment_stat_tests.LDA_QDA_analysis(absrel_df, absrel_df2)
 
         # aBSREL dnds comparison non candidates
         
-        #plot_aBSREL_comparisons_noncandidates(absrel_df, args.plot_evorate)   
+        plot_aBSREL_comparisons_noncandidates(absrel_df, args.plot_evorate)   
         
         
         # aBSREL dnds comparison candidates
+        print(absrel_df['symbiont_branch_dnds_avg'])
+        
         evorate_alignment_df = pd.merge(alignment_df, absrel_df, on='query', how='left')
-        plot_aBSREL_comparisons_candidates(evorate_alignment_df, args.plot_evorate)  
+        
+        
+        #plot_aBSREL_comparisons_candidates(evorate_alignment_df, args.plot_evorate, 'Symbiont vs Non-Symbiont Branch dN/dS Averages wMel, small taxa range')  
     
         
     # save dataframe to csv 
