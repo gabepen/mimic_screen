@@ -1,20 +1,20 @@
 # Required files 
 query_proteome: "data/lp.faa"
-accession_list: "data/legionella_ALL.txt"
+accession_list: "data/lp_non_candidates.txt"
 
 # Required values 
 microbe_id: '272624'
 taxon_id: '1236'
 taxon_ids: ['118969', '91347', '135621', '641', '84642']
-work_dir: 'lp_outputs'
+work_dir: 'lp_nonc_outputs'
 max_genomes: '200'
 hyphy_e_number: '0.04' # sets hyphy pre-process.bf acceptance of low homology sequences (lower float = less stringent)
 
 # Logging
-log_path: 'lp_outputs/logs/'
+log_path: 'lp_nonc_outputs/logs/'
 
-#Resource values
+# Resource values
 mmseq_threads: '80'
 
-#Other options
+# Other options
 max_ortho_seqs: '100'

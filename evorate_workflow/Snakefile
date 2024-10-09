@@ -1,6 +1,6 @@
 import glob
 
-configfile: "config/hp_config2.yaml"
+configfile: "config/wmel_config2.yaml"
 
 samples = []
 with open(config["accession_list"], 'r') as file:
@@ -19,6 +19,8 @@ checkpoint download_genomes:
     params:
         microbe_id=config["microbe_id"],
         taxon_id=config["taxon_id"],
+        taxon_ids=",".join(map(str, config["taxon_ids"])),
+        free_living_taxon_ids=",".join(map(str, config["free_living_taxon_ids"])), 
         work_dir=config["work_dir"],
         max_genomes=config["max_genomes"],
         log_file=config["log_path"]
@@ -30,10 +32,11 @@ checkpoint download_genomes:
         python scripts/download_genomes_multi.py \
             -p {input.query_proteome} \
             -i {params.microbe_id} \
-            -x {params.taxon_id} \
+            -x {params.taxon_ids} \
             -w {params.work_dir} \
             -m {params.max_genomes} \
-            -l {params.log_file}
+            -l {params.log_file} \
+            -f {params.free_living_taxon_ids}
         """
     
 def wait_for_genomes(wc): 

@@ -1,18 +1,18 @@
 # Required files 
 query_proteome: "data/wmel.faa"
-accession_list: "data/wmel_ALL.txt"
+accession_list: "data/wmel_noncandidates.txt"
 
 # Required values 
 microbe_id: '163164'
 taxon_id: '28211'
-taxon_ids: ['766', '204458', '204441']
+taxon_ids: ['1993', '33993', '952', '255531', '943']
 free_living_taxon_ids: ['28211']
-work_dir: 'wmel_outputs'
+work_dir: 'wmel_nonc_outputs'
 max_genomes: '200'
 hyphy_e_number: '0.04' # sets hyphy pre-process.bf acceptance of low homology sequences (lower float = less stringent)
 
 # Logging
-log_path: 'wmel_outputs/logs/'
+log_path: 'wmel_nonc_outputs/logs/'
 
 #Resource values
 mmseq_threads: '80'
