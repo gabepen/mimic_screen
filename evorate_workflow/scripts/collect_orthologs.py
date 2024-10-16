@@ -125,7 +125,7 @@ def download_gene_data(taxid, query_id, taxon_dict, accession_dict, seq_dict, wo
         
             # if the source_wp_accession matches the ortho accessission this is the mimic candidate gene
             if source_wp_accession == ortho_wp_accession:
-                seq_content = (f">{seq_record.description}_MIMIC_CANDIDATE\n", str(seq_record.seq) + "\n")
+                seq_content = (f">{seq_record.description}\n", str(seq_record.seq) + "\n")
             else:
                 seq_content = (f">{seq_record.description}\n", str(seq_record.seq) + "\n")
                 

@@ -1,18 +1,19 @@
 # Required files 
 query_proteome: "data/hpylori_26695.faa"
-accession_list: "data/hp_all_candidates.txt"
+accession_list: "data/hp_noncandidates.txt"
 
 # Required values 
 microbe_id: '85962'
-taxon_id: '72293'
+taxon_id: '1236'
 taxon_ids: ['3031852']
-work_dir: 'hp_outputs'
+work_dir: 'hp_nonc_outputs'
 max_genomes: '200'
 hyphy_e_number: '0.04' # sets hyphy pre-process.bf acceptance of low homology sequences (lower float = less stringent)
 nltk_data_dir: 'nlp_model_data'
+globi_db_path: 'data/globi.db'
 
 # Logging
-log_path: 'hp_outputs/logs/'
+log_path: 'hp_nonc_outputs/logs/'
 
 #Resource values
 mmseq_threads: '80'

@@ -1,19 +1,20 @@
 # Required files 
-query_proteome: "data/lp.faa"
-accession_list: "data/legionella_ALL.txt"
+query_proteome: "data/wmel.faa"
+accession_list: "data/wmel_noncandidates.txt"
 
 # Required values 
-microbe_id: '272624'
-taxon_id: '1236'
-taxon_ids: ['118969', '91347', '135621', '641', '84642']
-work_dir: 'lp_outputs'
+microbe_id: '163164'
+taxon_id: '28211'
+taxon_ids: ['1993', '33993', '952', '255531', '943']
+free_living_taxon_ids: ['28211']
+work_dir: 'wmel_nonc_outputs'
 max_genomes: '200'
 hyphy_e_number: '0.04' # sets hyphy pre-process.bf acceptance of low homology sequences (lower float = less stringent)
 nltk_data_dir: 'nlp_model_data'
 globi_db_path: 'data/globi.db'
 
 # Logging
-log_path: 'lp_outputs/logs/'
+log_path: 'wmel_nonc_outputs/logs/'
 
 #Resource values
 mmseq_threads: '80'

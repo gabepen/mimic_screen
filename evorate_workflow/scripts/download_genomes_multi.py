@@ -13,92 +13,272 @@ from queue import Queue
 from functools import partial
 import time
 import urllib.request
-import ordered_replicon
-from io import TextIOWrapper
+import globi_db_queries
+import xmltodict
+import nltk
+from nltk.corpus import wordnet as wn 
 
-def taxonkit_get_subtree(taxid: str) -> list:
+# defining globi db path globally
+globi_db_path = None
 
-    '''Uses taxonkit to generate a list of subspecies for a given taxid'''
-    taxonkit_command = f"taxonkit list --ids {taxid} --indent '' -r"
-    result = subprocess.run(taxonkit_command, shell=True, capture_output=True)
-    output = result.stdout.decode().splitlines()
+def taxonkit_get_subtrees(taxids: list) -> list:
     
-    # collect only taxids of rank = species
+    """
+    Uses taxonkit to generate a list of subspecies for a given list of taxids.
+    Args:
+        taxids (list): A list of taxonomic IDs (taxids) for which to retrieve subspecies.
+    Returns:
+        list: A list of taxonomic IDs (taxids) corresponding to species within the subtrees of the given taxids.
+    Example:
+        taxids = [9606, 10090]
+        species_taxids = taxonkit_get_subtrees(taxids)
+        print(species_taxids)
+    """
+    
     species_taxids = []
-    for tid in output:
-        if tid != '' and tid.split()[1] == '[species]':
-            species_taxids.append(tid.split()[0])
+    '''Uses taxonkit to generate a list of subspecies for a given taxid'''
+    for taxid in taxids:
+        taxonkit_command = f"taxonkit list --ids {taxid} --indent '' -r"
+        result = subprocess.run(taxonkit_command, shell=True, capture_output=True)
+        output = result.stdout.decode().splitlines()
     
-    logger.info(f"Number of species in subtree for taxid {taxid} is {len(species_taxids)}")
+        # collect only taxids of rank = species
+        species_count = 0
+        for tid in output:
+            if tid != '' and tid.split()[1] == '[species]':
+                species_taxids.append(tid.split()[0])
+                species_count += 1
+    
+        logger.info(f"Number of species in subtree for taxid {taxid} is {species_count}")
         
-    return species_taxids          
+    return species_taxids 
 
-def dataset_download(dl_command, taxid, taxon_genome_map,
+def get_scientific_name(taxid: str, retries: int) -> str:     
+    
+        
+    retries = retries
+    while retries > 0:
+        result = subprocess.run(f"datasets summary taxonomy taxon {taxid}", shell=True, capture_output=True, text=True)
+        reports = result.stdout
+        try:
+            # process stdout into dictionary 
+            reports = reports.replace('true', 'True')
+            report_dict = eval(reports)
+            
+            # obtain scientific name from result dict 
+            sci_name = report_dict["reports"][0]["taxonomy"]["current_scientific_name"]["name"]
+            return sci_name
+        # this will occur if the taxid does not return a valid result
+        # which should only occur with transient errors in the dataset query 
+        # so logging the error and retrying is appropriate
+        except:
+            logger.warning(f"Symbiosis check for {taxid} error, {result}")
+            retries -= 1
+
+def check_sciname_for_symbiosis(sci_name: str) -> bool:
+    
+    """
+    Check if the scientific name indicates a symbiotic relationship.
+    This function examines the provided scientific name to determine if it 
+    suggests a symbiotic taxa. It checks for the presence of specific keywords 
+    that are commonly associated with symbiosis.
+    Args:
+        sci_name (str): The scientific name to be checked.
+    Returns:
+        bool: True if the scientific name indicates a symbiotic relationship, 
+              False otherwise.
+    """
+    
+    # conditions are clear indications of a symbiotic taxa
+    return 'symbiont' in sci_name.lower()
+   
+
+def validate_globi_results(taxid: str, rows: list):
+    
+    """
+    Parses the rows returned from a GloBI query to determine if a valid interaction has been observed.
+    Args:
+        taxid (str): The taxonomic ID of the organism being queried.
+        rows (list): A list of rows returned from the GloBI query, where each row is expected to be a list containing interaction data.
+    Returns:
+        bool: True if valid interactions are found, False otherwise.
+    Logs:
+        Logs citation information for unique interactions found.
+    """
+        
+    # initialize citation logger 
+    logger_citations = logger.bind(task="citations")
+    
+    # no interaction results found
+    if len(rows) == 0:
+        return False
+
+    # interactions found, check citations 
+    found_interactions = set()
+    for r in rows:
+        
+        # only save citations for unique interactions
+        if (r[38],r[42]) not in found_interactions:
+            ref_citation = r[84]
+            source_citation = r[85]
+            logger_citations.info(f"{taxid} | {r[38]} | {r[42]} | {ref_citation} | {source_citation}")
+            found_interactions.add((r[38], r[42]))
+    
+    return True 
+    
+def ncbi_taxid_to_biosample_uids(taxid: str) -> list:
+    
+    entrez_url = f"https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esearch.fcgi?db=biosample&term=txid{taxid}&retmax=10&retmode=json"
+    results_json = json.loads(urllib.request.urlopen(entrez_url).read())
+    return results_json['esearchresult']['idlist']
+
+def is_source_freeliving(isolation_source: str) -> tuple:
+    
+    """
+    Determines if the given isolation source is associated with a free-living environment or a host-associated environment.
+    Args:
+        isolation_source (str): The source from which the sample was isolated.
+    Returns:
+        tuple: A tuple containing a boolean and a string. The boolean indicates whether the source is free-living (True) or not (False). 
+               The string provides additional information about the determination, such as the specific term that led to the conclusion.
+    """
+    
+    
+    isolation_source = isolation_source.lower()
+    
+    if isolation_source == 'missing':
+        return (False, 'no isolation source')
+    
+    if 'culture' in isolation_source:
+        return (False, 'from culture')
+    
+    # define core terms to check for freeliving status
+    core_free_living_attributes = ['soil', 'sediment', 'water', 'air', 'dust', 'marsh', 'saltern', 
+                                   'spring', 'vent', 'river', 'wasterwater', 'freshwater', 'seawater', 
+                                   'bay']
+    core_host_associated_attributes = ['human', 'animal', 'infected', 'plant', 'insect', 'fungal', 
+                                       'protozoan', 'algal', 'microbial', 'culture', 'strain']
+    
+    
+    living_entity_syns = {'living_thing', 'organism', 'animal', 'plant', 'body_part', 'organ', 'culture', 
+                               'biological_entity', 'biological_object', 'biological_attribute',
+                               'plant_organ', 'biological_system'}
+    
+    # determine word association with NLP model to determine if the isolation source is associated with a living thing 
+    for word in isolation_source.split():
+        synsets = wn.synsets(isolation_source)
+        for synset in synsets:
+            # Check if the synset's hypernyms contain any living categories
+            hypernyms = synset.hypernyms()
+            while hypernyms:
+                for hypernym in hypernyms:
+                    if hypernym.name().split('.')[0] in living_entity_syns:
+                        print(hypernym)
+                        return (False, hypernym)
+                hypernyms = hypernyms[0].hypernyms() 
+    
+    # check for host associations specific isolation source words
+    for word in isolation_source.split():
+        if word in core_host_associated_attributes:
+            return (False, word)
+        
+    # no living entity associations found in isolation source words confirm with core terms
+    for word in isolation_source.split():
+        if word in core_free_living_attributes:
+            return (True, word)
+    
+    # no core terms found in isolation source words 
+    return (False, 'unknown')
+        
+
+def check_biosample_isolation_source(biosample_uids: list) -> bool:
+    
+    """
+    Checks if the isolation sources of given biosample UIDs are associated with free-living environments.
+    This function queries the NCBI Entrez API to retrieve metadata for each biosample UID provided. It then
+    parses the metadata to find the 'isolation_source' attribute and checks if it is associated with a 
+    free-living environment using the `is_source_freeliving` function.
+    Args:
+        biosample_uids (list): A list of biosample UIDs to be checked.
+    Returns:
+        bool: Returns True if all biosample isolation sources are confirmed with free-living environments,
+              otherwise returns False.
+    """
+    
+    
+    # initialize tasked logger
+    logger_biosamples = logger.bind(task="biosamples")
+    
+    
+    # check each biosample uid for freeliving sources
+    for uid in biosample_uids:
+        
+        # format entrez API url
+        entrez_url = f"https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esummary.fcgi?db=biosample&id={uid}&retmode=json"
+        
+        # call entrez API and parse results
+        results_json = json.loads(urllib.request.urlopen(entrez_url).read())
+        sample_data = xmltodict.parse(results_json['result'][uid]['sampledata'])
+        
+        # check for isolation source field in the attributes section of the biosample metadata
+        for meta_data_field in sample_data['BioSample']['Attributes']['Attribute']:
+            if meta_data_field['@attribute_name'] == 'isolation_source':
+                isolation_source = meta_data_field['#text']
+                
+                # check if the isolation source is associated with a free-living environment
+                freeliving_status = is_source_freeliving(isolation_source)
+                logger_biosamples.info(f"{uid} | {isolation_source} | {freeliving_status[0]} | {freeliving_status[1]}")
+                
+                # if the any of the biosample isolation sources are associated with a host, return False
+                if not freeliving_status[0]:
+                    return False 
+    return True
+    
+    
+def dataset_download(dl_command, taxid, fl_id_list, taxon_genome_map,
                      success_queue, fg_genomes_selected, 
                      bg_genomes_selected, max_genome_count, 
-                     max_genome_event, macsyfinder_workdir):
+                     max_genome_event, globi_db_path):
     
-    def check_symbiosis(taxid: str) -> bool:
+    
+    def add_taxa_to_selected_group(taxid: str, selected_list: list, list_name: str) -> bool:  
         
-        try:
-            retries = 3
-            while retries > 0:
-                logger.info(f"Checking for symbiosis in taxid {taxid}")
-                result = subprocess.run(f"datasets summary taxonomy taxon {taxid}", shell=True, capture_output=True, text=True)
-                reports = result.stdout
-                try:
-                    # process stdout into dictionary 
-                    reports = reports.replace('true', 'True')
-                    report_dict = eval(reports)
-                    
-                    # obtain scientific name from result dict 
-                    sci_name = report_dict["reports"][0]["taxonomy"]["current_scientific_name"]["name"]
-                    
-                    # both conditions are clear indications of a symbiotic taxa
-                    if 'symbiont' in sci_name.lower():
-                        return True 
-                    elif 'candidatus' in sci_name.lower():
-                        return True 
-                    else:
-                        return False
-
-                # this will occur if the taxid does not return a valid result
-                # which should only occur with transient errors in the dataset query 
-                # so logging the error and retrying is appropriate
-                except:
-                    logger.warning(f"Symbiosis check for {taxid} error, {result}")
-                    retries -= 1
-                
+        """
+        Add a taxid to the selected group if the number of selected genomes is less than half of the max genome count.
+        Parameters:
+        - taxid (str): The taxid to be added to the selected group.
+        - selected_list (list): The list of selected taxids.
+        - list_name (str): The name of the list for logging purposes.
+        Returns:
+        - bool: True if the taxid was successfully added, False otherwise.
+        """
+        
+        # save taxid if forground genomes are not over half of the max genome count
+        if len(selected_list) < int(max_genome_count / 2):
+            logger.info(f"Adding taxid {taxid} to {list_name} genomes")
+            selected_list.append(taxid)
+            # increment the success count
+            success_queue.put(1)
+            return True 
+        else:
+            logger.info(f"Max {list_name} genomes reached skipping taxid {taxid}")
             return False
-        except Exception as e:
-            logger.warning(f"Failed to check for symbiosis in taxid {taxid}, {e}")
-            return False
-        
-    def run_macsyfinder_TXSScan(proteome_file: str, output_dir: str) -> bool:
-        
-        macsyfinder_argument = ["macsyfinder", "--sequence-db", proteome_file, "-o", output_dir,
-                                "--models", "TXSScan", "all", "--db-type", "ordered_replicon",
-                                "-w", "4", "--models-dir", "macsyfinder_models",  "--mute"]
-        
-        # Run macsyfinder subprocess
-        subprocess.run(macsyfinder_argument)
-        
-        # check for output file 
-        if not os.path.exists(output_dir + '/best_solution.tsv'):
-            return False
-        
-        # check output for identified secretion systems
-        best_solution_tsv = output_dir + '/best_solution.tsv'
-        with open(best_solution_tsv, 'r') as f:
-            lines = f.readlines()
-            if "# No Systems found" in lines[3]:
-                return False
-            else:
-                return True
-        
+      
     def map_id_to_genome(taxid: str, archive_path: str) -> dict:
         
-        ''' nested to be called for both existing archives and new archives'''
+        """
+        Maps a taxid to the corresponding GCF accession and refseq chromosome accessions.
+        Args:
+            taxid (str): The taxid to map.
+            archive_path (str): The path to the zip archive containing the genome files.
+        Returns:
+            dict: A dictionary containing the mapped GCF accession and refseq chromosome accessions.
+        Raises:
+            FileNotFoundError: If the zip archive specified by archive_path does not exist.
+            IndexError: If the zip archive does not contain a sequence_report.jsonl file.
+        """
+        
+        
         # Open the zip archive
         with zipfile.ZipFile(archive_path, 'r') as zip_ref:
             
@@ -142,76 +322,62 @@ def dataset_download(dl_command, taxid, taxon_genome_map,
         dl_error_message = dl_output.stderr.decode().split('\n')
         dl_error_message = dl_error_message[1].strip().split('[')[0]
         logger.info(f"{dl_error_message} for taxid {taxid}")
+            
+        # Check for biological interactions using GloBI database 
         
-        # extract gff and proteome files for macsyfinder analysis 
-       
-        with zipfile.ZipFile(o_file, 'r') as zip_ref:
-            logger.info(o_file)
+        # GloBI does not seem to include 'X endosymbiont of Y' or 'Candidatus X' in their taxa names
+        # so we will check the taxid name for these terms which indicate expiremental confidence of symbiosis 
+        fl_exclusive_opt = False
+        if taxid in fl_id_list:
+            fl_exclusive_opt = True
             
+        sci_name = get_scientific_name(taxid, 3)
+        logger.info(f"Taxid {taxid} scientific name is {sci_name}")
+        if check_sciname_for_symbiosis(sci_name):
+            logger.info(f"Taxid {taxid} is a symbiont based on scientific name")
             
-            # Get the list of files in the archive
-            file_list = zip_ref.namelist()
-            
-            # find the protein and gff files
-            for file_name in file_list:
-                if file_name.endswith('protein.faa'):
-                    protein_file = file_name
-                elif file_name.endswith('genomic.gff'):
-                    gff_file = file_name
-           
-            # check if the genome contains secretion systems
-            # first order the proteome based on GFF coords 
-            ordered_replicon_fasta_output = macsyfinder_workdir + f"/{taxid}_ordered_replicon.fasta"
-            try:
-                with zip_ref.open(protein_file) as protein_fasta, zip_ref.open(gff_file) as gff3:
-                    logger.info('running ordered replicon')
-                    ordered_replicon.order_proteins_by_gene_annotation(
-                        TextIOWrapper(gff3, encoding='utf-8'),
-                        TextIOWrapper(protein_fasta, encoding='utf-8'), 
-                        ordered_replicon_fasta_output
-                    )
-            except Exception as e:
-                logger.info(f"Failed to extract protein and gff files for taxid {taxid}, {e}")
-                return
-      
-            # run macsyfinder on the ordered replicon
-            try:
-                has_phenotype = run_macsyfinder_TXSScan(ordered_replicon_fasta_output, macsyfinder_workdir+f"/{taxid}")
-            except Exception as e:
-                logger.warning(f"Failed to run macsyfinder on taxid {taxid}, {e}")
-                has_phenotype = False
-            logger.info(f"Taxid {taxid} has phenotype: {has_phenotype}")  
-            
-            # the taxid has a secretion system, check if it is a symbiont
-            if check_symbiosis(taxid):
-                # save taxid if forground genomes are not over half of the max genome count
-                if len(fg_genomes_selected) < int(max_genome_count / 2):
-                    fg_genomes_selected.append(taxid)
-                    logger.info(f"Taxid {taxid} is a fg genome")
-                    # increment the success count
-                    success_queue.put(1)
-                else:
-                    logger.info(f"Max foreground genomes reached skipping taxid {taxid}")
-                    os.remove(o_file)
-                    return
-
-            elif has_phenotype == False:   
-                # if its not add it to bg genome list
-                if len(bg_genomes_selected) < int(max_genome_count / 2):
-                    bg_genomes_selected.append(taxid)
-                    logger.info(f"Taxid {taxid} is a bg genome")
-                    # increment the success count
-                    success_queue.put(1)
-                else:
-                    logger.info(f"Max background genomes reached skipping taxid {taxid}")
-                    os.remove(o_file)
-                    return
-            else:
-                logger.info(f"Taxid {taxid} is a not explicity a symbiont, but has a secretion system")
+            # add to the foreground genomes if possible
+            if not add_taxa_to_selected_group(taxid, fg_genomes_selected, 'foreground') or fl_exclusive_opt:
+                # if the max fg genomes have been reached delete the archive and return
                 os.remove(o_file)
                 return
+        
+        else:
+            # If the scientific name does not indicate symbiosis, check GloBI database for interactions
+            query = {
+                'sourceTaxonName': sci_name, 
+                'interactionTypeName': ['parasiteOf','hasHost','pathogenOf']
+            }
+            results = globi_db_queries.multi_column_search('interactions', query, globi_db_path)
+            if validate_globi_results(taxid, results):
+                logger.info(f"Taxid {taxid} is a symbiont/pathogen based on GloBI results")
                 
-        # save taxid - genome record map
+                # add to the foreground genomes if possible
+                if not add_taxa_to_selected_group(taxid, fg_genomes_selected, 'foreground') or fl_exclusive_opt:
+                    
+                    # if the max fg genomes have been reached delete the archive and return
+                    os.remove(o_file)
+                    return
+    
+            else:
+                # Taxa has passed the GloBI check, check the isolation source through NCBI biosample metadata
+                # First collect biosample_uids for the taxid
+                biosample_uids = ncbi_taxid_to_biosample_uids(taxid)
+                logger.info(f"Taxid {taxid} Biosample UIDs: {biosample_uids}")
+                if check_biosample_isolation_source(biosample_uids):
+                    logger.info(f"Taxid {taxid} is freeliving based on biosample isolation sources")
+                    
+                    if not add_taxa_to_selected_group(taxid, bg_genomes_selected, 'background'):
+                        # if the max bg genomes have been reached delete the archive and return
+                        os.remove(o_file)
+                        return
+                else:  
+                    # Taxid cannot be confidently classified as symbiont or free-living 
+                    logger.info(f"Taxid {taxid} cannot be confidently classified")
+                    os.remove(o_file)
+                    return
+            
+        # taxid was succesfully added to a selected list, add to the taxon_genome_map
         taxon_genome_map[taxid] = map_id_to_genome(taxid, o_file) 
         
         # monitor success queue to check if max_genome_count has been reached
@@ -223,10 +389,8 @@ def dataset_download(dl_command, taxid, taxon_genome_map,
     else:
         dl_error_message = dl_output.stderr.decode().split('\n')
         dl_error_message = dl_error_message[1].strip().replace('Error:', '')
-        logger.warning(f"Failed to download genome for taxid {taxid}, {dl_error_message}")
+        #logger.warning(f"Failed to download genome for taxid {taxid}, {dl_error_message}")
         
-    
-
 def monitor_downloads(max_genome_event, terminate_event, pool): 
     '''Monitor the download processes and increment the success count'''
     logger.info('Monitor initiated')
@@ -238,18 +402,13 @@ def monitor_downloads(max_genome_event, terminate_event, pool):
             break
         time.sleep(2)  
 
-def download_genomes(id_list: list, max_genome_count: int, workdir: str, log_file: str) -> (list, dict):
+def download_genomes(id_list: list,fl_id_list: list, max_genome_count: int, workdir: str, log_file: str) -> (list, dict):
     
     '''uses ncbi datasets to download genomes for a list of taxids'''
     
     # Create a directory to store the genomes
     os.makedirs(workdir + '/genomes', exist_ok=True)
-    
-    # Create temporary directory to store macsyfinder results
-    macsyfinder_workdir = workdir + '/tmp_macsyfinder'
-    os.makedirs(macsyfinder_workdir, exist_ok=True)
-    
-    
+      
     # shuffle taxid list 
     random.shuffle(id_list)
     
@@ -272,6 +431,7 @@ def download_genomes(id_list: list, max_genome_count: int, workdir: str, log_fil
     # generate all potential download commands and store in list 
     download_commands = []
     taxids_used = []
+    id_list = id_list + fl_id_list
     for taxid in id_list:
         
         # Set output file path
@@ -311,9 +471,9 @@ def download_genomes(id_list: list, max_genome_count: int, workdir: str, log_fil
             monitor_process.start()
             
             # multi-threaded download ansyn 
-            results = [pool.apply_async(dataset_download, args=(download_command, taxid, taxid_genome_map, 
+            results = [pool.apply_async(dataset_download, args=(download_command, taxid, fl_id_list, taxid_genome_map, 
                                                                 success_queue, fg_genomes_selected, bg_genomes_selected, 
-                                                                max_genome_count, max_genome_event, macsyfinder_workdir)) 
+                                                                max_genome_count, max_genome_event, globi_db_path)) 
                        for download_command, taxid in zip(download_commands, taxids_used)]
             
             # moinitor monitoring loop 
@@ -346,51 +506,85 @@ def download_genomes(id_list: list, max_genome_count: int, workdir: str, log_fil
             logger.info(f"Downloaded {len(fg_genomes_selected)} foreground genomes and {len(bg_genomes_selected)} background genomes of {max_genome_count} requested")
         # return first taxids selected up until max_genome_count in case there were more downloaded after the pool termination 
         
-        return list(fg_genomes_selected)+list(bg_genomes_selected), dict(taxid_genome_map) 
+        return list(fg_genomes_selected), list(bg_genomes_selected), dict(taxid_genome_map) 
 
 def main():
 
     '''This script preforms an RBH search of a set of taxa to identify orthologs
        of a query sequence from each proteome in the taxa group.
     '''
+    global globi_db_path
     
     # Parse command line arguments
     parser = argparse.ArgumentParser(description="Taxon kit subtree download of random species RefSeq genome records")
     parser.add_argument("-p", "--query_proteome", help="Path to the query proteome file")
     parser.add_argument("-i", "--query_id", help="ID of the query microbe")
-    parser.add_argument("-x", "--taxid", type=int, help="Taxonomy ID for the species of interest")
+    parser.add_argument("-x", "--taxids",help="Comma seperated Taxonomy ID for the clades of interest")
     parser.add_argument("-w", "--workdir", default="work", help="Path to the working directory")
     parser.add_argument("-m", "--max_genome_count", default=300, type=int, help="max number of genomess to download")
     parser.add_argument("-l", "--log", default="logs/", help="log file name")
+    parser.add_argument("-f", "--free_living_tax_ids", default='')
+    parser.add_argument("-n", "--nltk_data_dir", default="nltk_data", help="Path to the NLTK data directory")
+    parser.add_argument("-g", "--globi_db_path", default="globi.db", help="Path to the GloBI database")
     args = parser.parse_args()
 
-   
-    
-    # old logging config
+    # logging config
     logger.remove()  # Remove default handler
     timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-    log_file = args.log + f"ncbi_genome_download_{timestamp}.log"
-    logger.add(log_file, enqueue=True, rotation="10 MB") # Add a log file handler
-    
-    
+    dl_log_file = args.log + f"ncbi_genome_download_{timestamp}.log"
+    citation_log_file = args.log + f"GloBI_citations_{timestamp}.log"
+    biosample_log_file = args.log + f"biosample_isolation_sources_{timestamp}.log"
+    logger.add(dl_log_file, enqueue=True, rotation="10 MB")
+    logger.add(citation_log_file, enqueue=True, rotation="10 MB", filter=lambda record: record["extra"].get("task")== "citations") # Add a log file handler
+    logger.add(biosample_log_file, enqueue=True, rotation="10 MB", filter=lambda record: record["extra"].get("task")== "biosamples") # Add a log file handler
+
     # make workdir
     os.makedirs(args.workdir, exist_ok=True)
     
+    # Set the NLTK data directory
+    nltk_data_dir = args.nltk_data_dir
+    os.makedirs(nltk_data_dir, exist_ok=True)
+    nltk.data.path.append(nltk_data_dir)
+    
+    # Download the WordNet dataset if not already downloaded
+    nltk.download('wordnet', download_dir=nltk_data_dir)
+    
+    # Set globi db path 
+    globi_db_path = args.globi_db_path
+    
     # Collect genome fastas for the taxid group
-    id_list = taxonkit_get_subtree(args.taxid)
-    genomes_selected, genome_accession_map = download_genomes(id_list, args.max_genome_count, args.workdir, log_file)
+    taxids = args.taxids.split(',')
+    fl_taxids = args.free_living_tax_ids.split(',')
+    logger.info(f"fl_taxids: {fl_taxids}")
+
+    id_list = taxonkit_get_subtrees(taxids)
+    fl_id_list = taxonkit_get_subtrees(fl_taxids)
+    fl_id_list = [taxid for taxid in fl_id_list if taxid not in id_list]
+    fg_genomes_selected, bg_genomes_selected, genome_accession_map = download_genomes(id_list, fl_id_list, args.max_genome_count, args.workdir, dl_log_file)
     
     # Save genome_accession_map to a json file 
     with open(f"{args.workdir}/genomes/genome_accession_map.json", 'w') as f:
         json.dump(genome_accession_map, f)
     
-    # Save list of genomes used for downstream analysis 
+    
+    # Save list of genomes used for downstream analysis
+    fg_genome_file_path = f"{args.log}/foreground_genomes.txt" 
+    fg_genome_file = open(fg_genome_file_path, 'w')
     with(open(f"{args.log}/genomes_selected.txt", 'w')) as f:
-        # Write all file names of zip files in the genomes directory
-        zip_files = [file for file in os.listdir(f"{args.workdir}/genomes/") if file.endswith(".zip")]
-        for zip_file in zip_files:
-            taxid = zip_file.split('_')[0]
+        for taxid in fg_genomes_selected:
             f.write(f"{taxid}\n")
-            
+            fg_genome_file.write(f"{taxid}\n")
+        for taxid in bg_genomes_selected:
+            f.write(f"{taxid}\n")
+    fg_genome_file.close()
+    
+    
+    # remove excess genomes 
+    zip_files = [file for file in os.listdir(f"{args.workdir}/genomes/") if file.endswith(".zip")]
+    for zip_file in zip_files:
+        taxid = zip_file.split('_')[0]
+        if taxid not in fg_genomes_selected and taxid not in bg_genomes_selected:
+            os.remove(f"{args.workdir}/genomes/{zip_file}")
+        
 if __name__ == "__main__":
     main()

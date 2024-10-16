@@ -5,9 +5,13 @@ accession_list: "data/wmel_ALL.txt"
 # Required values 
 microbe_id: '163164'
 taxon_id: '28211'
+taxon_ids: ['766', '204458', '204441']
+free_living_taxon_ids: ['28211']
 work_dir: 'wmel_outputs'
 max_genomes: '200'
 hyphy_e_number: '0.04' # sets hyphy pre-process.bf acceptance of low homology sequences (lower float = less stringent)
+nltk_data_dir: 'nlp_model_data'
+globi_db_path: 'data/globi.db'
 
 # Logging
 log_path: 'wmel_outputs/logs/'
