@@ -9,6 +9,7 @@ taxon_ids: ['3031852']
 work_dir: 'hp_outputs'
 max_genomes: '200'
 hyphy_e_number: '0.04' # sets hyphy pre-process.bf acceptance of low homology sequences (lower float = less stringent)
+nltk_data_dir: 'nlp_model_data'
 
 # Logging
 log_path: 'hp_outputs/logs/'

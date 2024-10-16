@@ -18,12 +18,8 @@ import xmltodict
 import nltk
 from nltk.corpus import wordnet as wn 
 
-# Set the NLTK data directory
-nltk_data_dir = '/private/groups/corbettlab/gabe/mimic_screen/evorate_workflow/nlp_model_data/'
-os.makedirs(nltk_data_dir, exist_ok=True)
-nltk.data.path.append(nltk_data_dir)
-# Download the WordNet dataset if not already downloaded
-nltk.download('wordnet', download_dir=nltk_data_dir)
+# defining globi db path globally
+globi_db_path = None
 
 def taxonkit_get_subtrees(taxids: list) -> list:
     
@@ -467,9 +463,6 @@ def download_genomes(id_list: list,fl_id_list: list, max_genome_count: int, work
         log_queue = manager.Queue()
         terminate_event = manager.Event()  
         
-        # HARD CODING FOR TESTING REMOVE AND MOVE TO CONFIG FILE 
-        globi_db_path = '/private/groups/corbettlab/gabe/evorate_debug_clutter/GloBI_tests/globi.db'
-        
         # create processes
         with mp.Pool(processes=100) as pool:
             
@@ -520,6 +513,7 @@ def main():
     '''This script preforms an RBH search of a set of taxa to identify orthologs
        of a query sequence from each proteome in the taxa group.
     '''
+    global globi_db_path
     
     # Parse command line arguments
     parser = argparse.ArgumentParser(description="Taxon kit subtree download of random species RefSeq genome records")
@@ -530,6 +524,8 @@ def main():
     parser.add_argument("-m", "--max_genome_count", default=300, type=int, help="max number of genomess to download")
     parser.add_argument("-l", "--log", default="logs/", help="log file name")
     parser.add_argument("-f", "--free_living_tax_ids", default='')
+    parser.add_argument("-n", "--nltk_data_dir", default="nltk_data", help="Path to the NLTK data directory")
+    parser.add_argument("-g", "--globi_db_path", default="globi.db", help="Path to the GloBI database")
     args = parser.parse_args()
 
     # logging config
@@ -544,6 +540,17 @@ def main():
 
     # make workdir
     os.makedirs(args.workdir, exist_ok=True)
+    
+    # Set the NLTK data directory
+    nltk_data_dir = args.nltk_data_dir
+    os.makedirs(nltk_data_dir, exist_ok=True)
+    nltk.data.path.append(nltk_data_dir)
+    
+    # Download the WordNet dataset if not already downloaded
+    nltk.download('wordnet', download_dir=nltk_data_dir)
+    
+    # Set globi db path 
+    globi_db_path = args.globi_db_path
     
     # Collect genome fastas for the taxid group
     taxids = args.taxids.split(',')
