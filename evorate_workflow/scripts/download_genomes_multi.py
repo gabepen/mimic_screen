@@ -331,9 +331,9 @@ def dataset_download(dl_command, taxid, fl_id_list, taxon_genome_map,
         
         # GloBI does not seem to include 'X endosymbiont of Y' or 'Candidatus X' in their taxa names
         # so we will check the taxid name for these terms which indicate expiremental confidence of symbiosis 
-        fl_exclusive_taxa = False
+        fl_exclusive_opt = False
         if taxid in fl_id_list:
-            fl_exclusive_taxa = True
+            fl_exclusive_opt = True
             
         sci_name = get_scientific_name(taxid, 3)
         logger.info(f"Taxid {taxid} scientific name is {sci_name}")
@@ -341,7 +341,7 @@ def dataset_download(dl_command, taxid, fl_id_list, taxon_genome_map,
             logger.info(f"Taxid {taxid} is a symbiont based on scientific name")
             
             # add to the foreground genomes if possible
-            if not add_taxa_to_selected_group(taxid, fg_genomes_selected, 'foreground') or fl_exclusive_taxa:
+            if not add_taxa_to_selected_group(taxid, fg_genomes_selected, 'foreground') or fl_exclusive_opt:
                 # if the max fg genomes have been reached delete the archive and return
                 os.remove(o_file)
                 return
@@ -357,7 +357,7 @@ def dataset_download(dl_command, taxid, fl_id_list, taxon_genome_map,
                 logger.info(f"Taxid {taxid} is a symbiont/pathogen based on GloBI results")
                 
                 # add to the foreground genomes if possible
-                if not add_taxa_to_selected_group(taxid, fg_genomes_selected, 'foreground') or fl_exclusive_taxa:
+                if not add_taxa_to_selected_group(taxid, fg_genomes_selected, 'foreground') or fl_exclusive_opt:
                     
                     # if the max fg genomes have been reached delete the archive and return
                     os.remove(o_file)
@@ -552,6 +552,7 @@ def main():
 
     id_list = taxonkit_get_subtrees(taxids)
     fl_id_list = taxonkit_get_subtrees(fl_taxids)
+    fl_id_list = [taxid for taxid in fl_id_list if taxid not in id_list]
     fg_genomes_selected, bg_genomes_selected, genome_accession_map = download_genomes(id_list, fl_id_list, args.max_genome_count, args.workdir, dl_log_file)
     
     # Save genome_accession_map to a json file 
