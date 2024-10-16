@@ -17,7 +17,6 @@ from scipy.stats import mannwhitneyu
 from skbio.stats.distance import DistanceMatrix
 from skbio.stats.distance import permanova
 from scipy.spatial.distance import pdist, squareform
-import alignment_stat_tests
 
 
 def calculate_average_pLDDT(pdb_file):
@@ -350,38 +349,39 @@ def plot_evorate_dnds(data_frame, output_path):
  
     plt.savefig(output_path)
     
-def plot_evorate_stats_comp(data_frame, output_path):
-    # Get the columns for fraction free living aligned and evorate stat
-    fraction_freeliving = data_frame['branch_fraction']
-    #evorate_stats = data_frame[['selected_syn_per_site_avg','selected_ns_per_site_avg', 'branch_fraction']]
-    evorate_stats = data_frame[['avg_branch_length','total_branch_length']]
+def plot_test_fraction(data_frame, output_path, outlier_cutoff=10):
     
-    # Filter the data_frame based on branch fraction
-    filtered_data = data_frame[data_frame['branch_fraction'] > 0]
+    # Filter the data_frame based on algn_fraction
+    no_outlier_data = data_frame[(data_frame['symbiont_branch_dnds_avg'] < outlier_cutoff) & (data_frame['non_symbiont_branch_dnds_avg'] < outlier_cutoff)]
+    outliers = data_frame[(data_frame['symbiont_branch_dnds_avg'] > outlier_cutoff) | (data_frame['non_symbiont_branch_dnds_avg'] > outlier_cutoff)]
+    num_rows_excluded = len(outliers)
+    
+    # Create scatter plots
+    plt.figure(figsize=(10, 6))
 
-    # Create a multipanel scatter plot
-    fig, axes = plt.subplots(nrows=1, ncols=len(evorate_stats.columns), figsize=(15, 5))
-    
-    # Iterate over each evorate stat column
-    for i, column in enumerate(evorate_stats.columns):
-        ax = axes[i]
-        ax.scatter(fraction_freeliving, evorate_stats[column])
-        ax.set_xlabel('branch_fraction')
-        ax.set_ylabel(column)
-    
-    # Save the plot to the output path
+    plt.scatter(no_outlier_data['algn_fraction'], no_outlier_data['test_fraction'], color='blue', zorder=1)
+
+    plt.xlabel('Alignment Fraction')
+    plt.ylabel('Test Fraction')
+    plt.title('FFPA vs Test Fraction')
+
+    plt.tight_layout()
     plt.savefig(output_path)
-
-def plot_aBSREL_comparisons_candidates(data_frame, output_path, title):
+    
+def plot_aBSREL_comparisons_candidates(data_frame, output_path, outlier_cutoff, title):
 
     # Filter the data_frame based on algn_fraction
-    no_outlier_data = data_frame[(data_frame['symbiont_branch_dnds_avg'] < 20) & (data_frame['non_symbiont_branch_dnds_avg'] < 20)]
-    outliers = data_frame[(data_frame['symbiont_branch_dnds_avg'] > 20) | (data_frame['non_symbiont_branch_dnds_avg'] > 20)]
+    no_outlier_data = data_frame[(data_frame['symbiont_branch_dnds_avg'] < outlier_cutoff) & (data_frame['non_symbiont_branch_dnds_avg'] < outlier_cutoff)]
+    outliers = data_frame[(data_frame['symbiont_branch_dnds_avg'] > outlier_cutoff) | (data_frame['non_symbiont_branch_dnds_avg'] > outlier_cutoff)]
     num_rows_excluded = len(outliers)
     print("Number of rows excluded:", num_rows_excluded)
     print("High symbiont dn/ds:")
     ids = []
     for r in no_outlier_data[no_outlier_data['symbiont_branch_dnds_avg'] > 1].iterrows():
+        print(r)
+        ids.append(r[1]['query'])
+    print("High non-symbiont dn/ds:")
+    for r in no_outlier_data[(no_outlier_data['non_symbiont_branch_dnds_avg'] > 1) & (no_outlier_data['algn_fraction'] < 0.5)].iterrows():
         print(r)
         ids.append(r[1]['query'])
     print(ids)
@@ -402,11 +402,11 @@ def plot_aBSREL_comparisons_candidates(data_frame, output_path, title):
     
     plt.savefig(output_path)
     
-def plot_aBSREL_comparisons_noncandidates(data_frame, output_path):
+def plot_aBSREL_comparisons_noncandidates(data_frame, output_path, outlier_cutoff, title):
 
     # Filter the data_frame based on algn_fraction
-    no_outlier_data = data_frame[(data_frame['symbiont_branch_dnds_avg'] < 10) & (data_frame['non_symbiont_branch_dnds_avg'] < 10)]
-    outliers = data_frame[(data_frame['symbiont_branch_dnds_avg'] > 10) | (data_frame['non_symbiont_branch_dnds_avg'] > 10)]
+    no_outlier_data = data_frame[(data_frame['symbiont_branch_dnds_avg'] < outlier_cutoff) & (data_frame['non_symbiont_branch_dnds_avg'] < outlier_cutoff)]
+    outliers = data_frame[(data_frame['symbiont_branch_dnds_avg'] > outlier_cutoff) | (data_frame['non_symbiont_branch_dnds_avg'] > outlier_cutoff)]
     num_rows_excluded = len(outliers)
     print("Number of rows excluded:", num_rows_excluded)
     print(outliers['symbiont_branch_dnds_avg'])
@@ -419,7 +419,7 @@ def plot_aBSREL_comparisons_noncandidates(data_frame, output_path):
 
     plt.xlabel('Symbiont Branch dN/dS Average')
     plt.ylabel('Non-Symbiont Branch dN/dS Average')
-    plt.title('Symbiont vs Non-Symbiont Branch dN/dS Averages')
+    plt.title(title)
     
     plt.savefig(output_path)
 
@@ -438,7 +438,23 @@ def rate_distribution_comparison(data_frame1, data_frame2, output_path):
 
     print(data_frame1['symbiont_branch_dnds_avg'])
     print(data_frame2['symbiont_branch_dnds_avg'])
-    input()
+    # Calculate and print the average of each data frame
+    avg_df1 = no_outlier_data1['symbiont_branch_dnds_avg'].mean()
+    avg_df2 = no_outlier_data2['symbiont_branch_dnds_avg'].mean()
+    print("Average of symbiont_branch_dnds_avg in data_frame1:", avg_df1)
+    print("Average of symbiont_branch_dnds_avg in data_frame2:", avg_df2)
+    
+    avg_df1 = no_outlier_data1['non_symbiont_branch_dnds_avg'].mean()
+    avg_df2 = no_outlier_data2['non_symbiont_branch_dnds_avg'].mean()
+    print("Average of non_symbiont_branch_dnds_avg in data_frame1:", avg_df1)
+    print("Average of non_symbiont_branch_dnds_avg in data_frame2:", avg_df2)
+
+    # Calculate and print the number of values above 1 in each data frame
+    count_above_1_df1 = (no_outlier_data1['symbiont_branch_dnds_avg'] > 1).sum()
+    count_above_1_df2 = (no_outlier_data2['symbiont_branch_dnds_avg'] > 1).sum()
+    print("Number of values above 1 in data_frame1:", count_above_1_df1)
+    print("Number of values above 1 in data_frame2:", count_above_1_df2)
+    
     # Print the results
     print("Mann-Whitney U test results:")
     print("Statistic:", statistic)
@@ -507,6 +523,7 @@ def main():
     parser.add_argument('-e','--evorate_analysis', type=str, help='path to evorateworkflow results directory')
     parser.add_argument('-e2','--evorate_analysis2', type=str, help='path to second evorate results directory for distrubtion comparison')
     parser.add_argument('-p','--plot_evorate',  type=str, help='path to evorateworkflow results plot')
+    parser.add_argument('-p2','--plot_evorate2',  type=str, help='path to evorateworkflow results plot (non-candidates)')
     parser.add_argument('-i','--id_map', type=str, help='path to id mapping file from uniprot')
     parser.add_argument('-s','--symbiont_ids', type=str, help='path to a txt file of symbiont IDs to pull from results')
     args = parser.parse_args()   
@@ -521,36 +538,35 @@ def main():
     # generate alignment stats data table and then clean up the ids
     alignment_table = alignment_stats(args.alignment, control_dictionary)
     alignment_df = make_output_df(alignment_table)
+    output_df = alignment_df.copy()
     
     if args.evorate_analysis:
         
         absrel_df = parse_hyphy_output.parse_absrel_results(args.evorate_analysis, args.symbiont_ids, args.id_map)
-        
+        print(absrel_df['symbiont_branch_dnds_avg'])
         if args.evorate_analysis2:
             
             # statistical comparison of dn/ds rates between two evorate analyses
             absrel_df2 = parse_hyphy_output.parse_absrel_results(args.evorate_analysis2, args.symbiont_ids, args.id_map)
+            
             rate_distribution_comparison(absrel_df, absrel_df2, args.plot_evorate)
             relative_rate_comparison(absrel_df, absrel_df2, args.plot_evorate)
-            #alignment_stat_tests.LDA_QDA_analysis(absrel_df, absrel_df2)
-
-        # aBSREL dnds comparison non candidates
-        
-        plot_aBSREL_comparisons_noncandidates(absrel_df, args.plot_evorate)   
-        
+            plot_aBSREL_comparisons_noncandidates(absrel_df2, args.plot_evorate2, 10, 'Symbiont vs Non-Symbiont Branch dN/dS Averages wMel non-candidates')   
         
         # aBSREL dnds comparison candidates
         print(absrel_df['symbiont_branch_dnds_avg'])
         
         evorate_alignment_df = pd.merge(alignment_df, absrel_df, on='query', how='left')
         
-        
-        #plot_aBSREL_comparisons_candidates(evorate_alignment_df, args.plot_evorate, 'Symbiont vs Non-Symbiont Branch dN/dS Averages wMel, small taxa range')  
-    
+        plot_test_fraction(evorate_alignment_df,'/storage1/gabe/mimic_screen/main_paper/final_figs/evorate_figs/wmel_testfraction-FFPA.png', 10)
+        plot_aBSREL_comparisons_candidates(evorate_alignment_df, args.plot_evorate, 10, 'Symbiont vs Non-Symbiont Branch dN/dS Averages wMelCandidates')  
+        columns_to_drop = ['ns_per_site_avg', 'syn_per_site_avg', 'dnds_tree_avg', 'symbiont_tree_dnds_avg', 'non_symbiont_tree_dnds_avg', 'selection_branch_count', 'total_branch_length', 'avg_branch_length', 'selected_ns_per_site_avg', 'selected_syn_per_site_avg','branch_fraction','branch_fraction_full_norm', 'Group']
+        evorate_alignment_df = evorate_alignment_df.drop(columns=columns_to_drop)
+        output_df = evorate_alignment_df.copy()
         
     # save dataframe to csv 
     
-    alignment_df.to_csv(args.csv_out, index=False)
+    output_df.to_csv(args.csv_out, index=False)
         
     # plot histogram of freeliving fraction values for alignment
     if args.fid_plot:
