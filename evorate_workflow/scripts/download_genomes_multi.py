@@ -232,6 +232,11 @@ def check_biosample_isolation_source(biosample_uids: list) -> bool:
                 # if the any of the biosample isolation sources are associated with a host, return False
                 if not freeliving_status[0]:
                     return False 
+            elif meta_data_field['@attribute_name'] == 'host':
+                host = meta_data_field['#text']
+                if host.lower() != 'enviorment':
+                    logger_biosamples.info(f"{uid} | {host} | host")
+                    return False
     return True
     
     
