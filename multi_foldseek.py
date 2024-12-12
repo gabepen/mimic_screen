@@ -56,11 +56,11 @@ def main():
         if args.threads:
             subprocess.run(['foldseek', 'easy-rbh', args.query,
                             proteome[0], output_path, 'multirbhtmp', '--threads', args.threads, 
-                            '--format-output', 'query,target,evalue,alntmscore,alnlen,qlen,tcov,qcov,tlen,u,t,lddt,fident,pident,prob'], stdout=subprocess.DEVNULL)
+                            '--format-output', 'query,target,evalue,alntmscore,alnlen,qlen,tcov,qcov,tlen,u,t,lddt,fident,pident,prob,qstart,qend,tstart,tend'], stdout=subprocess.DEVNULL)
         else:
             subprocess.run(['foldseek', 'easy-rbh', args.query,
                             proteome[0], output_path, 'multirbhtmp',
-                            '--format-output', 'query,target,evalue,alntmscore,alnlen,qlen,tcov,qcov,tlen,u,t,lddt,fident,pident,prob'], stdout=subprocess.DEVNULL)
+                            '--format-output', 'query,target,evalue,alntmscore,alnlen,qlen,tcov,qcov,tlen,u,t,lddt,fident,pident,prob,qstart,qend,tstart,tend'], stdout=subprocess.DEVNULL)
 
 if __name__ == '__main__':
     main()

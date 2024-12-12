@@ -9,3 +9,4 @@ evorate_workflow/scripts/__pycache__/
 taxon_selection/__pycache__/
 /evorate_workflow/nlp_model_data/
 /evorate_workflow/GloBI/
+*.json
