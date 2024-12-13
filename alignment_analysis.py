@@ -202,8 +202,70 @@ def calculate_alignment_overlap(aln_span1, aln_span2):
     
     overlap_pct = (overlap_len / union_len)  
     return overlap_pct      
-   
-def make_output_df(data_table, top_hits_only=False):
+
+def create_host_self_alignment_table(alignment):
+    
+    # create a dictionary of host protein self alignments
+    host_self_alignment_table = {}
+    
+    #parse host self alignment and create look up table
+    with open(alignment, 'r') as tsv:
+        lines = tsv.readlines()
+        for l in lines:
+            
+            # collect foldseek output values
+            parts = l.strip().split()
+            score = float(parts[3])
+            evalue = float(parts[2])
+            tcov = float(parts[6])
+            qcov = float(parts[7])
+            fident = float(lp[12])
+            
+            # alignment base statistic requirements
+            if score > 0.4 and  evalue < 0.01 and (tcov > 0.25 or qcov >= 0.5):
+                
+                # clean up file name to just have UNIProt ID
+                start = 'AF-'
+                end = '-F'
+                target_id = re.search(f'{start}(.*?){end}', parts[1]).group(1) if re.search(f'{start}(.*?){end}', parts[1]) else parts[1]
+                query_id = re.search(f'{start}(.*?){end}', parts[0]).group(1) if re.search(f'{start}(.*?){end}', parts[0]) else parts[0]
+                
+                # store the two aligned proteins and the tm-score in lookup table 
+                if query_id in host_self_alignment_table:
+                    host_self_alignment_table[query_id].append([target_id, score, fident])
+                else:
+                    host_self_alignment_table[query_id] = [[target_id, score, fident]]
+    
+    return host_self_alignment_table
+                     
+          
+def paralog_filter(target_group, host_self_alignment_table, query_tm_scores, threshold=0.15):
+    
+    
+    # iterate over target group and collect all alignment scores between each target in group
+    alignment_scores = []
+    sequence_identity_scores = []
+    for target in target_group:
+        for alignment in host_self_alignment_table[target]:
+            if alignment[0] in target_group and alignment[0] != target:
+                alignment_scores.append(alignment[1])
+    
+    # calculate the average alignment score between all targets in the group
+    try:
+        avg_alignment_score = sum(alignment_scores) / len(alignment_scores)
+        avg_query_score = sum(query_tm_scores) / len(query_tm_scores)
+        
+    # the similarity between the host proteins are too low to have been aligned
+    except ZeroDivisionError:
+        return None
+    
+    # determine if the divergence in structure between the host proteins and the query is within the threshold
+    if abs(avg_alignment_score - avg_query_score) < threshold:
+        return True
+    else:
+        return False
+    
+def make_output_df(data_table, host_self_alignment_table, top_hits_only=False):
     
     '''cleans up the results table and returns as a pandas dataframe
     '''
@@ -250,12 +312,33 @@ def make_output_df(data_table, top_hits_only=False):
             target_table[target_id].append([query_id, row[1], row[2], row[3], row[4], row[5], row[8], row[9], row[7]])
         else:
             target_table[target_id] = [[query_id, row[1], row[2], row[3], row[4], row[5], row[8], row[9], row[7]]]
-        
-        
+
+    #DEBUG: counting paralogs removed 
+    queries_aligned_to_paralog_groups = []
     # iterate over all alignment pairs and add to output dataframe 
     seen_target_ids = set()
-    for query_id in query_table:
+    for query_id in list(query_table.keys()):
         
+        # check number of targets query aligns to 
+        targets = list(query_table[query_id].keys())
+        
+        # this could indicate a group of host protein paralogs
+        if len(targets) > 1 and host_self_alignment_table != None:
+            
+            #  get tm-score across all alignments for query id
+            query_tm_scores = [query_table[query_id][target][1] for target in targets]
+            
+            # determine if the divergence in structure between the host proteins 
+            # is the same as the divergence between the query and host proteins
+            # (i.e. very likely houskeeping genes)
+           
+            if paralog_filter(targets, host_self_alignment_table, query_tm_scores):
+                # remove all alignments to this query id 
+                queries_aligned_to_paralog_groups.append(query_id)
+                del query_table[query_id]
+                continue
+                
+            
         for target_id in list(query_table[query_id].keys()) :
             
             # if the target id mapped to multiple queries determine percent overlaps of those alignments 
@@ -293,6 +376,7 @@ def make_output_df(data_table, top_hits_only=False):
                 # select the alignment with the highest TM-score from each group
                 best_alignments = []
                 for group in grouped_alignments:
+                    
                     largest_value = max(grouped_alignments[group], key=lambda x: x[1])
                     best_alignments = [v for v in grouped_alignments[group] if abs(v[1] - largest_value[1]) <= 0.003]
                     
@@ -317,7 +401,6 @@ def make_output_df(data_table, top_hits_only=False):
                 continue
                 
         
-        
     '''if alignment_pair not in pairs:
         # format output order
         output = [query_id, target_id, row[1], row[2], row[3], row[4], row[5]]
@@ -328,6 +411,10 @@ def make_output_df(data_table, top_hits_only=False):
     # Convert data_table to pandas DataFrame
     df = pd.DataFrame(output_table, columns=['query', 'target', 'score', 'tcov', 'qcov', 'fident', 'algn_fraction', 'qlen', 'tlen', 'qstart', 'qend', 'tstart', 'tend'])
 
+    #DEBUG
+    print(queries_aligned_to_paralog_groups)
+    print('Paralogs removed:', len(queries_aligned_to_paralog_groups))
+    
     return df
            
 def plot_freeliving_fraction_distribution(data_table, output_path):
@@ -676,6 +763,7 @@ def main():
     parser.add_argument('-p2','--plot_evorate2',  type=str, help='path to evorateworkflow results plot (non-candidates)')
     parser.add_argument('-i','--id_map', type=str, help='path to id mapping file from uniprot')
     parser.add_argument('-s','--symbiont_ids', type=str, help='path to a txt file of symbiont IDs to pull from results')
+    parser.add_argument('-pf','--paralog_filter', type=str, help='path to host self alignment file to filter out paralogs from the results')
     args = parser.parse_args()   
 
     # either generate the control dictionary or load it from previous run 
@@ -685,9 +773,31 @@ def main():
         with open(args.json_file, 'r') as json_f:
             control_dictionary = json.load(json_f)
 
-    # generate alignment stats data table and then clean up the ids
+    # generate alignment stats data table
     alignment_table = alignment_stats(args.alignment, control_dictionary)
-    alignment_df = make_output_df(alignment_table, False)
+    
+    # create host self alignment table if using paralog filter 
+    if args.paralog_filter:
+        
+        # check if self alignment has been used before 
+        self_alignment_name  = args.paralog_filter.split('/')[-1].split('.')[0]
+        if not os.path.exists(f'{self_alignment_name}.json'):
+            
+            # create host self alignment table
+            host_self_alignment_table = create_host_self_alignment_table(args.paralog_filter)
+            
+            # save host self alignment table to json
+            with open(f'{self_alignment_name}.json', 'w') as json_f:
+                json.dump(host_self_alignment_table, json_f, indent=2)
+        
+        else:
+            with open(f'{self_alignment_name}.json', 'r') as json_f:
+                host_self_alignment_table = json.load(json_f)
+        
+    else:
+        host_self_alignment_table = None
+        
+    alignment_df = make_output_df(alignment_table, host_self_alignment_table, False)
     output_df = alignment_df.copy()
         
     if args.evorate_analysis:
@@ -700,7 +810,7 @@ def main():
             
             #rate_distribution_comparison(absrel_df, absrel_df2, args.plot_evorate)
             #relative_rate_comparison(absrel_df, absrel_df2, args.plot_evorate)
-            plot_aBSREL_comparisons_noncandidates(absrel_df2, args.plot_evorate2, 10, 'Symbiont vs Non-Symbiont Branch dN/dS Averages wMel non-candidates')   
+            #plot_aBSREL_comparisons_noncandidates(absrel_df2, args.plot_evorate2, 10, 'Symbiont vs Non-Symbiont Branch dN/dS Averages wMel non-candidates')   
         
         # aBSREL dnds comparison candidates
         
@@ -717,7 +827,13 @@ def main():
     output_df = add_protein_description(output_df, 'target')
     output_df = add_go_terms(output_df, 'target')
     
-    PCA_tests.lda_pca_analysis(output_df, 'hpylori')
+    ''' for go_term_type in ['target_cellular_components', 'target_molecular_functions', 'target_biological_processes']:
+        for n_clusters in [15, 20, 30, 40]:
+            print('Running LDA and PCA analysis for', go_term_type, 'with', n_clusters, 'clusters')
+    '''
+    go_term_type = 'target_cellular_components'
+    n_clusters = 20
+    PCA_tests.lda_pca_analysis(output_df, 'wmel', go_term_type, n_clusters)
     #PCA_tests.tsne_analysis(output_df)
 
     # save dataframe to csv 
