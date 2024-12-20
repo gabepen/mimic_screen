@@ -283,13 +283,6 @@ def lda_pca_analysis(data_frame, organism_name, go_term_type, n_clusters=20):
             plt.scatter(x, y, c=colors[row['label']], s=4, zorder=rank_dict[row['label']])
         else:
             plt.scatter(x, y, c=colors[row['label']], s=10, zorder=rank_dict[row['label']])
-     
-    # Plot feature vectors 
-    scaled_loadings = pca.components_ * np.sqrt(pca.explained_variance_)
-    # Plot the feature vectors
-    for i in range(pca.components_.shape[1]):
-        plt.arrow(0, 0, scaled_loadings[i, 0], scaled_loadings[i, 1], color='k', alpha=0.5, zorder=20)
-        plt.text(scaled_loadings[i, 0] * 1.1, scaled_loadings[i, 1] * 1.1, f'Feature {i+1}', zorder=20)
         
     handles = [plt.Line2D([0], [0], marker='o', color='w', markerfacecolor=color, markersize=10, label=label) for label, color in colors.items()]
     plt.legend(handles=handles, title=' '.join(go_term_type.split('_')[1:]).capitalize(), title_fontsize='8', fontsize='6',  bbox_to_anchor=(1.05, 1), loc='upper left')

@@ -15,11 +15,14 @@ import PCA_tests
 import pandas as pd
 import seaborn as sns
 from scipy.stats import mannwhitneyu
+from scipy.stats import ttest_ind
 from skbio.stats.distance import DistanceMatrix
 from skbio.stats.distance import permanova
+from scipy.stats import mannwhitneyu
 from scipy.spatial.distance import pdist, squareform
 import uniprot_api_queries
 from scipy.cluster.hierarchy import linkage, fcluster
+import subprocess
 import pdb
 
 def calculate_average_pLDDT(pdb_file):
@@ -219,7 +222,7 @@ def create_host_self_alignment_table(alignment):
             evalue = float(parts[2])
             tcov = float(parts[6])
             qcov = float(parts[7])
-            fident = float(lp[12])
+            fident = float(parts[12])
             
             # alignment base statistic requirements
             if score > 0.4 and  evalue < 0.01 and (tcov > 0.25 or qcov >= 0.5):
@@ -238,10 +241,71 @@ def create_host_self_alignment_table(alignment):
     
     return host_self_alignment_table
                      
-          
-def paralog_filter(target_group, host_self_alignment_table, query_tm_scores, threshold=0.15):
+def plot_paralog_stat_distributions(structure_scores, sequence_scores, cohen_d_values, output_path):
     
+    structure_scores = [score for score in structure_scores if score is not None]
+    sequence_scores = [score for score in sequence_scores if score is not None]
+   
+    plt.figure(figsize=(10, 6))
     
+    sns.histplot(structure_scores, kde=True, color='blue', label='Structure Scores', bins=30)
+    sns.histplot(sequence_scores, kde=True, color='red', label='Sequence Scores', bins=30)
+    
+    plt.xlabel('Scores')
+    plt.ylabel('Frequency')
+    plt.title('Distribution of Structure and Sequence Average Scores Per Target Group')
+    plt.legend()
+    
+    plt.savefig(output_path)
+    plt.close()
+    
+def plot_paralog_rank_comparison(ranking_averages, output_path):
+    
+    # Extract the first and second values from the tuples
+    first_values = [x[0] for x in ranking_averages]
+    second_values = [x[1] for x in ranking_averages]
+
+    # Determine the ranks of the first and second values
+    first_ranks = pd.Series(first_values).rank().tolist()
+    second_ranks = pd.Series(second_values).rank().tolist()
+
+    # Create a scatter plot of the ranks
+    plt.figure(figsize=(10, 6))
+    plt.scatter(first_ranks, second_ranks, color='blue')
+
+    plt.xlabel('Rank of TM-Score Value')
+    plt.ylabel('Rank of SeqID Value')
+    plt.title('Scatter Plot of Ranks')
+
+    plt.savefig(output_path)
+    plt.close()
+    
+def paralog_filter(target_group, host_self_alignment_table, query_tm_scores, query_seqid_scores):
+    
+    def cohen_d(data1, data2):
+        """
+        Calculates Cohen's d effect size for two samples.
+
+        Args:
+            data1: The first dataset (list or numpy array).
+            data2: The second dataset (list or numpy array).
+
+        Returns:
+            Cohen's d effect size.
+        """
+
+        n1 = len(data1)
+        n2 = len(data2)
+        mean1 = np.mean(data1)
+        mean2 = np.mean(data2)
+        std1 = np.std(data1, ddof=1)  # Sample standard deviation
+        std2 = np.std(data2, ddof=1)  # Sample standard deviation
+
+        pooled_std = np.sqrt(((n1 - 1) * std1**2 + (n2 - 1) * std2**2) / (n1 + n2 - 2))
+        d = (mean1 - mean2) / pooled_std
+
+        return d
+
     # iterate over target group and collect all alignment scores between each target in group
     alignment_scores = []
     sequence_identity_scores = []
@@ -249,21 +313,84 @@ def paralog_filter(target_group, host_self_alignment_table, query_tm_scores, thr
         for alignment in host_self_alignment_table[target]:
             if alignment[0] in target_group and alignment[0] != target:
                 alignment_scores.append(alignment[1])
+                sequence_identity_scores.append(alignment[2])
     
+
+    '''
     # calculate the average alignment score between all targets in the group
     try:
         avg_alignment_score = sum(alignment_scores) / len(alignment_scores)
         avg_query_score = sum(query_tm_scores) / len(query_tm_scores)
-        
     # the similarity between the host proteins are too low to have been aligned
     except ZeroDivisionError:
         return None
+    '''
     
+    
+    # calculate the average seqid between all targets in the group
+    try:
+        avg_seqid_score = sum(sequence_identity_scores) / len(sequence_identity_scores)
+        avg_alignment_score = sum(alignment_scores) / len(alignment_scores)
+        avg_query_score = sum(query_seqid_scores) / len(query_seqid_scores)
+    # the similarity between the host proteins are too low to have been aligned
+    except ZeroDivisionError:
+        return False, None, None
+    
+    '''
     # determine if the divergence in structure between the host proteins and the query is within the threshold
-    if abs(avg_alignment_score - avg_query_score) < threshold:
-        return True
+    if abs(avg_seqid_score - avg_query_score) < threshold:
+        return True, avg_seqid_score, avg_alignment_score
     else:
-        return False
+        return False, avg_seqid_score, avg_alignment_score
+    '''
+    
+    # statistical and magnitude test approach 
+    
+    #U_statistic, p_value = mannwhitneyu(alignment_scores, query_tm_scores)
+    #cohen_d = cohen_d(alignment_scores, query_tm_scores)
+
+    U_statistic, p_value = mannwhitneyu(sequence_identity_scores, query_seqid_scores)
+    #cohen_d = cohen_d(sequence_identity_scores, query_seqid_scores)
+    
+    #cohen_d = abs(cohen_d)
+    if p_value < 0.05:
+        return False, avg_seqid_score, avg_alignment_score
+    else:
+        return True, avg_seqid_score, avg_alignment_score
+
+def make_output_df_no_filters(data_table):
+    
+    output_table = []
+    # get results 
+    pairs = set()
+    query_ids = set()
+    host_ids = set()
+    query_table = {}
+    target_table = {}
+    for row in tqdm(data_table):
+
+        if row[-1] == 'filtered':
+            continue
+        
+        # clean up file name to just have UNIProt ID
+        start = 'AF-'
+        end = '-F'
+        target_id = re.search(f'{start}(.*?){end}', row[6]).group(1) if re.search(f'{start}(.*?){end}', row[6]) else row[6]
+        query_id = re.search(f'{start}(.*?){end}', row[0]).group(1) if re.search(f'{start}(.*?){end}', row[0]) else row[0].split('_')[0]
+        
+        alignment_pair  = (query_id, target_id) 
+        
+        alignment_stats = [row[1], row[2], row[3], row[4], row[5], row[8], row[9], row[7]]
+        output_fields = alignment_stats[0:7]
+        output_fields.extend(alignment_stats[7])
+        output_fields.insert(0, target_id)
+        output_fields.insert(0, query_id)
+        output_table.append(output_fields)
+
+        
+    df = pd.DataFrame(output_table, columns=['query', 'target', 'score', 'tcov', 'qcov', 'fident', 'algn_fraction', 'qlen', 'tlen', 'qstart', 'qend', 'tstart', 'tend'])
+
+    return df
     
 def make_output_df(data_table, host_self_alignment_table, top_hits_only=False):
     
@@ -292,15 +419,18 @@ def make_output_df(data_table, host_self_alignment_table, top_hits_only=False):
         
         # determine top alignment for query id
         if top_hits_only and query_id in query_table:
-            if row[1] + row[2] > query_table[query_id][1] + query_table[query_id][2]:
-                query_table[query_id] = {target_id: [row[1], row[2], row[3], row[4], row[5], row[8], row[9], row[7]]}
+            if row[1] + row[2] > query_table[query_id][2] + query_table[query_id][3]:
+                query_table[query_id] = [target_id, row[1], row[2], row[3], row[4], row[5], row[8], row[9], row[7]]
         else:
+            # add new query id to table
             if query_id not in query_table:
                 query_table[query_id] = {target_id: [row[1], row[2], row[3], row[4], row[5], row[8], row[9], row[7]]}
             else:
+                # query exists in table add new target id
                 if target_id not in query_table[query_id]:
                     query_table[query_id][target_id] = [row[1], row[2], row[3], row[4], row[5], row[8], row[9], row[7]]
                 else:
+                    # query has been aligned to target at different positions, compare scores
                     if row[1] > query_table[query_id][target_id][0]:
                         query_table[query_id][target_id] = [row[1], row[2], row[3], row[4], row[5], row[8], row[9], row[7]]
                     else:
@@ -315,6 +445,10 @@ def make_output_df(data_table, host_self_alignment_table, top_hits_only=False):
 
     #DEBUG: counting paralogs removed 
     queries_aligned_to_paralog_groups = []
+    group_tmscore_averages = []
+    group_seqid_averages = []
+    ranking_averages = []
+    cohen_d_values = []
     # iterate over all alignment pairs and add to output dataframe 
     seen_target_ids = set()
     for query_id in list(query_table.keys()):
@@ -327,12 +461,17 @@ def make_output_df(data_table, host_self_alignment_table, top_hits_only=False):
             
             #  get tm-score across all alignments for query id
             query_tm_scores = [query_table[query_id][target][1] for target in targets]
+            query_seqid_scores = [query_table[query_id][target][4] for target in targets]
             
             # determine if the divergence in structure between the host proteins 
             # is the same as the divergence between the query and host proteins
             # (i.e. very likely houskeeping genes)
-           
-            if paralog_filter(targets, host_self_alignment_table, query_tm_scores):
+            result, seq_id_average, tm_score_avg = paralog_filter(targets, host_self_alignment_table, query_tm_scores, query_seqid_scores)
+            group_seqid_averages.append(seq_id_average)
+            group_tmscore_averages.append(tm_score_avg)
+            ranking_averages.append((tm_score_avg, seq_id_average))
+
+            if result:
                 # remove all alignments to this query id 
                 queries_aligned_to_paralog_groups.append(query_id)
                 del query_table[query_id]
@@ -411,10 +550,23 @@ def make_output_df(data_table, host_self_alignment_table, top_hits_only=False):
     # Convert data_table to pandas DataFrame
     df = pd.DataFrame(output_table, columns=['query', 'target', 'score', 'tcov', 'qcov', 'fident', 'algn_fraction', 'qlen', 'tlen', 'qstart', 'qend', 'tstart', 'tend'])
 
+    
     #DEBUG
+    
     print(queries_aligned_to_paralog_groups)
     print('Paralogs removed:', len(queries_aligned_to_paralog_groups))
     
+    candidate_list = [
+    'Q5ZVD8', 'Q5ZTI6', 'Q5ZUA2', 'Q5ZSI9', 'Q5ZUX1', 'Q5ZWA1', 
+    'Q5ZU58', 'Q5ZU32', 'Q5ZUS4', 'Q5ZRQ0', 'Q5ZSZ6', 'Q5ZVF7', 
+    'Q5ZYU9', 'Q5ZTM4', 'Q5ZSB6'
+    ]
+    # Check if values in the candidate list are in the queries aligned to paralog groups list
+    for candidate in candidate_list:
+        if candidate in queries_aligned_to_paralog_groups:
+            print(f"{candidate} is in the queries aligned to paralog groups list")
+    
+
     return df
            
 def plot_freeliving_fraction_distribution(data_table, output_path):
@@ -741,7 +893,80 @@ def add_go_terms(data_frame, field_name):
         json.dump(id_descriptions, json_f, indent=2)
         
     return data_frame
+
+def collect_aa_sequences(data_frame, field_name, mt_predictions): 
     
+    aa_sequences = []
+    collected_ids = set()     
+    for index, row in data_frame.iterrows():
+        query_id = row[field_name]
+        
+        # prediction has already been made or id seq has been collected already
+        if query_id in mt_predictions or query_id in collected_ids:
+            continue
+        
+        # check if target protein is likely mitochondrial 
+        #if 'mitoc' in row['target_description'] or 'mitoc' in ' '.join(row['target_cellular_components']).lower():
+            
+        # fetch entry from UniProt API
+        entry = uniprot_api_queries.fetch_uniprot_entry(query_id)
+        
+        # collect amino acid sequence for uniprot entry
+        try:
+            aa_sequence = entry['sequence']['value']
+        except KeyError:  
+            aa_sequence = 'X'
+        
+        aa_sequences.append({'id': query_id, 'sequence': aa_sequence})
+        
+        collected_ids.add(query_id)
+        
+            
+    return aa_sequences
+    
+def write_aa_sequences_to_fasta(aa_seq_list, output_path):
+    
+    with open(output_path, 'w+') as fasta_f:
+        for seq in aa_seq_list:
+            fasta_f.write(f'>{seq["id"]}\n{seq["sequence"]}\n')
+    
+    return output_path
+
+def predict_mt_sequences(data_frame, fasta_path, mt_predictions_dict, field_name):
+    
+    # run targetp on fasta file
+    results = subprocess.run(['targetp', '-fasta', fasta_path, '-format', 'short', '-stdout'], capture_output=True, text=True)
+    
+    probabilities = []
+    for l in results.stdout.split('\n'):
+        if l.startswith('#'):
+            continue
+        l = l.split('\t')
+        
+        try:
+            query_id = l[0]
+            prediction = l[1]
+        except IndexError:
+            continue
+        
+        # store prediction in dictionary
+        if query_id not in mt_predictions_dict:
+            mt_predictions_dict[query_id] = (l[2], l[3], l[4])
+        
+    output_field_mTP = field_name + '_mTP_probability'
+    output_field_SP = field_name + '_SP_probability'
+    data_frame[output_field_mTP] = data_frame[field_name].map(lambda x: mt_predictions_dict[x][2] if x in mt_predictions_dict else None)
+    data_frame[output_field_SP] = data_frame[field_name].map(lambda x: mt_predictions_dict[x][1] if x in mt_predictions_dict else None)
+    
+    # remove tmp fasta file
+    os.remove(fasta_path)
+    
+    # save id predictions to json
+    with open('mt_sequence_predictions.json', 'w') as json_f:
+        json.dump(mt_predictions_dict, json_f, indent=2)
+        
+    return data_frame
+         
 def main():
 
     '''Script that determines the overall presence of wMel protein alignments with the free-living control dataset.
@@ -764,6 +989,7 @@ def main():
     parser.add_argument('-i','--id_map', type=str, help='path to id mapping file from uniprot')
     parser.add_argument('-s','--symbiont_ids', type=str, help='path to a txt file of symbiont IDs to pull from results')
     parser.add_argument('-pf','--paralog_filter', type=str, help='path to host self alignment file to filter out paralogs from the results')
+    parser.add_argument('-mt','--mt_seq_predict', action='store_true', help='predict mitochondrial sequences')
     args = parser.parse_args()   
 
     # either generate the control dictionary or load it from previous run 
@@ -798,6 +1024,7 @@ def main():
         host_self_alignment_table = None
         
     alignment_df = make_output_df(alignment_table, host_self_alignment_table, False)
+    #alignment_df = make_output_df_no_filters(alignment_table)
     output_df = alignment_df.copy()
         
     if args.evorate_analysis:
@@ -827,13 +1054,28 @@ def main():
     output_df = add_protein_description(output_df, 'target')
     output_df = add_go_terms(output_df, 'target')
     
+    # add mitochondrial sequence prediction to the output dataframe
+    if args.mt_seq_predict:
+        
+        # Check for id dict for previous runs 
+        if not os.path.exists('mt_sequence_predictions.json'):
+            mt_predictions = {}
+        else:
+            with open('mt_sequence_predictions.json', 'r') as json_f:
+                mt_predictions = json.load(json_f)
+       
+        aa_sequences = collect_aa_sequences(output_df, 'query', mt_predictions)
+        tmp_aa_seq_fasta = write_aa_sequences_to_fasta(aa_sequences, 'mt_prediciton_tmp.fasta')
+        output_df = predict_mt_sequences(output_df, tmp_aa_seq_fasta, mt_predictions, 'query')
+        
+
     ''' for go_term_type in ['target_cellular_components', 'target_molecular_functions', 'target_biological_processes']:
         for n_clusters in [15, 20, 30, 40]:
             print('Running LDA and PCA analysis for', go_term_type, 'with', n_clusters, 'clusters')
     '''
-    go_term_type = 'target_cellular_components'
-    n_clusters = 20
-    PCA_tests.lda_pca_analysis(output_df, 'wmel', go_term_type, n_clusters)
+    #go_term_type = 'target_cellular_components'
+    #n_clusters = 10
+    #PCA_tests.lda_pca_analysis(output_df, 'wmel_parafilt_tm', go_term_type, n_clusters)
     #PCA_tests.tsne_analysis(output_df)
 
     # save dataframe to csv 
