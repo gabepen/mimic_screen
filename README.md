@@ -19,8 +19,12 @@ For other scripts
 
 
 ```
-$ pip install numpy pandas tqdm
+$ conda create --name mimic_screen --file req.txt
 ```
+Mitochondrial Sequence Prediction requires targetp V2.0
+
+* https://services.healthtech.dtu.dk/cgi-bin/sw_request?software=targetp&version=2.0&packageversion=2.0&platform=Linux
+* Add executable to path
 
 ## Screen Overview  
 
