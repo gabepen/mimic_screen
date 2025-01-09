@@ -985,6 +985,7 @@ def main():
     parser.add_argument('-mt','--mt_seq_predict', action='store_true', help='predict mitochondrial sequences')
     parser.add_argument('-t','--top_hits', action='store_true', help='only output top hits for each query id')
     parser.add_argument('-ap','--alignment_span_filter', action='store_true', help='filter out alignments where the target has aligned to multiple queries on the save span of target structure')
+    parser.add_argument('-pca','--pca_test_dir', type=str, help='path to directory for running and storing PCA tests')
     args = parser.parse_args()   
 
     # either generate the control dictionary or load it from previous run 
@@ -1030,14 +1031,8 @@ def main():
             # statistical comparison of dn/ds rates between two evorate analyses
             absrel_df2 = parse_hyphy_output.parse_absrel_results(args.evorate_analysis2, args.symbiont_ids, args.id_map)
             
-            #rate_distribution_comparison(absrel_df, absrel_df2, args.plot_evorate)
-            #relative_rate_comparison(absrel_df, absrel_df2, args.plot_evorate)
-            #plot_aBSREL_comparisons_noncandidates(absrel_df2, args.plot_evorate2, 10, 'Symbiont vs Non-Symbiont Branch dN/dS Averages wMel non-candidates')   
-        
         # aBSREL dnds comparison candidates
-        
         evorate_alignment_df = pd.merge(alignment_df, absrel_df, on='query', how='left')
-        
         plot_test_fraction(evorate_alignment_df,'/storage1/gabe/mimic_screen/main_paper/final_figs/evorate_figs/wmel_testfraction-FFPA.png', 10)
         plot_aBSREL_comparisons_candidates(evorate_alignment_df, args.plot_evorate, 10, 'Symbiont vs Non-Symbiont Branch dN/dS Averages wMelCandidates')  
         columns_to_drop = ['ns_per_site_avg', 'syn_per_site_avg', 'dnds_tree_avg', 'symbiont_tree_dnds_avg', 'non_symbiont_tree_dnds_avg', 'selection_branch_count', 'total_branch_length', 'avg_branch_length', 'selected_ns_per_site_avg', 'selected_syn_per_site_avg','branch_fraction','branch_fraction_full_norm']
@@ -1063,15 +1058,10 @@ def main():
         tmp_aa_seq_fasta = write_aa_sequences_to_fasta(aa_sequences, 'mt_prediciton_tmp.fasta')
         output_df = predict_mt_sequences(output_df, tmp_aa_seq_fasta, mt_predictions, 'query')
         
-
-    ''' for go_term_type in ['target_cellular_components', 'target_molecular_functions', 'target_biological_processes']:
-        for n_clusters in [15, 20, 30, 40]:
-            print('Running LDA and PCA analysis for', go_term_type, 'with', n_clusters, 'clusters')
-    '''
-    #go_term_type = 'target_cellular_components'
-    #n_clusters = 10
-    #PCA_tests.lda_pca_analysis(output_df, 'wmel_parafilt_tm', go_term_type, n_clusters)
-    #PCA_tests.tsne_analysis(output_df)
+    if args.pca_test_dir:
+        go_term_type = 'target_cellular_components'
+        n_clusters = 10
+        PCA_tests.lda_pca_analysis(args.pca_test_dir,output_df, 'wmel_parafilt_tm', go_term_type, n_clusters)
 
     # save dataframe to csv 
     output_df.to_csv(args.csv_out, index=False)

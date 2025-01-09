@@ -13,11 +13,7 @@ import argparse
 import re
 import pdb
 
-pca_test_dir = '/storage1/gabe/mimic_screen/main_paper/final_figs/pca_test'
 candidate_list = ['Q73HU7', 'Q73IF8', 'Q73GY6', 'Q73GG5', 'Q73HX8', 'P61189']
-#candidate_list = ['O25525', 'O25981']
-#candidate_list = ['Q5F2U4', 'Q5ZW23']
-#candidate_list = []
 validation_list = [
     'Q5ZVD8', 'Q5ZTI6', 'Q5ZUA2', 'Q5ZSI9', 'Q5ZUX1', 'Q5ZWA1', 
     'Q5ZU58', 'Q5ZU32', 'Q5ZUS4', 'Q5ZRQ0', 'Q5ZSZ6', 'Q5ZVF7', 
@@ -183,7 +179,7 @@ def apply_labels(data_frame):
     
     return test_data_frame, labels, selected_columns
     
-def lda_pca_analysis(data_frame, organism_name, go_term_type, n_clusters=20):
+def lda_pca_analysis(pca_test_dir, data_frame, organism_name, go_term_type, n_clusters=20):
     
     #go_term_type = 'target_cellular_components'
     #n_clusters = 20
@@ -293,7 +289,7 @@ def lda_pca_analysis(data_frame, organism_name, go_term_type, n_clusters=20):
     plt.savefig(pca_test_dir + f'/lda_pca_viz_{organism_name}_{go_term_out}_{n_clusters}.png', dpi=300)
     plt.close()
     
-def tsne_analysis(data_frame):
+def tsne_analysis(pca_test_dir, data_frame):
     
     # label data by groups 
     test_data_frame, labels, selected_columns = apply_labels(data_frame)
@@ -366,7 +362,7 @@ def tsne_analysis(data_frame):
     plt.savefig(pca_test_dir + '/tsne_viz_lp.png')
     plt.close()
 
-def pca_tsne_analysis(data_frame):
+def pca_tsne_analysis(pca_test_dir, data_frame):
     
      # label data by groups 
     test_data_frame, labels, selected_columns = apply_labels(data_frame)
@@ -435,7 +431,7 @@ def pca_tsne_analysis(data_frame):
     plt.savefig(pca_test_dir + '/tsne_pca_viz_hp.png')
     plt.close()
     
-def pca_analysis(data_frame):
+def pca_analysis(pca_test_dir, data_frame):
      # Store the categorical value in a separate variable
     data_frame['simplified_labels'] = data_frame['target_cellular_components'].apply(classify_label)
     labels = data_frame['simplified_labels']
