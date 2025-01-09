@@ -15,10 +15,8 @@ import PCA_tests
 import pandas as pd
 import seaborn as sns
 from scipy.stats import mannwhitneyu
-from scipy.stats import ttest_ind
 from skbio.stats.distance import DistanceMatrix
 from skbio.stats.distance import permanova
-from scipy.stats import mannwhitneyu
 from scipy.spatial.distance import pdist, squareform
 import uniprot_api_queries
 from scipy.cluster.hierarchy import linkage, fcluster
@@ -392,7 +390,7 @@ def make_output_df_no_filters(data_table):
 
     return df
     
-def make_output_df(data_table, host_self_alignment_table, top_hits_only=False):
+def make_output_df(data_table, host_self_alignment_table, top_hits_only, alignment_span_filter):
     
     '''cleans up the results table and returns as a pandas dataframe
     '''
@@ -417,24 +415,25 @@ def make_output_df(data_table, host_self_alignment_table, top_hits_only=False):
         
         alignment_pair  = (query_id, target_id) 
         
-        # determine top alignment for query id
+        ''' # determine top alignment for query id
         if top_hits_only and query_id in query_table:
             if row[1] + row[2] > query_table[query_id][2] + query_table[query_id][3]:
                 query_table[query_id] = [target_id, row[1], row[2], row[3], row[4], row[5], row[8], row[9], row[7]]
         else:
-            # add new query id to table
-            if query_id not in query_table:
-                query_table[query_id] = {target_id: [row[1], row[2], row[3], row[4], row[5], row[8], row[9], row[7]]}
+        '''
+        # add new query id to table
+        if query_id not in query_table:
+            query_table[query_id] = {target_id: [row[1], row[2], row[3], row[4], row[5], row[8], row[9], row[7]]}
+        else:
+            # query exists in table add new target id
+            if target_id not in query_table[query_id]:
+                query_table[query_id][target_id] = [row[1], row[2], row[3], row[4], row[5], row[8], row[9], row[7]]
             else:
-                # query exists in table add new target id
-                if target_id not in query_table[query_id]:
+                # query has been aligned to target at different positions, compare scores
+                if row[1] > query_table[query_id][target_id][0]:
                     query_table[query_id][target_id] = [row[1], row[2], row[3], row[4], row[5], row[8], row[9], row[7]]
                 else:
-                    # query has been aligned to target at different positions, compare scores
-                    if row[1] > query_table[query_id][target_id][0]:
-                        query_table[query_id][target_id] = [row[1], row[2], row[3], row[4], row[5], row[8], row[9], row[7]]
-                    else:
-                        continue
+                    continue
                 
         
         # track all alignments for target id
@@ -443,14 +442,10 @@ def make_output_df(data_table, host_self_alignment_table, top_hits_only=False):
         else:
             target_table[target_id] = [[query_id, row[1], row[2], row[3], row[4], row[5], row[8], row[9], row[7]]]
 
-    #DEBUG: counting paralogs removed 
-    queries_aligned_to_paralog_groups = []
-    group_tmscore_averages = []
-    group_seqid_averages = []
-    ranking_averages = []
-    cohen_d_values = []
-    # iterate over all alignment pairs and add to output dataframe 
+    # iterate over all alignment pairs and add to output dataframe by each query ID then each target it aligns to 
     seen_target_ids = set()
+    paralog_results = {}
+    alternate_hits = {}
     for query_id in list(query_table.keys()):
         
         # check number of targets query aligns to 
@@ -467,21 +462,29 @@ def make_output_df(data_table, host_self_alignment_table, top_hits_only=False):
             # is the same as the divergence between the query and host proteins
             # (i.e. very likely houskeeping genes)
             result, seq_id_average, tm_score_avg = paralog_filter(targets, host_self_alignment_table, query_tm_scores, query_seqid_scores)
-            group_seqid_averages.append(seq_id_average)
-            group_tmscore_averages.append(tm_score_avg)
-            ranking_averages.append((tm_score_avg, seq_id_average))
 
             if result:
-                # remove all alignments to this query id 
-                queries_aligned_to_paralog_groups.append(query_id)
-                del query_table[query_id]
-                continue
-                
+                paralog_results[query_id] = 'yes'
+            else:
+                paralog_results[query_id] = 'no'
+        
+        # for top_hits_only output determine the best alignment for each query id
+        if top_hits_only:
             
+            # Rank the values in the dictionary for the query id based on the sum of the first two values in each sub dictionary
+            ranked_targets = sorted(query_table[query_id].items(), key=lambda x: x[1][0] + x[1][1], reverse=True)
+
+            # Update the query table with the best alignment for the query id
+            query_table[query_id] = {ranked_targets[0][0]: ranked_targets[0][1]} 
+            
+            # store the alternate hits for the query id 
+            alternate_hits[query_id] = [target[0] for target in ranked_targets[1:]]
+                 
+        # iterate over all alignments for query id
         for target_id in list(query_table[query_id].keys()) :
             
             # if the target id mapped to multiple queries determine percent overlaps of those alignments 
-            if target_id not in seen_target_ids and len(target_table[target_id]) > 1:
+            if target_id not in seen_target_ids and len(target_table[target_id]) > 1 and not top_hits_only and alignment_span_filter:
                 overlap_matrix = []
                 for i in range(len(target_table[target_id])):
                     row = []
@@ -546,26 +549,16 @@ def make_output_df(data_table, host_self_alignment_table, top_hits_only=False):
         output_table.append(output)
         pairs.add(alignment_pair)
         ids.add(query_id)'''
-            
+
     # Convert data_table to pandas DataFrame
     df = pd.DataFrame(output_table, columns=['query', 'target', 'score', 'tcov', 'qcov', 'fident', 'algn_fraction', 'qlen', 'tlen', 'qstart', 'qend', 'tstart', 'tend'])
+    
+    # Map on paralog check results 
+    df['targets_likely_paralogs'] = df['query'].map(paralog_results)
 
-    
-    #DEBUG
-    
-    print(queries_aligned_to_paralog_groups)
-    print('Paralogs removed:', len(queries_aligned_to_paralog_groups))
-    
-    candidate_list = [
-    'Q5ZVD8', 'Q5ZTI6', 'Q5ZUA2', 'Q5ZSI9', 'Q5ZUX1', 'Q5ZWA1', 
-    'Q5ZU58', 'Q5ZU32', 'Q5ZUS4', 'Q5ZRQ0', 'Q5ZSZ6', 'Q5ZVF7', 
-    'Q5ZYU9', 'Q5ZTM4', 'Q5ZSB6'
-    ]
-    # Check if values in the candidate list are in the queries aligned to paralog groups list
-    for candidate in candidate_list:
-        if candidate in queries_aligned_to_paralog_groups:
-            print(f"{candidate} is in the queries aligned to paralog groups list")
-    
+    if top_hits_only:
+        # Map on alternate hits results 
+        df['alternate_hits'] = df['query'].map(alternate_hits)
 
     return df
            
@@ -990,6 +983,8 @@ def main():
     parser.add_argument('-s','--symbiont_ids', type=str, help='path to a txt file of symbiont IDs to pull from results')
     parser.add_argument('-pf','--paralog_filter', type=str, help='path to host self alignment file to filter out paralogs from the results')
     parser.add_argument('-mt','--mt_seq_predict', action='store_true', help='predict mitochondrial sequences')
+    parser.add_argument('-t','--top_hits', action='store_true', help='only output top hits for each query id')
+    parser.add_argument('-ap','--alignment_span_filter', action='store_true', help='filter out alignments where the target has aligned to multiple queries on the save span of target structure')
     args = parser.parse_args()   
 
     # either generate the control dictionary or load it from previous run 
@@ -1023,7 +1018,7 @@ def main():
     else:
         host_self_alignment_table = None
         
-    alignment_df = make_output_df(alignment_table, host_self_alignment_table, False)
+    alignment_df = make_output_df(alignment_table, host_self_alignment_table, args.top_hits, args.alignment_span_filter)
     #alignment_df = make_output_df_no_filters(alignment_table)
     output_df = alignment_df.copy()
         
