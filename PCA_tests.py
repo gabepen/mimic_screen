@@ -13,10 +13,7 @@ import argparse
 import re
 import pdb
 
-pca_test_dir = '/storage1/gabe/mimic_screen/main_paper/final_figs/pca_test'
-#candidate_list = ['Q73HU7', 'Q73IF8', 'Q73GY6', 'Q73GG5', 'Q73HX8', 'P61189']
-candidate_list = ['O25525', 'O25981']
-#candidate_list = ['Q5F2U4', 'Q5ZW23']
+candidate_list = ['Q73HU7', 'Q73IF8', 'Q73GY6', 'Q73GG5', 'Q73HX8', 'P61189']
 validation_list = [
     'Q5ZVD8', 'Q5ZTI6', 'Q5ZUA2', 'Q5ZSI9', 'Q5ZUX1', 'Q5ZWA1', 
     'Q5ZU58', 'Q5ZU32', 'Q5ZUS4', 'Q5ZRQ0', 'Q5ZSZ6', 'Q5ZVF7', 
@@ -34,7 +31,11 @@ def generate_label_color_dict(labels):
         'magenta', 'yellow', 'black', 'teal', 'lime', 'navy', 'maroon', 'gold', 'silver', 'violet'
     ]
     '''
-    colors = plt.cm.get_cmap('tab20', len(unique_labels)).colors
+    # Use a combination of tab20, tab20b, and tab20c colormaps for more colors
+    colors = list(plt.cm.get_cmap('tab20', 20).colors) + \
+             list(plt.cm.get_cmap('tab20b', 20).colors) + \
+             list(plt.cm.get_cmap('tab20c', 20).colors)
+             
     if len(unique_labels) > len(colors):
         raise ValueError("Number of unique labels exceeds the number of available colors.")
     label_color_dict = {label: colors[i] for i, label in enumerate(unique_labels)}
@@ -98,7 +99,7 @@ def semantic_clustering(data_frame, term, n_clusters=15):
     X = vectorizer.fit_transform(all_annotations)
     
     # Cluster the annotations into 10-20 groups
-    kmeans = KMeans(n_clusters=n_clusters)
+    kmeans = KMeans(n_clusters=n_clusters, n_init=10, random_state=12, max_iter=600)
     clusters = kmeans.fit_predict(X)
 
     # Map terms to their clusters
@@ -178,14 +179,14 @@ def apply_labels(data_frame):
     
     return test_data_frame, labels, selected_columns
     
-def lda_pca_analysis(data_frame, organism_name):
+def lda_pca_analysis(pca_test_dir, data_frame, organism_name, go_term_type, n_clusters=20):
     
-    go_term_type = 'target_cellular_components'
-    n_clusters = 15
+    #go_term_type = 'target_cellular_components'
+    #n_clusters = 20
     test_data_frame, labels, selected_columns = semantic_clustering(data_frame, go_term_type, n_clusters)
    #test_data_frame, labels, selected_columns = apply_labels(data_frame)
     
-    candidate_list = generate_candidate_list(data_frame, 0.1, 0.3)
+    #candidate_list = generate_candidate_list(data_frame, 0.1, 0.3)
     print('Candidates within threshold:', len(candidate_list))
      # label data by groups 
     
@@ -232,10 +233,16 @@ def lda_pca_analysis(data_frame, organism_name):
     color_dict['mimic'] = 'mediumspringgreen'
     rank_dict['candidate'] = n_clusters + 3
     rank_dict['mimic'] = n_clusters + 2
-    print(color_dict.keys())
     
+    if go_term_type == 'target_cellular_components':
+        go_term_out = 'cellcomp'
+    elif go_term_type == 'target_molecular_functions':
+        go_term_out = 'molfunc'
+    else:
+        go_term_out = 'bioproc'
+
     # Save pca_df to a CSV file
-    pca_df.to_csv(pca_test_dir + f'/{organism_name}_pca_results.csv', index=False)
+    pca_df.to_csv(pca_test_dir + f'/{organism_name}_pca_results_{go_term_out}_{n_clusters}.csv', index=False)
     
     plt.clf()
     
@@ -272,18 +279,17 @@ def lda_pca_analysis(data_frame, organism_name):
             plt.scatter(x, y, c=colors[row['label']], s=4, zorder=rank_dict[row['label']])
         else:
             plt.scatter(x, y, c=colors[row['label']], s=10, zorder=rank_dict[row['label']])
-     
-
+        
     handles = [plt.Line2D([0], [0], marker='o', color='w', markerfacecolor=color, markersize=10, label=label) for label, color in colors.items()]
     plt.legend(handles=handles, title=' '.join(go_term_type.split('_')[1:]).capitalize(), title_fontsize='8', fontsize='6',  bbox_to_anchor=(1.05, 1), loc='upper left')
     plt.xlabel('Principal Component 1')
     plt.ylabel('Principal Component 2')
     plt.title(f'LDA-PCA of Alignment Features {organism_name.capitalize()}')
     plt.tight_layout(rect=[0, 0, 0.75, 1])  # Adjust layout to make room for the legend
-    plt.savefig(pca_test_dir + f'/lda_pca_viz_{organism_name}.png', dpi=300)
+    plt.savefig(pca_test_dir + f'/lda_pca_viz_{organism_name}_{go_term_out}_{n_clusters}.png', dpi=300)
     plt.close()
     
-def tsne_analysis(data_frame):
+def tsne_analysis(pca_test_dir, data_frame):
     
     # label data by groups 
     test_data_frame, labels, selected_columns = apply_labels(data_frame)
@@ -356,7 +362,7 @@ def tsne_analysis(data_frame):
     plt.savefig(pca_test_dir + '/tsne_viz_lp.png')
     plt.close()
 
-def pca_tsne_analysis(data_frame):
+def pca_tsne_analysis(pca_test_dir, data_frame):
     
      # label data by groups 
     test_data_frame, labels, selected_columns = apply_labels(data_frame)
@@ -425,7 +431,7 @@ def pca_tsne_analysis(data_frame):
     plt.savefig(pca_test_dir + '/tsne_pca_viz_hp.png')
     plt.close()
     
-def pca_analysis(data_frame):
+def pca_analysis(pca_test_dir, data_frame):
      # Store the categorical value in a separate variable
     data_frame['simplified_labels'] = data_frame['target_cellular_components'].apply(classify_label)
     labels = data_frame['simplified_labels']

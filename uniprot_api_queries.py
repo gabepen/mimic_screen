@@ -42,12 +42,11 @@ def search_uniprot(query, format='json'):
 
 def main():
     # Example usage
-    uniprot_id = "Q73FR6"
+    uniprot_id = "Q73G91"
     entry = fetch_uniprot_entry(uniprot_id)
     pp = pprint.PrettyPrinter(indent=5)
     pp.pprint(entry)
-    print(entry.keys())
-    print(entry['proteinDescription']['recommendedName']['fullName']['value'])
+    print(entry['sequence']['value'])
     
    
 
