@@ -64,6 +64,9 @@ def download_gene_data(taxid, query_id, taxon_dict, accession_dict, seq_dict, wo
     result = subprocess.run(ncbi_datasets_command, shell=True, capture_output=True, text=True)
     error_output = result.stderr
     
+    logger.info(f"Download error output for {taxid}: {error_output}")
+    logger.info(f"Download command for {taxid}: {ncbi_datasets_command}")
+    
     # extract protein sequence fasta to taxid folder in orthologs folder 
     zip_path = os.path.join(output_path)
     extract_dir = os.path.splitext(zip_path)[0]
@@ -206,16 +209,12 @@ def collect_ortholog_accesssions(query_id, candidate_list, workdir):
                     # Write out rbh hits to the query accession number
                     if fields[0] in candidate_list: 
                         
-                        # storing all mimic candidate accessions in the taxon_dict
-                        taxon_dict[query_id].append((fields[0],fields[0]))
-                        
                         # candidate has at least one ortholog seq
                         candidate_sources.add(fields[0]) 
                           
                         # map candidate accession to its orthologs 
                         if fields[0] not in query_dict:
-                            query_dict[fields[0]] = [fields[0],fields[1]]
-                                               
+                            query_dict[fields[0]] = [fields[0],fields[1]]                  
                         else:
                             query_dict[fields[0]].append(fields[1])
                         

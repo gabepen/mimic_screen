@@ -254,9 +254,6 @@ def download_genomes(id_list: list,fl_id_list: list, max_genome_count: int, work
     
     # Create a directory to store the genomes
     os.makedirs(workdir + '/genomes', exist_ok=True)
-      
-    # shuffle taxid list 
-    random.shuffle(id_list)
     
     # Log download command 
     download_command = [
@@ -404,6 +401,9 @@ def main():
     logger.info(f"fl_taxids: {fl_taxids}")
 
     id_list = taxonkit_get_subtrees(taxids)
+     # shuffle taxid list 
+    random.shuffle(id_list)
+    id_list.insert(0, args.query_id)
     fl_id_list = taxonkit_get_subtrees(fl_taxids)
     fl_id_list = [taxid for taxid in fl_id_list if taxid not in id_list]
     fg_genomes_selected, bg_genomes_selected, genome_accession_map = download_genomes(id_list, fl_id_list, args.max_genome_count, args.workdir, dl_log_file)
