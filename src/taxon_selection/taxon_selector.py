@@ -123,11 +123,13 @@ def main():
     selection_dict = generate_selection_dict(subtree, rank1, rank2)
 
     # collect previously selected taxids 
-    previously_selected_taxids = set()
-    previous_csvs = glob(args.previous + '/*.csv')
-    for taxon_csv in previous_csvs:
-        taxid_set = collect_already_selected(taxon_csv)
-        previously_selected_taxids.update(taxid_set)
+    if args.previous: 
+        previously_selected_taxids = set()
+        previous_csvs = glob(args.previous + '/*.csv')
+        for taxon_csv in previous_csvs:
+            taxid_set = collect_already_selected(taxon_csv)
+            previously_selected_taxids.update(taxid_set)
+    else: previously_selected_taxids = set()
 
     # initialize entrez database toolkit objects
     genome_lib = es.Librarian('genome')

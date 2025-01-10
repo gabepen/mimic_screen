@@ -10,3 +10,6 @@ taxon_selection/__pycache__/
 /evorate_workflow/nlp_model_data/
 /evorate_workflow/GloBI/
 *.json
+/src/utilities/__pycache__
+*.dtd
+/src/taxon_selection/*.csv
