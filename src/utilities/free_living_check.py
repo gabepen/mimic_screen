@@ -7,6 +7,17 @@ import datetime
 import csv
 import sys
 import os
+import nltk
+from nltk.corpus import wordnet as wn 
+
+# Define the relative path for NLTK data within the repository
+nltk_data_path = os.path.join(os.path.dirname(__file__), '../../data/nltk_data')
+
+# install nltk data if not already installed
+nltk.download('wordnet', download_dir=nltk_data_path)
+
+# add nltk data path to environment
+nltk.data.path.append(nltk_data_path)
 
 def is_source_freeliving(isolation_source: str) -> tuple:
     
@@ -49,7 +60,6 @@ def is_source_freeliving(isolation_source: str) -> tuple:
             while hypernyms:
                 for hypernym in hypernyms:
                     if hypernym.name().split('.')[0] in living_entity_syns:
-                        print(hypernym)
                         return (False, hypernym)
                 hypernyms = hypernyms[0].hypernyms() 
     
@@ -79,6 +89,16 @@ def validate_globi_results(taxid: str, rows: list):
         Logs citation information for unique interactions found.
     """
         
+    '''
+    INDEX ERRORS IN THIS FUNCTION 
+    
+    Are very likely occuring because the globi.db file was created with the wrong columns cut from the interactions csv file.
+    This program is designed to work with the minimal columns necessary in the interactions table for 
+    determining if a taxon is free-living or not.
+    
+    Refer to the readme for the correct columns to cut from the interactions csv file or the names of the fields that
+    are being checked by this function
+    '''
     
     # no interaction results found
     if len(rows) == 0:
@@ -89,10 +109,10 @@ def validate_globi_results(taxid: str, rows: list):
     for r in rows:
         
         # only save citations for unique interactions
-        if (r[38],r[42]) not in found_interactions:
-            ref_citation = r[84]
-            source_citation = r[85]
-            found_interactions.add((r[38], r[42]))
+        if (r[3],r[4]) not in found_interactions:
+            ref_citation = r[5]
+            source_citation = r[6]
+            found_interactions.add((r[3], r[4]))
     
     return True 
 

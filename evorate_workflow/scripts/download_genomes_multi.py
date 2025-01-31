@@ -2,6 +2,7 @@ import subprocess
 import argparse
 from tqdm import tqdm
 import os
+import sys
 import zipfile
 import shutil
 import random
@@ -367,7 +368,6 @@ def main():
     parser.add_argument("-m", "--max_genome_count", default=300, type=int, help="max number of genomess to download")
     parser.add_argument("-l", "--log", default="logs/", help="log file name")
     parser.add_argument("-f", "--free_living_tax_ids", default='')
-    parser.add_argument("-n", "--nltk_data_dir", default="nltk_data", help="Path to the NLTK data directory")
     parser.add_argument("-g", "--globi_db_path", default="globi.db", help="Path to the GloBI database")
     args = parser.parse_args()
 
@@ -383,14 +383,6 @@ def main():
 
     # make workdir
     os.makedirs(args.workdir, exist_ok=True)
-    
-    # Set the NLTK data directory
-    nltk_data_dir = args.nltk_data_dir
-    os.makedirs(nltk_data_dir, exist_ok=True)
-    nltk.data.path.append(nltk_data_dir)
-    
-    # Download the WordNet dataset if not already downloaded
-    nltk.download('wordnet', download_dir=nltk_data_dir)
     
     # Set globi db path 
     globi_db_path = args.globi_db_path
