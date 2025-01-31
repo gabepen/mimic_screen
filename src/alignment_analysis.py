@@ -1,27 +1,25 @@
 import argparse
-import numpy as np
-from glob import glob 
-import os 
-from tqdm import tqdm
 import json
-import re
-import sys
-from statistics import mean 
-from Bio.PDB import PDBParser
 import matplotlib.pyplot as plt
-from matplotlib.ticker import StrMethodFormatter, PercentFormatter
-import parse_hyphy_output
-import PCA_tests
+import numpy as np
+import os
 import pandas as pd
-import seaborn as sns
-from scipy.stats import mannwhitneyu
-from skbio.stats.distance import DistanceMatrix
-from skbio.stats.distance import permanova
-from scipy.spatial.distance import pdist, squareform
-import uniprot_api_queries
-from scipy.cluster.hierarchy import linkage, fcluster
-import subprocess
 import pdb
+import re
+import seaborn as sns
+import subprocess
+import sys
+from Bio.PDB import PDBParser
+from glob import glob
+from matplotlib.ticker import PercentFormatter, StrMethodFormatter
+from scipy.cluster.hierarchy import fcluster, linkage
+from scipy.spatial.distance import pdist, squareform
+from scipy.stats import mannwhitneyu
+from skbio.stats.distance import DistanceMatrix, permanova
+from statistics import mean
+from tqdm import tqdm
+from utilities import parse_hyphy_output, uniprot_api_queries
+from stats_modules import PCA_tests
 
 def calculate_average_pLDDT(pdb_file):
     
@@ -788,7 +786,7 @@ def add_protein_description(data_frame, field_name):
     else:
         with open('prot_descriptions.json', 'r') as json_f:
             id_descriptions = json.load(json_f)
-            
+                    
     descriptions = []
     for query_id in data_frame[field_name]:
         if query_id in id_descriptions:

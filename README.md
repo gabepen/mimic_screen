@@ -6,13 +6,38 @@ The taxon selection folder contains the scripts for generating the exapnsive con
 
 ##  Dependency Installation 
 
-For taxon selection scripts:
-* gsutil from the Google Cloud CLI is required to run the fetch_proteomes.sh script for downloading proteomes from the AlphaFold Structure Database: https://cloud.google.com/storage/docs/gsutil_install
+For taxon selection scripts using LLM for free-living determination:
 
+
+* gsutil from the Google Cloud CLI is required to run the fetch_proteomes.sh script for downloading proteomes from the AlphaFold Structure Database: https://cloud.google.com/storage/docs/gsutil_install
 
 ```
 $ pip install bardapi==0.1.38 bacdive==0.3.1 biopython==1.79
 ```
+
+For taxon selection with database searching (RECOMMENDED):
+
+* Download globi interactions csv and convert to sqlite3 database
+
+```
+$ wget https://zenodo.org/records/14640564/files/interactions.csv.gz
+```
+
+* We want to cut out only the columns necessary for the free-living determination reducing the size of the final db file from ~50gb to ~4. If you want to retain more columns for some other analysis you would need to adjust the index values in validate_globi_results() in free_living_check.py based on your version of the sqlite3 database 
+
+```
+$ cat interactions.csv.gz | gunzip | cut -d',' -f1,2,3,39,43,85,86 | sqlite3 -csv globi_reduced.db '.import /dev/stdin interactions'
+```
+
+* Columns being selected
+    - Index 38, Name: interactionTypeName
+    - Index: 42, Name: targetTaxonName
+    - Index: 84, Name: referenceCitation
+    - Index: 85, Name: referenceDoi
+    - Index: 2, Name: sourceTaxonName
+    - Index: 0, Name: sourceTaxonId
+    - Index: 1, Name: sourceTaxonIds
+
 For other scripts 
 
 * https://github.com/steineggerlab/foldseek

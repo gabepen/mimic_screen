@@ -1,12 +1,21 @@
+# logging, lookup tables, and databases
 **/*.json
+**/*.log
+**/*.db
+data/nltk_data/corpora/
+
+# python cache
+**/__pycache__
+
+# evorate_workflow outputs
 /evorate_workflow/*outputs/
 /evorate_workflow/logs/
 /evorate_workflow/.snakemake/
 /evorate_workflow/data/*.faa
 /evorate_workflow/data/*.zip
-__pycache__/
-evorate_workflow/scripts/__pycache__/
-taxon_selection/__pycache__/
-/evorate_workflow/nlp_model_data/
-/evorate_workflow/GloBI/
-*.json
+
+# esummary dtd output
+*.dtd
+
+# taxon selection outputs
+/src/taxon_selection/*.csv
