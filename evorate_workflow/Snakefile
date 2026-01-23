@@ -1,6 +1,6 @@
 import glob
 
-configfile: "config/wmel_config2.yaml"
+configfile: "config/lp_config.yaml"
 
 samples = []
 with open(config["accession_list"], 'r') as file:
@@ -20,11 +20,10 @@ checkpoint download_genomes:
         microbe_id=config["microbe_id"],
         taxon_id=config["taxon_id"],
         taxon_ids=",".join(map(str, config["taxon_ids"])),
-        free_living_taxon_ids=",".join(map(str, config["free_living_taxon_ids"])), 
+        free_living_taxon_ids=",".join(map(str, config.get("free_living_taxon_ids", []))), 
         work_dir=config["work_dir"],
         max_genomes=config["max_genomes"],
         log_file=config["log_path"],
-        nltk_data_dir=config["nltk_data_dir"], 
         globi_db_path=config["globi_db_path"]
     output:
         genomes=directory("{work_dir}/genomes"), 
@@ -39,7 +38,6 @@ checkpoint download_genomes:
             -m {params.max_genomes} \
             -l {params.log_file} \
             -f {params.free_living_taxon_ids} \
-            -n {params.nltk_data_dir} \
             -g {params.globi_db_path}
         """
     
@@ -124,7 +122,7 @@ rule format_seq_names:
         "{work_dir}/msa_files/{sample}/{sample}.renamed.fna"
     shell:
         '''
-        sed -e 's/:/_/g' -e 's/\./_/g' -e 's/\[/_/g' -e 's/\]/_/g' -e 's/\=/_/g' {input} > {output}
+        sed -e 's/:/_/g' -e 's/\\./_/g' -e 's/\\[/_/g' -e 's/\\]/_/g' -e 's/\\=/_/g' {input} > {output}
         '''
 
 rule macse_hmmcleaner:
@@ -134,7 +132,13 @@ rule macse_hmmcleaner:
         "{work_dir}/msa_files/{sample}/{sample}_final_align_NT.aln"
     shell:
         '''
-        bash scripts/MACSE_HMMCleaner.sh --in_seq_file {input} --out_dir "{work_dir}/msa_files/{wildcards.sample}" --out_file_prefix {wildcards.sample} --genetic_code_number 11
+        if grep -q "no_orthologs_found" {input}; then
+            echo "Skipping MACSE for {wildcards.sample} - no orthologs found" >&2
+            echo ">no_orthologs_found" > {output}
+            echo "X" >> {output}
+        else
+            bash scripts/MACSE_HMMCleaner.sh --in_seq_file {input} --out_dir "{work_dir}/msa_files/{wildcards.sample}" --out_file_prefix {wildcards.sample} --genetic_code_number 11
+        fi
         '''
 
 rule iqtree:
@@ -144,7 +148,13 @@ rule iqtree:
         "{work_dir}/tree_files/{sample}/{sample}.treefile"
     shell:
         '''
-        iqtree -s {input} --prefix "{work_dir}/tree_files/{wildcards.sample}/{wildcards.sample}" -nt AUTO --quiet
+        if grep -q "no_orthologs_found" {input}; then
+            echo "Skipping IQ-TREE for {wildcards.sample} - no orthologs found" >&2
+            mkdir -p "{work_dir}/tree_files/{wildcards.sample}"
+            echo "();" > {output}
+        else
+            iqtree -s {input} --prefix "{work_dir}/tree_files/{wildcards.sample}/{wildcards.sample}" -nt AUTO --quiet
+        fi
         '''     
 
 rule absrel:
@@ -155,5 +165,11 @@ rule absrel:
         "{work_dir}/results/{sample}_absrel.json"
     shell:
         '''
-        hyphy absrel --alignment {input.alignment} --tree {input.tree} --output {output} --srv Yes --syn-rates 3 --multiple-hits Double+Triple
+        if grep -q "no_orthologs_found" {input.alignment}; then
+            echo "Skipping aBSREL for {wildcards.sample} - no orthologs found" >&2
+            mkdir -p "{work_dir}/results"
+            echo '{{"error": "no_orthologs_found", "sample": "{wildcards.sample}"}}' > {output}
+        else
+            hyphy absrel --alignment {input.alignment} --tree {input.tree} --output {output} --srv Yes --syn-rates 3 --multiple-hits Double+Triple
+        fi
         '''

@@ -159,6 +159,7 @@ def dataset_download(dl_command, taxid, fl_id_list, taxon_genome_map,
     o_file = dl_command[dl_command.index('--filename') + 1]
     dl_command = ' '.join(dl_command)
     
+    logger.info(f"Attempting download for taxid {taxid}")
     # Run the download command and capture the output
     dl_output = subprocess.run(dl_command, shell=True, capture_output=True)
     
@@ -166,9 +167,12 @@ def dataset_download(dl_command, taxid, fl_id_list, taxon_genome_map,
     if dl_output.returncode == 0:
         
         # logging output 
-        dl_error_message = dl_output.stderr.decode().split('\n')
-        dl_error_message = dl_error_message[1].strip().split('[')[0]
-        logger.info(f"{dl_error_message} for taxid {taxid}")
+        try:
+            dl_error_message = dl_output.stderr.decode().split('\n')
+            dl_error_message = dl_error_message[1].strip().split('[')[0]
+            logger.info(f"Download successful: {dl_error_message} for taxid {taxid}")
+        except (IndexError, AttributeError):
+            logger.info(f"Download successful for taxid {taxid} (no stderr message)")
             
         # Check for biological interactions using GloBI database 
         
@@ -177,6 +181,9 @@ def dataset_download(dl_command, taxid, fl_id_list, taxon_genome_map,
         fl_exclusive_opt = False
         if taxid in fl_id_list:
             fl_exclusive_opt = True
+            logger.info(f"Taxid {taxid} is in free-living taxon list")
+        else:
+            logger.info(f"Taxid {taxid} is NOT in free-living taxon list")
             
         sci_name = get_scientific_name(taxid, 3)
         logger.info(f"Taxid {taxid} scientific name is {sci_name}")
@@ -184,10 +191,17 @@ def dataset_download(dl_command, taxid, fl_id_list, taxon_genome_map,
             logger.info(f"Taxid {taxid} is a symbiont based on scientific name")
             
             # add to the foreground genomes if possible
+            # If taxid is in free-living list and classified as symbiont, delete it (contradiction)
             if not add_taxa_to_selected_group(taxid, fg_genomes_selected, 'foreground') or fl_exclusive_opt:
+                if fl_exclusive_opt:
+                    logger.info(f"Taxid {taxid} rejected: in free-living list but classified as symbiont - DELETING")
+                else:
+                    logger.info(f"Taxid {taxid} rejected: max foreground genomes reached ({len(fg_genomes_selected)}/{int(max_genome_count/2)})")
                 # if the max fg genomes have been reached delete the archive and return
                 os.remove(o_file)
                 return
+            else:
+                logger.info(f"Taxid {taxid} successfully added to foreground genomes (total: {len(fg_genomes_selected)})")
         
         else:
             # If the scientific name does not indicate symbiosis, check GloBI database for interactions
@@ -200,43 +214,62 @@ def dataset_download(dl_command, taxid, fl_id_list, taxon_genome_map,
                 logger.info(f"Taxid {taxid} is a symbiont/pathogen based on GloBI results")
                 
                 # add to the foreground genomes if possible
+                # If taxid is in free-living list and classified as symbiont, delete it (contradiction)
                 if not add_taxa_to_selected_group(taxid, fg_genomes_selected, 'foreground') or fl_exclusive_opt:
+                    if fl_exclusive_opt:
+                        logger.info(f"Taxid {taxid} rejected: in free-living list but classified as symbiont - DELETING")
+                    else:
+                        logger.info(f"Taxid {taxid} rejected: max foreground genomes reached ({len(fg_genomes_selected)}/{int(max_genome_count/2)})")
                     
                     # if the max fg genomes have been reached delete the archive and return
                     os.remove(o_file)
                     return
+                else:
+                    logger.info(f"Taxid {taxid} successfully added to foreground genomes (total: {len(fg_genomes_selected)})")
     
             else:
                 # Taxa has passed the GloBI check, check the isolation source through NCBI biosample metadata
+                logger.info(f"Taxid {taxid} passed GloBI check (not a symbiont) - checking biosample isolation sources")
                 # First collect biosample_uids for the taxid
                 biosample_uids = free_living_check.ncbi_taxid_to_biosample_uids(taxid)
                 logger.info(f"Taxid {taxid} Biosample UIDs: {biosample_uids}")
                 if free_living_check.check_biosample_isolation_source(biosample_uids):
-                    logger.info(f"Taxid {taxid} is freeliving based on biosample isolation sources")
+                    logger.info(f"Taxid {taxid} is freeliving based on biosample isolation sources - adding to background")
                     
                     if not add_taxa_to_selected_group(taxid, bg_genomes_selected, 'background'):
                         # if the max bg genomes have been reached delete the archive and return
+                        logger.info(f"Taxid {taxid} rejected: max background genomes reached ({len(bg_genomes_selected)}/{int(max_genome_count/2)})")
                         os.remove(o_file)
                         return
+                    else:
+                        logger.info(f"Taxid {taxid} successfully added to background genomes (total: {len(bg_genomes_selected)})")
                 else:  
                     # Taxid cannot be confidently classified as symbiont or free-living 
-                    logger.info(f"Taxid {taxid} cannot be confidently classified")
+                    logger.info(f"Taxid {taxid} cannot be confidently classified as symbiont or free-living - DELETING")
                     os.remove(o_file)
                     return
             
         # taxid was succesfully added to a selected list, add to the taxon_genome_map
+        logger.info(f"Taxid {taxid} successfully classified and added - mapping genome accession")
         taxon_genome_map[taxid] = map_id_to_genome(taxid, o_file) 
         
         # monitor success queue to check if max_genome_count has been reached
         if success_queue.qsize() >= max_genome_count:
             max_genome_event.set()
-            logger.info('Max genome number reached')
+            logger.info(f'Max genome number reached: {success_queue.qsize()} genomes selected')
         
         
     else:
-        dl_error_message = dl_output.stderr.decode().split('\n')
-        dl_error_message = dl_error_message[1].strip().replace('Error:', '')
-        #logger.warning(f"Failed to download genome for taxid {taxid}, {dl_error_message}")
+        # Download failed
+        try:
+            dl_error_message = dl_output.stderr.decode().split('\n')
+            if len(dl_error_message) > 1:
+                error_msg = dl_error_message[1].strip().replace('Error:', '')
+            else:
+                error_msg = dl_output.stderr.decode().strip()
+            logger.warning(f"Download FAILED for taxid {taxid}: {error_msg}")
+        except Exception as e:
+            logger.warning(f"Download FAILED for taxid {taxid}: returncode={dl_output.returncode}, error parsing: {e}")
         
 def monitor_downloads(max_genome_event, terminate_event, pool): 
     '''Monitor the download processes and increment the success count'''
@@ -275,7 +308,9 @@ def download_genomes(id_list: list,fl_id_list: list, max_genome_count: int, work
     # generate all potential download commands and store in list 
     download_commands = []
     taxids_used = []
-    id_list = id_list + fl_id_list
+    combined_list = id_list + fl_id_list
+    logger.info(f"Preparing downloads for {len(combined_list)} total taxids ({len(id_list)} from main list, {len(fl_id_list)} from free-living list)")
+    id_list = combined_list
     for taxid in id_list:
         
         # Set output file path
@@ -398,7 +433,9 @@ def main():
     id_list.insert(0, args.query_id)
     fl_id_list = taxonkit_get_subtrees(fl_taxids)
     fl_id_list = [taxid for taxid in fl_id_list if taxid not in id_list]
+    logger.info(f"Starting genome download: {len(id_list)} taxids from main list, {len(fl_id_list)} taxids from free-living list, max_genomes={args.max_genome_count}")
     fg_genomes_selected, bg_genomes_selected, genome_accession_map = download_genomes(id_list, fl_id_list, args.max_genome_count, args.workdir, dl_log_file)
+    logger.info(f"Genome download complete: {len(fg_genomes_selected)} foreground, {len(bg_genomes_selected)} background genomes selected")
     
     # Save genome_accession_map to a json file 
     with open(f"{args.workdir}/genomes/genome_accession_map.json", 'w') as f:
