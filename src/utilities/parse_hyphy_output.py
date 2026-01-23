@@ -28,7 +28,7 @@ def parse_absrel_results(directory, symbiont_ids, id_map_file):
     
     if symbiont_ids:
         with open(symbiont_ids) as file:
-            symbiont_ids = [l.strip() for l in file.readlines()]
+            symbiont_ids = set([l.strip() for l in file.readlines()])
     
     # debug stat tracking
     tree_lengths = []
@@ -45,6 +45,56 @@ def parse_absrel_results(directory, symbiont_ids, id_map_file):
                 except json.JSONDecodeError:
                     continue
                 
+                # In the parse_absrel_results function, after loading the JSON (around line 46),
+# add this check before processing branch attributes:
+
+            with open(filepath) as file:
+                try:
+                    json_data = json.load(file)
+                # catching empty json files from halted or failed snakemake runs
+                except json.JSONDecodeError:
+                    continue
+                
+                # Check if this is a "no_orthologs_found" error file
+                if 'error' in json_data and json_data['error'] == 'no_orthologs_found':
+                    # Extract sample name from filename or JSON
+                    refseq_accession = os.path.splitext(filename)[0].replace('_absrel', '')
+                    if 'sample' in json_data:
+                        refseq_accession = json_data['sample']
+                    
+                    # Convert to prot_id if id_map is provided
+                    if id_map_file:
+                        try:
+                            prot_id = id_map[refseq_accession]
+                        except KeyError:
+                            prot_id = refseq_accession
+                    else:
+                        prot_id = refseq_accession
+                    
+                    # Add entry with all None values
+                    data.append({
+                        'query': prot_id,
+                        'accession': refseq_accession,
+                        'ns_per_site_avg': None,
+                        'syn_per_site_avg': None,
+                        'dnds_tree_avg': None,
+                        'symbiont_branch_dnds_avg': None,
+                        'symbiont_tree_dnds_avg': None,
+                        'non_symbiont_branch_dnds_avg': None,
+                        'non_symbiont_tree_dnds_avg': None,
+                        'selection_branch_count': None,
+                        'total_branch_length': None,
+                        'avg_branch_length': None,
+                        'selected_ns_per_site_avg': None,
+                        'selected_syn_per_site_avg': None,
+                        'branch_fraction': None,
+                        'branch_fraction_full_norm': None,
+                        'test_fraction': None
+                    })
+                    continue
+                
+                # metrics to collect from the json file
+                corrected_pvalues = []
                 # metrics to collect from the json file
                 corrected_pvalues = []
                 full_model_nonsyn_branch_lens = [] # Full adaptive model, the branch lengths under this model for nonsynonymous sites
@@ -79,10 +129,11 @@ def parse_absrel_results(directory, symbiont_ids, id_map_file):
                         # skip internal nodes
                         if branch_taxid.startswith('Node'):
                             continue
-                        if branch_taxid == 'CANDIDATE':
+                        # Handle MIMIC_CANDIDATE suffix - taxon ID is 2 positions before the end
+                        if branch_taxid == 'CANDIDATE' or branch_taxid.endswith('CANDIDATE'):
                             branch_taxid = branch.split('_')[-3]
                     
-                        if branch_taxid in symbiont_ids:
+                        if symbiont_ids and branch_taxid in symbiont_ids:
                             foreground_branches += 1
                             total_branches += 1
                             symbiont_branch_dnds.append(full_model_nonsyn_branch_lens[-1] / full_model_syn_branch_lens[-1])

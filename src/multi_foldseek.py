@@ -33,7 +33,26 @@ def main():
 
     # foldseek calling
     databases = glob(database_dir + '*') 
-    for db_path in tqdm(databases):
+    has_subdirs = any(os.path.isdir(db_path) for db_path in databases)
+    
+    if not has_subdirs:
+        # Database directory contains individual structure files, treat as single database
+        db_name = database_dir.rstrip('/').split('/')[-1]
+        output_path = output_prefix + db_name + '_rbh.tsv'
+        
+        # check to see if output exists
+        if not os.path.exists(output_path):
+            if args.threads:
+                subprocess.run(['foldseek', 'easy-rbh', args.query,
+                                database_dir, output_path, 'multirbhtmp', '--threads', args.threads, 
+                                '--format-output', 'query,target,evalue,alntmscore,alnlen,qlen,tcov,qcov,tlen,u,t,lddt,fident,pident,prob,qstart,qend,tstart,tend'], stdout=subprocess.DEVNULL)
+            else:
+                subprocess.run(['foldseek', 'easy-rbh', args.query,
+                                database_dir, output_path, 'multirbhtmp',
+                                '--format-output', 'query,target,evalue,alntmscore,alnlen,qlen,tcov,qcov,tlen,u,t,lddt,fident,pident,prob,qstart,qend,tstart,tend'], stdout=subprocess.DEVNULL)
+    else:
+        # Original behavior: iterate over subdirectories, each containing a .tar file
+        for db_path in tqdm(databases):
         
         # check if proteome exists in the database directory
         proteome = []

@@ -276,7 +276,7 @@ def plot_paralog_rank_comparison(ranking_averages, output_path):
     plt.savefig(output_path)
     plt.close()
     
-def paralog_filter(target_group, host_self_alignment_table, query_tm_scores, query_seqid_scores):
+def paralog_filter(target_group, host_self_alignment_table, query_tcov_scores, query_algn_fraction_scores):
     
     def cohen_d(data1, data2):
         """
@@ -327,7 +327,7 @@ def paralog_filter(target_group, host_self_alignment_table, query_tm_scores, que
     try:
         avg_seqid_score = sum(sequence_identity_scores) / len(sequence_identity_scores)
         avg_alignment_score = sum(alignment_scores) / len(alignment_scores)
-        avg_query_score = sum(query_seqid_scores) / len(query_seqid_scores)
+        avg_query_score = sum(query_algn_fraction_scores) / len(query_algn_fraction_scores)
     # the similarity between the host proteins are too low to have been aligned
     except ZeroDivisionError:
         return False, None, None
@@ -345,7 +345,7 @@ def paralog_filter(target_group, host_self_alignment_table, query_tm_scores, que
     #U_statistic, p_value = mannwhitneyu(alignment_scores, query_tm_scores)
     #cohen_d = cohen_d(alignment_scores, query_tm_scores)
 
-    U_statistic, p_value = mannwhitneyu(sequence_identity_scores, query_seqid_scores)
+    U_statistic, p_value = mannwhitneyu(sequence_identity_scores, query_algn_fraction_scores)
     #cohen_d = cohen_d(sequence_identity_scores, query_seqid_scores)
     
     #cohen_d = abs(cohen_d)
@@ -452,14 +452,14 @@ def make_output_df(data_table, host_self_alignment_table, top_hits_only, alignme
         # this could indicate a group of host protein paralogs
         if len(targets) > 1 and host_self_alignment_table != None:
             
-            #  get tm-score across all alignments for query id
-            query_tm_scores = [query_table[query_id][target][1] for target in targets]
-            query_seqid_scores = [query_table[query_id][target][4] for target in targets]
+            #  get tcov and algn_fraction across all alignments for query id
+            query_tcov_scores = [query_table[query_id][target][1] for target in targets]
+            query_algn_fraction_scores = [query_table[query_id][target][4] for target in targets]
             
             # determine if the divergence in structure between the host proteins 
             # is the same as the divergence between the query and host proteins
             # (i.e. very likely houskeeping genes)
-            result, seq_id_average, tm_score_avg = paralog_filter(targets, host_self_alignment_table, query_tm_scores, query_seqid_scores)
+            result, seq_id_average, tm_score_avg = paralog_filter(targets, host_self_alignment_table, query_tcov_scores, query_algn_fraction_scores)
 
             if result:
                 paralog_results[query_id] = 'yes'
@@ -984,6 +984,7 @@ def main():
     parser.add_argument('-t','--top_hits', action='store_true', help='only output top hits for each query id')
     parser.add_argument('-ap','--alignment_span_filter', action='store_true', help='filter out alignments where the target has aligned to multiple queries on the save span of target structure')
     parser.add_argument('-pca','--pca_test_dir', type=str, help='path to directory for running and storing PCA tests')
+    parser.add_argument('--all_alignments', action='store_true', help='Output all alignments without deduplication')
     args = parser.parse_args()   
 
     # either generate the control dictionary or load it from previous run 
@@ -1017,8 +1018,25 @@ def main():
     else:
         host_self_alignment_table = None
         
-    alignment_df = make_output_df(alignment_table, host_self_alignment_table, args.top_hits, args.alignment_span_filter)
-    #alignment_df = make_output_df_no_filters(alignment_table)
+    if args.all_alignments:
+        alignment_df = make_output_df_no_filters(alignment_table)
+        # Add paralog filter column if paralog filter is provided
+        if host_self_alignment_table is not None:
+            paralog_results = {}
+            for query_id in alignment_df['query'].unique():
+                targets = alignment_df[alignment_df['query'] == query_id]['target'].unique().tolist()
+                if len(targets) > 1:
+                    query_tcov_scores = alignment_df[alignment_df['query'] == query_id]['tcov'].tolist()
+                    query_algn_fraction_scores = alignment_df[alignment_df['query'] == query_id]['algn_fraction'].tolist()
+                    result, _, _ = paralog_filter(targets, host_self_alignment_table, query_tcov_scores, query_algn_fraction_scores)
+                    paralog_results[query_id] = 'yes' if result else 'no'
+                else:
+                    paralog_results[query_id] = None
+            alignment_df['targets_likely_paralogs'] = alignment_df['query'].map(paralog_results)
+        else:
+            alignment_df['targets_likely_paralogs'] = None
+    else:
+        alignment_df = make_output_df(alignment_table, host_self_alignment_table, args.top_hits, args.alignment_span_filter)
     output_df = alignment_df.copy()
         
     if args.evorate_analysis:
@@ -1031,8 +1049,9 @@ def main():
             
         # aBSREL dnds comparison candidates
         evorate_alignment_df = pd.merge(alignment_df, absrel_df, on='query', how='left')
-        plot_test_fraction(evorate_alignment_df,'/storage1/gabe/mimic_screen/main_paper/final_figs/evorate_figs/wmel_testfraction-FFPA.png', 10)
-        plot_aBSREL_comparisons_candidates(evorate_alignment_df, args.plot_evorate, 10, 'Symbiont vs Non-Symbiont Branch dN/dS Averages wMelCandidates')  
+        if args.plot_evorate:
+            plot_test_fraction(evorate_alignment_df,'/storage1/gabe/mimic_screen/main_paper/final_figs/evorate_figs/wmel_testfraction-FFPA.png', 10)
+            plot_aBSREL_comparisons_candidates(evorate_alignment_df, args.plot_evorate, 10, 'Symbiont vs Non-Symbiont Branch dN/dS Averages wMelCandidates')  
         columns_to_drop = ['ns_per_site_avg', 'syn_per_site_avg', 'dnds_tree_avg', 'symbiont_tree_dnds_avg', 'non_symbiont_tree_dnds_avg', 'selection_branch_count', 'total_branch_length', 'avg_branch_length', 'selected_ns_per_site_avg', 'selected_syn_per_site_avg','branch_fraction','branch_fraction_full_norm']
         output_evorate_alignment_df = evorate_alignment_df.drop(columns=columns_to_drop)
         output_df = output_evorate_alignment_df.copy()
@@ -1066,7 +1085,7 @@ def main():
         
     # plot histogram of freeliving fraction values for alignment
     if args.fid_plot:
-        plot_freeliving_fraction_distribution(data_table, args.fid_plot)
+        plot_freeliving_fraction_distribution(alignment_table, args.fid_plot)
     
     # parse list of validation or general IDs of interest to pull from the results of an alignment
     if args.validation_ids:
