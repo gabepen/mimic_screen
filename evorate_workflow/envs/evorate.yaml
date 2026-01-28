@@ -11,29 +11,28 @@ dependencies:
   - amply=0.1.6=pyhd8ed1ab_0
   - appdirs=1.4.4=pyh9f0ad1d_0
   - argparse-dataclass=2.0.0=pyhd8ed1ab_0
-  - aria2=1.37.0=hbc8128a_2
+  - aria2=1.37.0=h347180d_1
   - attmap=0.13.2=pyhd8ed1ab_0
   - binutils_impl_linux-64=2.40=ha885e6a_0
   - biopython=1.83=py312h98912ed_0
   - brotli-python=1.1.0=py312h30efb56_1
   - bzip2=1.0.8=hd590300_5
   - c-ares=1.28.1=hd590300_0
-  - ca-certificates=2024.8.30=hbcca054_0
-  - cairo=1.18.0=hebfffa5_3
-  - certifi=2024.8.30=pyhd8ed1ab_0
+  - ca-certificates=2026.1.4=hbd8a1cb_0
+  - cairo=1.18.0=h3faef2a_0
+  - certifi=2026.1.4=pyhd8ed1ab_0
   - cffi=1.17.0=py312h1671c18_0
   - charset-normalizer=3.3.2=pyhd8ed1ab_0
   - coin-or-cbc=2.10.10=h9002f0b_0
-  - coin-or-cgl=0.60.9=h1d3f3f2_0
-  - coin-or-clp=1.17.10=h07f2a63_0
-  - coin-or-osi=0.108.11=h6514dde_1
-  - coin-or-utils=2.11.12=h99da652_1
+  - coin-or-cgl=0.60.7=h516709c_0
+  - coin-or-clp=1.17.8=h1ee7a9c_0
+  - coin-or-osi=0.108.10=haf5fa05_0
+  - coin-or-utils=2.11.11=hee58242_0
   - coincbc=2.10.10=0_metapackage
   - colorama=0.4.6=pyhd8ed1ab_0
   - conda-inject=1.3.1=pyhd8ed1ab_0
   - configargparse=1.7=pyhd8ed1ab_0
   - connection_pool=0.0.3=pyhd3deb0d_0
-  - curl=7.88.1=hdc1c0ab_1
   - datrie=0.8.2=py312h98912ed_7
   - docutils=0.21.2=pyhd8ed1ab_0
   - dpath=2.1.6=pyha770c72_0
@@ -60,19 +59,19 @@ dependencies:
   - gmp=6.3.0=h59595ed_1
   - graphite2=1.3.13=h59595ed_1003
   - h2=4.1.0=pyhd8ed1ab_0
-  - harfbuzz=9.0.0=hda332d3_1
+  - harfbuzz=8.5.0=hfac3d4d_0
   - hmmcleaner=0.180750=pl5321h9bf148f_0
   - hmmer=3.4=hdbdd923_2
   - hpack=4.0.0=pyh9f0ad1d_0
   - humanfriendly=10.0=pyhd8ed1ab_6
   - hyperframe=6.0.1=pyhd8ed1ab_0
-  - hyphy=2.5.2=h7d38c80_0
-  - icu=75.1=he02047a_0
+  - hyphy=2.5.61=h0705fce_0
+  - icu=73.2=h59595ed_0
   - idna=3.7=pyhd8ed1ab_0
   - immutables=0.20=py312h98912ed_1
   - importlib_resources=6.4.0=pyhd8ed1ab_0
   - iniconfig=2.0.0=pyhd8ed1ab_0
-  - iqtree=2.3.6=hdbdd923_0
+  - iqtree=2.3.3=h21ec9f0_0
   - jsonschema=4.22.0=pyhd8ed1ab_0
   - jsonschema-specifications=2023.12.1=pyhd8ed1ab_0
   - jupyter_core=5.7.2=py312h7900ff3_0
@@ -80,7 +79,7 @@ dependencies:
   - kcalign=1.0.2=py_0
   - kernel-headers_linux-64=3.10.0=h4a8ded7_16
   - keyutils=1.6.1=h166bdaf_0
-  - krb5=1.20.1=h81ceb04_0
+  - krb5=1.21.2=h659d440_0
   - lcms2=2.16=hb7c19ff_0
   - ld_impl_linux-64=2.40=h55db66e_0
   - lerc=4.0.0=h27087fc_0
@@ -88,12 +87,11 @@ dependencies:
   - libasprintf-devel=0.22.5=h661eb56_2
   - libblas=3.9.0=22_linux64_openblas
   - libcblas=3.9.0=22_linux64_openblas
-  - libcups=2.3.3=h36d4200_3
-  - libcurl=7.88.1=hdc1c0ab_1
-  - libdeflate=1.21=h4bc722e_0
+  - libcups=2.3.3=h4637d8d_4
+  - libcurl=8.7.1=hca28451_0
+  - libdeflate=1.20=hd590300_0
   - libedit=3.1.20191231=he28a2e2_2
   - libev=4.33=hd590300_2
-  - libevent=2.1.12=hf998b51_1
   - libexpat=2.6.2=h59595ed_0
   - libffi=3.4.2=h7f98852_5
   - libgcc=14.1.0=h77fa898_1
@@ -101,55 +99,52 @@ dependencies:
   - libgcc-ng=14.1.0=h69a702a_1
   - libgettextpo=0.22.5=h59595ed_2
   - libgettextpo-devel=0.22.5=h59595ed_2
-  - libgfortran=14.1.0=h69a702a_1
-  - libgfortran-ng=14.1.0=h69a702a_1
-  - libgfortran5=14.1.0=hc5f4f2c_1
-  - libglib=2.80.3=h315aac3_2
+  - libgfortran-ng=13.2.0=h69a702a_7
+  - libgfortran5=13.2.0=hca663fb_7
+  - libglib=2.80.2=hf974151_0
   - libgomp=14.1.0=h77fa898_1
-  - libhwloc=2.11.1=default_hecaa2ac_1000
   - libiconv=1.17=hd590300_2
   - libidn2=2.3.7=hd590300_0
   - libjpeg-turbo=3.0.0=hd590300_1
   - liblapack=3.9.0=22_linux64_openblas
   - liblapacke=3.9.0=22_linux64_openblas
   - libnghttp2=1.58.0=h47da74e_1
-  - libnl=3.10.0=h4bc722e_0
   - libnsl=2.0.1=hd590300_0
   - libopenblas=0.3.27=pthreads_h413a1c8_0
-  - libpng=1.6.44=hadc24fc_0
+  - libpng=1.6.43=h2797004_0
   - libsanitizer=14.1.0=hcba0ae0_1
-  - libsqlite=3.46.1=hadc24fc_0
+  - libsqlite=3.45.3=h2797004_0
   - libssh2=1.11.0=h0841786_0
   - libstdcxx=14.1.0=hc0a3c3a_1
   - libstdcxx-ng=13.2.0=hc0a3c3a_7
-  - libtiff=4.6.0=h46a8edc_4
+  - libtiff=4.6.0=h1dd3fc0_3
   - libunistring=0.9.10=h7f98852_0
   - libuuid=2.38.1=h0b41bf4_0
   - libwebp-base=1.4.0=hd590300_0
-  - libxcb=1.16=hb9d3cd8_1
+  - libxcb=1.15=h0b41bf4_0
   - libxcrypt=4.4.36=hd590300_1
-  - libxml2=2.12.7=he7c6b58_4
-  - libzlib=1.3.1=h4ab18f5_1
+  - libxml2=2.12.6=h232c23b_2
+  - libzlib=1.2.13=hd590300_5
   - logmuse=0.2.6=pyh8c360ce_0
   - macse=2.07=hdfd78af_0
   - mafft=7.525=h031d066_1
   - make=4.4.1=hb9d3cd8_1
   - markdown-it-py=3.0.0=pyhd8ed1ab_0
   - mdurl=0.1.2=pyhd8ed1ab_0
-  - mmseqs2=15.6f452=pl5321h6a68c12_3
+  - mmseqs2=15.6f452=pl5321h6a68c12_2
   - mpfr=4.2.1=h9458935_1
   - mpi=1.0=openmpi
   - nbformat=5.10.4=pyhd8ed1ab_0
-  - ncbi-datasets-cli=16.23.0=ha770c72_0
-  - ncurses=6.5=he02047a_1
+  - ncbi-datasets-cli=18.15.0=ha770c72_0
+  - ncurses=6.4.20240210=h59595ed_0
   - numpy=1.26.4=py312heda63a1_0
-  - openjdk=11.0.1=h516909a_1016
-  - openmpi=5.0.5=h9a79eee_100
-  - openssl=3.3.2=hb9d3cd8_0
+  - openjdk=22.0.1=hb622114_0
+  - openmpi=4.1.6=hc5af2df_101
+  - openssl=3.6.0=h26f9b46_0
   - packaging=24.0=pyhd8ed1ab_0
   - paml=4.10.7=h031d066_1
   - pandas=2.2.2=py312hfb8ada1_0
-  - pcre2=10.44=hba22ea6_2
+  - pcre2=10.43=hcad00b1_0
   - peppy=0.40.1=pyhd8ed1ab_0
   - perl=5.32.1=7_hd590300_perl5
   - perl-app-cpanminus=1.7047=pl5321hd8ed1ab_0
@@ -207,7 +202,7 @@ dependencies:
   - pyparsing=3.1.2=pyhd8ed1ab_0
   - pysocks=1.7.1=pyha2e5f31_6
   - pytest=8.2.0=pyhd8ed1ab_0
-  - python=3.12.5=h2ad013b_0_cpython
+  - python=3.12.3=hab00c5b_0_cpython
   - python-fastjsonschema=2.19.1=pyhd8ed1ab_0
   - python-tzdata=2024.1=pyhd8ed1ab_0
   - python_abi=3.12=4_cp312
@@ -230,7 +225,7 @@ dependencies:
   - snakemake-interface-report-plugins=1.0.0=pyhdfd78af_0
   - snakemake-interface-storage-plugins=3.2.2=pyhdfd78af_0
   - snakemake-minimal=8.11.3=pyhdfd78af_0
-  - sqlite=3.46.1=h9eae976_0
+  - sqlite=3.45.3=h2c6b66d_0
   - stopit=1.1.2=py_0
   - sysroot_linux-64=2.17=h4a8ded7_16
   - tabulate=0.9.0=pyhd8ed1ab_1
@@ -253,7 +248,7 @@ dependencies:
   - xorg-kbproto=1.0.7=h7f98852_1002
   - xorg-libice=1.1.1=hd590300_0
   - xorg-libsm=1.2.4=h7391055_0
-  - xorg-libx11=1.8.9=hb711507_1
+  - xorg-libx11=1.8.9=h8ee46fc_0
   - xorg-libxau=1.0.11=hd590300_0
   - xorg-libxdmcp=1.1.3=h7f98852_0
   - xorg-libxext=1.3.4=h0b41bf4_2
@@ -270,40 +265,72 @@ dependencies:
   - yaml=0.2.5=h7f98852_2
   - yte=1.5.4=pyha770c72_0
   - zipp=3.17.0=pyhd8ed1ab_0
-  - zlib=1.3.1=h4ab18f5_1
+  - zlib=1.2.13=hd590300_5
   - zstandard=0.23.0=py312h3483029_0
   - zstd=1.5.6=ha6fb4c9_0
   - pip:
+      - annotated-types==0.7.0
       - anyio==4.4.0
       - argcomplete==3.0.8
       - argh==0.28.1
       - async-property==0.2.2
       - attrs==23.1.0
       - bacdive==1.0.0
+      - blis==0.7.11
+      - catalogue==2.0.10
+      - click==8.1.7
+      - cloudpathlib==0.19.0
       - colorlog==6.8.2
+      - confection==0.1.5
       - cryptography==43.0.1
+      - cymem==2.0.8
       - deprecation==2.1.0
+      - en-core-web-md==3.7.1
+      - en-core-web-sm==3.7.1
+      - gensim==4.3.3
       - gffutils==0.11.1
       - h11==0.14.0
       - httpcore==1.0.5
       - httpx==0.27.2
       - jinja2==3.1.2
+      - joblib==1.4.2
       - jsonlines==3.1.0
       - jwcrypto==1.5.6
+      - langcodes==3.4.0
+      - language-data==1.2.0
       - loguru==0.7.2
       - macsyfinder==2.1.4
+      - marisa-trie==1.2.0
       - markupsafe==2.1.2
+      - murmurhash==1.0.10
       - ncbi-datasets-pylib==16.6.1
       - networkx==3.3
+      - nltk==3.9.1
+      - preshed==3.0.9
       - protobuf==4.23.0
+      - pydantic==2.9.2
+      - pydantic-core==2.23.4
       - pyfaidx==0.7.2.1
       - python-dateutil==2.8.2
       - python-keycloak==4.4.0
+      - regex==2024.9.11
       - requests-toolbelt==1.0.0
+      - scipy==1.13.1
       - setuptools==67.7.2
+      - shellingham==1.5.4
       - simplejson==3.19.1
       - snakemake-executor-plugin-slurm==0.5.1
       - snakemake-executor-plugin-slurm-jobstep==0.2.1
       - sniffio==1.3.1
+      - spacy==3.7.6
+      - spacy-legacy==3.0.12
+      - spacy-loggers==1.0.5
+      - srsly==2.4.8
+      - textblob==0.18.0.post0
+      - thinc==8.2.5
+      - typer==0.12.5
       - urllib3==1.26.15
+      - wasabi==1.1.3
+      - weasel==0.4.1
       - xml2dict==0.2.2
+      - xmltodict==0.13.0
