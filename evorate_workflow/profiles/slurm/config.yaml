@@ -18,7 +18,7 @@ set-resources:
   download_genomes:
     slurm_partition: "long"
     slurm_account: # Same as sbatch -A. Not all clusters use this.
-    runtime: 1440 # In minutes
+    runtime: 5760 # In minutes
   mmseq_rbh:
     slurm_partition: "short"
     slurm_account: # Same as sbatch -A. Not all clusters use this.
