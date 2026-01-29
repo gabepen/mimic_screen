@@ -67,6 +67,11 @@ def get_scientific_name(taxid: str, retries: int) -> str:
     while retries > 0:
         result = subprocess.run(f"datasets summary taxonomy taxon {taxid}", shell=True, capture_output=True, text=True)
         reports = result.stdout
+        
+        # Check for TLS handshake timeout error specifically
+        if result.stderr and "TLS handshake timeout" in result.stderr:
+            logger.error(f"TLS handshake timeout detected for taxid {taxid} (attempt {retries} remaining): {result.stderr.strip()}")
+        
         try:
             # process stdout into dictionary 
             reports = reports.replace('true', 'True')
