@@ -348,7 +348,8 @@ def download_genomes(id_list: list,fl_id_list: list, max_genome_count: int, work
         terminate_event = manager.Event()  
         
         # create processes
-        with mp.Pool(processes=100) as pool:
+        # Reduced parallelism to avoid overwhelming ncbi datasets and causing segfaults
+        with mp.Pool(processes=30) as pool:
             
             # Start the monitor_downloads function in a separate thread
             monitor_process = mp.Process(target=monitor_downloads, args=(max_genome_event, terminate_event, pool))
