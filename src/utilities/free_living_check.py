@@ -136,6 +136,10 @@ def check_sciname_for_symbiosis(sci_name: str) -> bool:
               False otherwise.
     """
     
+    # Handle None or empty scientific names
+    if not sci_name:
+        return False
+    
     # conditions are clear indications of a symbiotic taxa
     return 'symbiont' in sci_name.lower()
 
