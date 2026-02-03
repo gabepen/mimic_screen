@@ -310,6 +310,37 @@ def download_genomes(id_list: list,fl_id_list: list, max_genome_count: int, work
     potential_dl_count = min(max_genome_count, len(id_list))
     max_genome_count = min(max_genome_count, len(id_list))
  
+    # Check for existing genomes and load them into the selected lists
+    existing_genomes_dir = f"{workdir}/genomes"
+    existing_fg_genomes = []
+    existing_bg_genomes = []
+    if os.path.exists(existing_genomes_dir):
+        existing_zip_files = [f for f in os.listdir(existing_genomes_dir) if f.endswith('.zip')]
+        logger.info(f"Found {len(existing_zip_files)} existing genome files, checking which are selected...")
+        
+        # Check if genomes_selected.txt exists to determine which genomes were previously selected
+        genomes_selected_file = f"{log_file}/genomes_selected.txt"
+        if os.path.exists(genomes_selected_file):
+            with open(genomes_selected_file, 'r') as f:
+                selected_taxids = set(line.strip() for line in f if line.strip())
+            
+            for zip_file in existing_zip_files:
+                taxid = zip_file.split('_')[0]
+                if taxid in selected_taxids:
+                    # Check if it's in foreground or background by checking foreground_genomes.txt
+                    fg_file = f"{log_file}/foreground_genomes.txt"
+                    if os.path.exists(fg_file):
+                        with open(fg_file, 'r') as f:
+                            fg_taxids = set(line.strip() for line in f if line.strip())
+                        if taxid in fg_taxids:
+                            existing_fg_genomes.append(taxid)
+                        else:
+                            existing_bg_genomes.append(taxid)
+                    else:
+                        # Default to foreground if we can't determine
+                        existing_fg_genomes.append(taxid)
+            logger.info(f"Found {len(existing_fg_genomes)} existing foreground and {len(existing_bg_genomes)} existing background genomes")
+    
     # generate all potential download commands and store in list 
     download_commands = []
     taxids_used = []
@@ -320,6 +351,11 @@ def download_genomes(id_list: list,fl_id_list: list, max_genome_count: int, work
         
         # Set output file path
         o_file = f"{workdir}/genomes/{taxid}_dataset.zip"
+        
+        # Skip if genome already exists
+        if os.path.exists(o_file):
+            logger.info(f"Skipping taxid {taxid} - genome file already exists")
+            continue
         
         # run dataset download command 
         download_command = [
@@ -345,7 +381,35 @@ def download_genomes(id_list: list,fl_id_list: list, max_genome_count: int, work
          # for tracking downloads 
         max_genome_event = manager.Event()
         log_queue = manager.Queue()
-        terminate_event = manager.Event()  
+        terminate_event = manager.Event()
+        
+        # Add existing genomes to selected lists and count them
+        for taxid in existing_fg_genomes:
+            fg_genomes_selected.append(taxid)
+            success_queue.put(1)
+            logger.info(f"Restored existing foreground genome: {taxid}")
+        for taxid in existing_bg_genomes:
+            bg_genomes_selected.append(taxid)
+            success_queue.put(1)
+            logger.info(f"Restored existing background genome: {taxid}")
+        
+        # Load existing genome accession map if it exists
+        genome_accession_map_file = f"{workdir}/genomes/genome_accession_map.json"
+        if os.path.exists(genome_accession_map_file):
+            with open(genome_accession_map_file, 'r') as f:
+                existing_map = json.load(f)
+                taxid_genome_map.update(existing_map)
+                logger.info(f"Restored {len(existing_map)} existing genome accession mappings")
+        
+        # Check if we've already reached max_genome_count with existing genomes
+        if success_queue.qsize() >= max_genome_count:
+            logger.info(f"Max genome count already reached with existing genomes ({success_queue.qsize()}/{max_genome_count})")
+            max_genome_event.set()
+        
+        # If no downloads to attempt, return early
+        if len(download_commands) == 0:
+            logger.info("No new downloads to attempt - all genomes already exist")
+            return list(fg_genomes_selected), list(bg_genomes_selected), dict(taxid_genome_map)
         
         # create processes
         # Reduced parallelism to avoid overwhelming ncbi datasets and causing segfaults
