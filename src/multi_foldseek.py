@@ -7,14 +7,17 @@ from tqdm import tqdm
 
 def main():
 
-    ''' Takes a query protein structure file and runs foldseek easy-rbh
-        on a specified set of proteomes. Can be used for multiple samples with multi_rbh.sh
+    ''' Takes a query protein structure file and runs foldseek search
+        on a specified set of proteomes. Supports multiple search modes.
     '''
     parser = argparse.ArgumentParser()
     parser.add_argument('-q','--query', type=str, help='path to query proteome')
     parser.add_argument('-o','--output', type=str, help='path to parent output folder')
     parser.add_argument('-d','--database_dir', type=str, help='path to database directory')
     parser.add_argument('-t','--threads', type=str, help='threads (INT) to pass to foldseek, default = ALL')
+    parser.add_argument('-m','--mode', type=str, default='easy-search', 
+                        choices=['easy-rbh', 'easy-search', 'search'],
+                        help='Foldseek search mode: easy-rbh (reciprocal best hit), easy-search (one-way search), or search (basic search). Default: easy-search')
     args = parser.parse_args()
 
     # make paths absolute
@@ -38,48 +41,46 @@ def main():
     if not has_subdirs:
         # Database directory contains individual structure files, treat as single database
         db_name = database_dir.rstrip('/').split('/')[-1]
-        output_path = output_prefix + db_name + '_rbh.tsv'
+        # Determine output file suffix based on mode
+        mode_suffix = args.mode.replace('easy-', '').replace('-', '_')
+        output_path = output_prefix + db_name + '_' + mode_suffix + '.tsv'
         
         # check to see if output exists
         if not os.path.exists(output_path):
+            cmd = ['foldseek', args.mode, args.query, database_dir, output_path, 'multirbhtmp']
             if args.threads:
-                subprocess.run(['foldseek', 'easy-rbh', args.query,
-                                database_dir, output_path, 'multirbhtmp', '--threads', args.threads, 
-                                '--format-output', 'query,target,evalue,alntmscore,alnlen,qlen,tcov,qcov,tlen,u,t,lddt,fident,pident,prob,qstart,qend,tstart,tend'], stdout=subprocess.DEVNULL)
-            else:
-                subprocess.run(['foldseek', 'easy-rbh', args.query,
-                                database_dir, output_path, 'multirbhtmp',
-                                '--format-output', 'query,target,evalue,alntmscore,alnlen,qlen,tcov,qcov,tlen,u,t,lddt,fident,pident,prob,qstart,qend,tstart,tend'], stdout=subprocess.DEVNULL)
+                cmd.extend(['--threads', args.threads])
+            cmd.extend(['--format-output', 'query,target,evalue,alntmscore,alnlen,qlen,tcov,qcov,tlen,u,t,lddt,fident,pident,prob,qstart,qend,tstart,tend'])
+            subprocess.run(cmd, stdout=subprocess.DEVNULL)
     else:
         # Original behavior: iterate over subdirectories, each containing a .tar file
         for db_path in tqdm(databases):
         
-        # check if proteome exists in the database directory
-        proteome = []
-        proteome = glob(db_path + '/*.tar')
-        if len(proteome) < 1:
-            print('No archive found for DB: {}'.format(db_path))
-            continue
-        elif len(proteome) > 1:
-            print('Unmerged proteomes shards in DB: {}'.format(db_path))
-            continue
-        
-        # create alignment output path and run foldseek easy-rbh
-        db_name = db_path.split('/')[-1]
-        output_path = output_prefix + db_name + '_rbh.tsv'
+            # check if proteome exists in the database directory
+            proteome = []
+            proteome = glob(db_path + '/*.tar')
+            if len(proteome) < 1:
+                print('No archive found for DB: {}'.format(db_path))
+                continue
+            elif len(proteome) > 1:
+                print('Unmerged proteomes shards in DB: {}'.format(db_path))
+                continue
+            
+            # create alignment output path and run foldseek search
+            db_name = db_path.split('/')[-1]
+            # Determine output file suffix based on mode
+            mode_suffix = args.mode.replace('easy-', '').replace('-', '_')
+            output_path = output_prefix + db_name + '_' + mode_suffix + '.tsv'
 
-        # check to see if output exists
-        if os.path.exists(output_path): 
-            continue
+            # check to see if output exists
+            if os.path.exists(output_path): 
+                continue
 
-        if args.threads:
-            subprocess.run(['foldseek', 'easy-rbh', args.query,
-                            proteome[0], output_path, 'multirbhtmp', '--threads', args.threads, 
-                            '--format-output', 'query,target,evalue,alntmscore,alnlen,qlen,tcov,qcov,tlen,u,t,lddt,fident,pident,prob,qstart,qend,tstart,tend'], stdout=subprocess.DEVNULL)
-        else:
-            subprocess.run(['foldseek', 'easy-rbh', args.query,
-                            proteome[0], output_path, 'multirbhtmp',
-                            '--format-output', 'query,target,evalue,alntmscore,alnlen,qlen,tcov,qcov,tlen,u,t,lddt,fident,pident,prob,qstart,qend,tstart,tend'], stdout=subprocess.DEVNULL)
+            cmd = ['foldseek', args.mode, args.query, proteome[0], output_path, 'multirbhtmp']
+            if args.threads:
+                cmd.extend(['--threads', args.threads])
+            cmd.extend(['--format-output', 'query,target,evalue,alntmscore,alnlen,qlen,tcov,qcov,tlen,u,t,lddt,fident,pident,prob,qstart,qend,tstart,tend'])
+            subprocess.run(cmd, stdout=subprocess.DEVNULL)
 
 if __name__ == '__main__':
     main()
