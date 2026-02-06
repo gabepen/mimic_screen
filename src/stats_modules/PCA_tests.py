@@ -1,24 +1,48 @@
 import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
+import os
+from mpl_toolkits.mplot3d import Axes3D
 from sklearn.decomposition import PCA
 from sklearn.discriminant_analysis import LinearDiscriminantAnalysis as LDA
 from sklearn.preprocessing import StandardScaler, Normalizer, RobustScaler
 from sklearn.manifold import TSNE
+try:
+    import umap
+    UMAP_AVAILABLE = True
+except ImportError:
+    UMAP_AVAILABLE = False
+
+try:
+    from sklearn.manifold import SpectralEmbedding
+    from scipy.sparse import csgraph
+    from scipy.spatial.distance import pdist, squareform
+    DIFFUSION_AVAILABLE = True
+except ImportError:
+    DIFFUSION_AVAILABLE = False
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.cluster import KMeans
 from sklearn.cluster import AgglomerativeClustering
+from sklearn.metrics import silhouette_score, davies_bouldin_score
+from sklearn.manifold import trustworthiness
 from gensim.models import Word2Vec
 import argparse
 import re
 import pdb
 
-candidate_list = ['Q73HU7', 'Q73IF8', 'Q73GY6', 'Q73GG5', 'Q73HX8', 'P61189']
+candidate_list = ['Q73HU7', 'Q73IF8', 'Q73GY6', 'Q73GG5', 'Q73HX8', 'P61189', 'O25525', 'O25981']
+
+
+'''
 validation_list = [
     'Q5ZVD8', 'Q5ZTI6', 'Q5ZUA2', 'Q5ZSI9', 'Q5ZUX1', 'Q5ZWA1', 
     'Q5ZU58', 'Q5ZU32', 'Q5ZUS4', 'Q5ZRQ0', 'Q5ZSZ6', 'Q5ZVF7', 
-    'Q5ZYU9', 'Q5ZTM4', 'Q5ZSB6'
+    'Q5ZYU9', 'Q5ZTM4', 'Q5ZSB6', 'Q5F2U4', 'Q5ZW23'
 ]
+'''
+#validation_list = ['Q5ZRQ0', 'Q5ZSJ8', 'Q5ZUS4', 'Q5ZQL5', 'Q5ZQL4', 'Q5ZQL3', 'Q5ZWD4', 'Q5ZQV8', 'Q5ZPT1', 'Q5ZXN1', 'Q5ZYU2', 'Q5ZSQ7']
+validation_list = ['Q5ZU58', 'Q5ZXE0', 'Q5ZU32', 'Q5ZSB6', 'Q5ZRP9', 'Q5ZT65', 'Q5ZXN6', 'Q5ZVF7', 'Q5ZTE0', 'Q5ZTL7', 'Q5ZSQ2', 'Q5ZTM4', 'Q5ZU83', 'Q5ZVS2', 'Q5ZWA1']
+
 
 def generate_label_color_dict(labels):
     
@@ -179,12 +203,14 @@ def apply_labels(data_frame):
     
     return test_data_frame, labels, selected_columns
     
-def lda_pca_analysis(pca_test_dir, data_frame, organism_name, go_term_type, n_clusters=20):
+def lda_pca_analysis(pca_test_dir, data_frame, organism_name, go_term_type, n_clusters=20, use_semantic_clustering=True):
     
     #go_term_type = 'target_cellular_components'
     #n_clusters = 20
-    test_data_frame, labels, selected_columns = semantic_clustering(data_frame, go_term_type, n_clusters)
-   #test_data_frame, labels, selected_columns = apply_labels(data_frame)
+    if use_semantic_clustering:
+        test_data_frame, labels, selected_columns = semantic_clustering(data_frame, go_term_type, n_clusters)
+    else:
+        test_data_frame, labels, selected_columns = apply_labels(data_frame)
     
     #candidate_list = generate_candidate_list(data_frame, 0.1, 0.3)
     print('Candidates within threshold:', len(candidate_list))
@@ -431,6 +457,2931 @@ def pca_tsne_analysis(pca_test_dir, data_frame):
     plt.savefig(pca_test_dir + '/tsne_pca_viz_hp.png')
     plt.close()
     
+def compute_robust_axis_limits(data, percentile_low=1.0, percentile_high=99.0, padding_factor=0.05):
+    """
+    Compute robust axis limits based on percentiles to handle outliers.
+    
+    Args:
+        data: Array of values
+        percentile_low: Lower percentile (default: 1.0)
+        percentile_high: Upper percentile (default: 99.0)
+        padding_factor: Additional padding as fraction of range (default: 0.05)
+    
+    Returns:
+        (min_limit, max_limit) tuple
+    """
+    if len(data) == 0:
+        return (0, 1)
+    
+    low = np.percentile(data, percentile_low)
+    high = np.percentile(data, percentile_high)
+    
+    # Add padding
+    range_val = high - low
+    if range_val == 0:
+        # If all values are the same, add small padding
+        padding = abs(low) * 0.1 if low != 0 else 0.1
+        return (low - padding, high + padding)
+    
+    padding = range_val * padding_factor
+    return (low - padding, high + padding)
+
+
+def compute_diffusion_map_analysis(scaled_data, data_frame, pca_test_dir, organism_name, diffusion_alpha=1.0, diffusion_n_neighbors=15, plot_3d=False, use_natural_attractor=False):
+    """
+    Compute diffusion map and diffusion pseudotime analysis.
+    This is for trajectory analysis, not clustering.
+    """
+    from sklearn.neighbors import kneighbors_graph
+    from scipy.sparse import csr_matrix, diags
+    from scipy.linalg import eigh
+    from scipy.sparse.csgraph import shortest_path
+    import os
+    
+    print(f"Using Diffusion Map for trajectory analysis (alpha={diffusion_alpha}, n_neighbors={diffusion_n_neighbors})...")
+    
+    # Create k-nearest neighbors graph with distances
+    knn_graph = kneighbors_graph(scaled_data, n_neighbors=diffusion_n_neighbors, mode='distance', metric='euclidean', include_self=True)
+    
+    # Convert to symmetric affinity matrix (Gaussian kernel)
+    distances = knn_graph.data
+    if len(distances) > 0:
+        bandwidth = np.median(distances[distances > 0])
+    else:
+        bandwidth = 1.0
+    
+    # Create Gaussian affinity matrix
+    knn_graph_sym = 0.5 * (knn_graph + knn_graph.T)  # Make symmetric
+    distances_sym = knn_graph_sym.data
+    affinities = np.exp(-distances_sym**2 / (2 * bandwidth**2))
+    affinity_matrix = csr_matrix((affinities, knn_graph_sym.indices, knn_graph_sym.indptr), shape=knn_graph_sym.shape)
+    
+    # Compute row sums for normalization
+    row_sums = np.array(affinity_matrix.sum(axis=1)).flatten()
+    row_sums[row_sums == 0] = 1
+    
+    # Apply alpha parameter
+    if diffusion_alpha != 1.0:
+        row_sums_alpha = np.power(row_sums, -diffusion_alpha)
+        D_alpha_inv = diags(row_sums_alpha, format='csr')
+        affinity_matrix = D_alpha_inv.dot(affinity_matrix).dot(D_alpha_inv)
+        row_sums = np.array(affinity_matrix.sum(axis=1)).flatten()
+        row_sums[row_sums == 0] = 1
+    
+    # Create Markov transition matrix
+    D_inv = diags(1.0 / row_sums, format='csr')
+    transition_matrix = D_inv.dot(affinity_matrix)
+    
+    # Compute diffusion map coordinates
+    n_samples = transition_matrix.shape[0]
+    n_diffusion_components = min(10, scaled_data.shape[1] - 1, n_samples - 1)
+    
+    if n_samples < 5000:
+        transition_dense = transition_matrix.toarray()
+        eigenvals, eigenvecs = eigh(transition_dense)
+        idx = eigenvals.argsort()[::-1]
+        eigenvals = eigenvals[idx]
+        eigenvecs = eigenvecs[:, idx]
+        diffusion_coords = eigenvecs[:, 1:n_diffusion_components+1]
+        eigenvalues = eigenvals[1:n_diffusion_components+1]
+    else:
+        from sklearn.manifold import SpectralEmbedding
+        embedding = SpectralEmbedding(n_components=n_diffusion_components, 
+                                     affinity='precomputed',
+                                     random_state=42)
+        diffusion_coords = embedding.fit_transform(transition_matrix)
+        eigenvalues = None  # Not available from SpectralEmbedding
+    
+    print(f"Diffusion map computed. Using {n_diffusion_components} components.")
+    
+    # Analyze eigenvalues to determine intrinsic dimensionality
+    print("\n" + "="*60)
+    print("Eigenvalue Analysis (Intrinsic Dimensionality Check)")
+    print("="*60)
+    if eigenvalues is not None:
+        print(f"Eigenvalues: {eigenvalues[:min(10, len(eigenvalues))]}")  # Show first 10
+        
+        # Check eigenvalue ratios to determine structure
+        if len(eigenvalues) >= 3:
+            lambda1 = eigenvalues[0]
+            lambda2 = eigenvalues[1]
+            lambda3 = eigenvalues[2]
+            
+            ratio_1_2 = lambda1 / lambda2 if lambda2 > 0 else np.inf
+            ratio_2_3 = lambda2 / lambda3 if lambda3 > 0 else np.inf
+            
+            print(f"\nEigenvalue Ratios:")
+            print(f"  λ₁/λ₂ = {ratio_1_2:.4f}")
+            print(f"  λ₂/λ₃ = {ratio_2_3:.4f}")
+            
+            if len(eigenvalues) >= 4:
+                lambda4 = eigenvalues[3]
+                ratio_3_4 = lambda3 / lambda4 if lambda4 > 0 else np.inf
+                print(f"  λ₃/λ₄ = {ratio_3_4:.4f}")
+                
+                # More detailed analysis for DC3 and DC4
+                # Check how much information DC3 and DC4 contain relative to DC1 and DC2
+                lambda_sum_12 = lambda1 + lambda2
+                lambda_sum_34 = lambda3 + lambda4
+                ratio_12_34 = lambda_sum_12 / lambda_sum_34 if lambda_sum_34 > 0 else np.inf
+                
+                # Check individual contributions
+                lambda3_contribution = lambda3 / lambda1 if lambda1 > 0 else 0
+                lambda4_contribution = lambda4 / lambda1 if lambda1 > 0 else 0
+                
+                print(f"\nDC3 and DC4 Information Content:")
+                print(f"  λ₃ contribution (relative to λ₁): {lambda3_contribution:.4f} ({lambda3_contribution*100:.2f}%)")
+                print(f"  λ₄ contribution (relative to λ₁): {lambda4_contribution:.4f} ({lambda4_contribution*100:.2f}%)")
+                print(f"  (λ₁+λ₂)/(λ₃+λ₄) ratio: {ratio_12_34:.4f}")
+                
+                if ratio_3_4 > 3.0:
+                    print(f"  ✓ DC3 contains significant signal (λ₃/λ₄ > 3)")
+                    print(f"    → DC3 likely captures meaningful structure")
+                elif ratio_3_4 > 2.0:
+                    print(f"  → DC3 may contain signal (λ₃/λ₄ > 2)")
+                    print(f"    → DC3 worth investigating")
+                elif ratio_3_4 > 1.5:
+                    print(f"  → DC3 and DC4 have similar magnitude (λ₃/λ₄ ≈ {ratio_3_4:.2f})")
+                    print(f"    → Both may contain some signal or both may be noise")
+                else:
+                    print(f"  → DC3 and DC4 likely noise (λ₃/λ₄ ≈ 1)")
+                    print(f"    → DC4 may be capturing noise floor")
+                
+                # Check if DC3+DC4 together contain substantial information
+                if lambda3_contribution > 0.1:  # DC3 is >10% of DC1
+                    print(f"  ✓ DC3 has substantial information ({lambda3_contribution*100:.1f}% of DC1)")
+                if lambda4_contribution > 0.05:  # DC4 is >5% of DC1
+                    print(f"  → DC4 has some information ({lambda4_contribution*100:.1f}% of DC1)")
+                
+                if ratio_12_34 < 3.0:
+                    print(f"  ⚠ DC3+DC4 together contain significant information")
+                    print(f"    → Consider 3D or 4D analysis (DC1-DC2-DC3 or DC1-DC2-DC3-DC4)")
+                elif ratio_12_34 < 5.0:
+                    print(f"  → DC3+DC4 may contain some information")
+                    print(f"    → Worth checking 3D visualizations")
+                else:
+                    print(f"  → DC3+DC4 contain minimal information relative to DC1+DC2")
+            
+            print(f"\nStructure Interpretation:")
+            if ratio_1_2 > 5 and ratio_2_3 > 5:
+                print(f"  ✓ Strong 1D structure detected (λ₁ ≫ λ₂ ≫ λ₃)")
+                print(f"    → Intrinsic dimensionality is ~1")
+                print(f"    → DC1 captures the main trajectory")
+                print(f"    → DC2 and higher likely represent noise correction")
+            elif ratio_1_2 > 2 and ratio_2_3 > 2:
+                print(f"  → Moderate 1D structure (λ₁ > λ₂ > λ₃)")
+                print(f"    → DC1 is primary, but DC2 may contain signal")
+            elif ratio_1_2 < 1.5:
+                print(f"  ⚠ Warning: λ₂ ≈ λ₁ (ratio = {ratio_1_2:.4f})")
+                print(f"    → Structure may have curvature or branching")
+                print(f"    → DC2 may contain important information")
+                print(f"    → Consider 2D analysis")
+            else:
+                print(f"  → Mixed structure: DC1 dominant but DC2 may be informative")
+        else:
+            print("  (Not enough eigenvalues for ratio analysis)")
+    else:
+        print("  (Eigenvalues not available from SpectralEmbedding approximation)")
+        print("  (Consider using smaller dataset for exact eigenvalue computation)")
+    
+    # Use DC1 as the primary pseudotime/progression axis
+    # Root point selection: prefer densest region (attractor) over minimum DC1
+    # This is more robust when many points cluster together (e.g., all alignments)
+    
+    # Compute local density to find attractor
+    from sklearn.neighbors import NearestNeighbors
+    n_neighbors_density = min(50, len(diffusion_coords) // 10)
+    if n_neighbors_density < 5:
+        n_neighbors_density = min(5, len(diffusion_coords) - 1)
+    
+    try:
+        nn = NearestNeighbors(n_neighbors=n_neighbors_density + 1)
+        nn.fit(diffusion_coords[:, :2])  # Use DC1 and DC2 for density
+        distances, _ = nn.kneighbors(diffusion_coords[:, :2])
+        # Local density = inverse of mean distance to neighbors
+        local_density = 1.0 / (distances[:, 1:].mean(axis=1) + 1e-10)
+        attractor_idx = np.argmax(local_density)
+        root_idx = attractor_idx
+        print(f"\nRoot point (attractor/densest region): index {root_idx}")
+        print(f"  DC1: {diffusion_coords[root_idx, 0]:.4f}, DC2: {diffusion_coords[root_idx, 1]:.4f}")
+        print(f"  Local density: {local_density[root_idx]:.4f}")
+    except:
+        # Fallback to minimum DC1 if density calculation fails
+        root_idx = np.argmin(diffusion_coords[:, 0])
+        print(f"\nRoot point (minimum DC1, fallback): index {root_idx}")
+    
+    # Check DC1 variance to diagnose pseudotime issues
+    dc1_values = diffusion_coords[:, 0]
+    dc1_range = dc1_values.max() - dc1_values.min()
+    dc1_std = dc1_values.std()
+    print(f"DC1 statistics:")
+    print(f"  Range: {dc1_range:.6f}")
+    print(f"  Std dev: {dc1_std:.6f}")
+    print(f"  Min: {dc1_values.min():.6f}, Max: {dc1_values.max():.6f}")
+    
+    # DC1-based pseudotime (normalized to start at 0)
+    dc1_pseudotime = diffusion_coords[:, 0] - diffusion_coords[root_idx, 0]
+    dc1_pseudotime = dc1_pseudotime - dc1_pseudotime.min()  # Normalize to start at 0
+    
+    # Check pseudotime variance
+    pseudotime_range = dc1_pseudotime.max() - dc1_pseudotime.min()
+    pseudotime_std = dc1_pseudotime.std()
+    print(f"DC1 pseudotime statistics:")
+    print(f"  Range: {pseudotime_range:.6f}")
+    print(f"  Std dev: {pseudotime_std:.6f}")
+    
+    if pseudotime_range < 1e-6:
+        print("  WARNING: DC1 pseudotime has near-zero range - all points are essentially identical!")
+        print("  This suggests DC1 has very low variance, possibly due to:")
+        print("    - Many duplicate or near-duplicate alignments")
+        print("    - Tight clustering in diffusion space")
+        print("  Consider using geodesic distances instead for better resolution.")
+    
+    # Also compute traditional diffusion pseudotime for comparison
+    diffusion_pseudotime = dc1_pseudotime.copy()
+    
+    # Alternative: compute shortest path distances on the graph
+    # Convert affinity to distance (higher affinity = lower distance)
+    distance_graph = affinity_matrix.copy()
+    distance_graph.data = -np.log(distance_graph.data + 1e-10)  # Avoid log(0)
+    distance_graph.data[distance_graph.data < 0] = 0  # Remove negative values
+    
+    # Compute shortest paths from root
+    geodesic_distances = None
+    try:
+        geodesic_distances = shortest_path(distance_graph, 
+                                          directed=False, 
+                                          indices=root_idx, 
+                                          method='auto')
+        geodesic_distances = geodesic_distances.flatten()
+        geodesic_distances[np.isinf(geodesic_distances)] = np.nan
+        
+        # Check geodesic distance statistics
+        valid_geodesic = geodesic_distances[~np.isnan(geodesic_distances)]
+        if len(valid_geodesic) > 0:
+            geodesic_range = valid_geodesic.max() - valid_geodesic.min()
+            geodesic_std = valid_geodesic.std()
+            print(f"Geodesic distance statistics:")
+            print(f"  Range: {geodesic_range:.6f}")
+            print(f"  Std dev: {geodesic_std:.6f}")
+            print(f"  Valid distances: {len(valid_geodesic)}/{len(geodesic_distances)}")
+        
+        print(f"Computed geodesic distances from root point")
+    except Exception as e:
+        print(f"Warning: Could not compute geodesic distances: {e}")
+        print("  Using diffusion coordinate ordering")
+    
+    # Use geodesic distances as primary pseudotime if DC1 variance is too low
+    # or if geodesic distances have better resolution
+    use_geodesic_as_primary = False
+    if geodesic_distances is not None:
+        valid_geodesic = geodesic_distances[~np.isnan(geodesic_distances)]
+        if len(valid_geodesic) > 0:
+            geodesic_range = valid_geodesic.max() - valid_geodesic.min()
+            # Use geodesic if DC1 range is very small OR if geodesic has better range
+            if pseudotime_range < 1e-4 or (geodesic_range > 0 and geodesic_range > pseudotime_range * 2):
+                use_geodesic_as_primary = True
+                print(f"\nUsing geodesic distances as primary pseudotime (better resolution)")
+                # Normalize geodesic distances to start at 0
+                diffusion_pseudotime = geodesic_distances.copy()
+                diffusion_pseudotime[np.isnan(diffusion_pseudotime)] = np.nanmax(geodesic_distances) + 1
+                diffusion_pseudotime = diffusion_pseudotime - diffusion_pseudotime.min()
+            else:
+                print(f"\nUsing DC1-based pseudotime (sufficient resolution)")
+    
+    # Create results DataFrame
+    results_df = data_frame.copy()
+    # Save up to DC4 (or as many as available)
+    for i in range(min(4, n_diffusion_components)):
+        results_df[f'Diffusion{i+1}'] = diffusion_coords[:, i]
+    results_df['dc1_pseudotime'] = dc1_pseudotime
+    results_df['diffusion_pseudotime'] = diffusion_pseudotime
+    if geodesic_distances is not None:
+        results_df['geodesic_distance'] = geodesic_distances
+        if use_geodesic_as_primary:
+            results_df['trajectory_order'] = np.argsort(geodesic_distances)
+        else:
+            results_df['trajectory_order'] = np.argsort(dc1_pseudotime)
+    else:
+        results_df['trajectory_order'] = np.argsort(dc1_pseudotime)
+    
+    # Identify best alignments for known mimics and candidates
+    alignment_quality = (data_frame['score'].values * 
+                        data_frame['fident'].values * 
+                        data_frame['algn_fraction'].values)
+    
+    # Find best mimic alignments (one per query)
+    mimic_indices = []
+    mimic_mask = data_frame['query'].isin(validation_list).values
+    if mimic_mask.sum() > 0:
+        mimic_df = pd.DataFrame({
+            'query': data_frame['query'].values,
+            'quality': alignment_quality,
+            'row_idx': range(len(data_frame))
+        })
+        mimic_df = mimic_df[mimic_mask]
+        best_mimic_indices = mimic_df.groupby('query')['quality'].idxmax().values
+        mimic_indices = best_mimic_indices.tolist()
+        print(f"Found {len(mimic_indices)} best mimic alignments to highlight")
+    
+    # Find best candidate alignments (one per query)
+    candidate_indices = []
+    candidate_mask = data_frame['query'].isin(candidate_list).values
+    if candidate_mask.sum() > 0:
+        candidate_df = pd.DataFrame({
+            'query': data_frame['query'].values,
+            'quality': alignment_quality,
+            'row_idx': range(len(data_frame))
+        })
+        candidate_df = candidate_df[candidate_mask]
+        best_candidate_indices = candidate_df.groupby('query')['quality'].idxmax().values
+        candidate_indices = best_candidate_indices.tolist()
+        print(f"Found {len(candidate_indices)} best candidate alignments to highlight")
+    
+    # Save results
+    # Include query column and GO term columns if available for downstream analysis
+    if 'query' in data_frame.columns:
+        results_df['query'] = data_frame['query'].values
+    # Include GO term columns if they exist
+    go_term_cols = ['target_biological_processes', 'target_molecular_functions', 'target_cellular_components']
+    for col in go_term_cols:
+        if col in data_frame.columns:
+            results_df[col] = data_frame[col].values
+    
+    output_file = os.path.join(pca_test_dir, f'{organism_name}_diffusion_map_results.csv')
+    results_df.to_csv(output_file, index=False)
+    print(f"Saved diffusion map results to {output_file}")
+    
+    # Create visualizations
+    # 2D plot: Diffusion1 vs Diffusion2, colored by pseudotime
+    fig, ax = plt.subplots(1, 1, figsize=(8, 6))
+    
+    # Plot all points colored by pseudotime
+    scatter = ax.scatter(diffusion_coords[:, 0], diffusion_coords[:, 1], 
+                        c=diffusion_pseudotime, cmap='viridis', s=20, alpha=0.5, zorder=1)
+    
+    # Highlight root point
+    ax.scatter(diffusion_coords[root_idx, 0], diffusion_coords[root_idx, 1], 
+              c='red', s=150, marker='*', label='Root', zorder=5, edgecolors='black', linewidths=1)
+    
+    # Highlight mimic points
+    if len(mimic_indices) > 0:
+        mimic_coords = diffusion_coords[mimic_indices, :]
+        ax.scatter(mimic_coords[:, 0], mimic_coords[:, 1],
+                  c='lime', s=200, marker='o', label=f'Mimics (n={len(mimic_indices)})', 
+                  zorder=4, edgecolors='black', linewidths=1.5, alpha=0.9)
+        # Add text labels for mimics
+        for idx in mimic_indices:
+            query_id = data_frame.iloc[idx]['query']
+            ax.annotate(query_id, 
+                       (diffusion_coords[idx, 0], diffusion_coords[idx, 1]),
+                       xytext=(5, 5), textcoords='offset points',
+                       fontsize=8, fontweight='bold', color='lime',
+                       bbox=dict(boxstyle='round,pad=0.3', facecolor='black', alpha=0.7, edgecolor='lime'),
+                       zorder=6)
+    
+    # Highlight candidate points
+    if len(candidate_indices) > 0:
+        candidate_coords = diffusion_coords[candidate_indices, :]
+        ax.scatter(candidate_coords[:, 0], candidate_coords[:, 1],
+                  c='cyan', s=200, marker='s', label=f'Candidates (n={len(candidate_indices)})', 
+                  zorder=4, edgecolors='black', linewidths=1.5, alpha=0.9)
+        # Add text labels for candidates
+        for idx in candidate_indices:
+            query_id = data_frame.iloc[idx]['query']
+            ax.annotate(query_id, 
+                       (diffusion_coords[idx, 0], diffusion_coords[idx, 1]),
+                       xytext=(5, 5), textcoords='offset points',
+                       fontsize=8, fontweight='bold', color='cyan',
+                       bbox=dict(boxstyle='round,pad=0.3', facecolor='black', alpha=0.7, edgecolor='cyan'),
+                       zorder=6)
+    
+    # Set robust axis limits to handle outliers (use 1st-99th percentile)
+    xlim_low, xlim_high = compute_robust_axis_limits(diffusion_coords[:, 0], percentile_low=1.0, percentile_high=99.0)
+    ylim_low, ylim_high = compute_robust_axis_limits(diffusion_coords[:, 1], percentile_low=1.0, percentile_high=99.0)
+    ax.set_xlim(xlim_low, xlim_high)
+    ax.set_ylim(ylim_low, ylim_high)
+    
+    ax.set_xlabel('Diffusion Coordinate 1')
+    ax.set_ylabel('Diffusion Coordinate 2')
+    ax.set_title(f'Diffusion Map - {organism_name.capitalize()}\n(Colored by Pseudotime, Mimics/Candidates Labeled)\n(Axis limits: 1st-99th percentile)')
+    plt.colorbar(scatter, ax=ax, label='Diffusion Pseudotime')
+    ax.legend(loc='best')
+    ax.grid(True, alpha=0.3)
+    
+    plt.tight_layout()
+    plot_file = os.path.join(pca_test_dir, f'diffusion_map_{organism_name}_2d.png')
+    plt.savefig(plot_file, dpi=300, bbox_inches='tight')
+    print(f"Saved plot to {plot_file}")
+    plt.close()
+    
+    if plot_3d:
+        # Separate 3D plot with multiple viewing angles
+        from mpl_toolkits.mplot3d import Axes3D
+        
+        # Define multiple viewing angles: (elevation, azimuth, title_suffix)
+        view_angles = [
+            (30, 45, 'standard'),
+            (0, 0, 'xy_plane'),      # Top-down view (looking down Z-axis)
+            (90, 0, 'xz_plane'),     # Side view (looking along Y-axis)
+            (0, 90, 'yz_plane'),     # Side view (looking along X-axis)
+            (30, 135, 'diagonal1'),
+            (30, 225, 'diagonal2'),
+            (60, 45, 'elevated'),
+        ]
+        
+        for elev, azim, suffix in view_angles:
+            fig = plt.figure(figsize=(12, 9))
+            ax = fig.add_subplot(111, projection='3d')
+            
+            # Plot all points colored by pseudotime
+            scatter = ax.scatter(diffusion_coords[:, 0], diffusion_coords[:, 1], diffusion_coords[:, 2],
+                               c=diffusion_pseudotime, cmap='viridis', s=20, alpha=0.5)
+            
+            # Root point
+            ax.scatter([diffusion_coords[root_idx, 0]], [diffusion_coords[root_idx, 1]], [diffusion_coords[root_idx, 2]],
+                      c='red', s=200, marker='*', label='Root')
+            
+            # Mimic points
+            if len(mimic_indices) > 0:
+                mimic_coords = diffusion_coords[mimic_indices, :]
+                ax.scatter(mimic_coords[:, 0], mimic_coords[:, 1], mimic_coords[:, 2],
+                          c='lime', s=300, marker='o', label=f'Mimics (n={len(mimic_indices)})', 
+                          edgecolors='black', linewidths=1.5, alpha=0.9)
+            
+            # Candidate points
+            if len(candidate_indices) > 0:
+                candidate_coords = diffusion_coords[candidate_indices, :]
+                ax.scatter(candidate_coords[:, 0], candidate_coords[:, 1], candidate_coords[:, 2],
+                          c='cyan', s=300, marker='s', label=f'Candidates (n={len(candidate_indices)})', 
+                          edgecolors='black', linewidths=1.5, alpha=0.9)
+            
+            # Set robust axis limits for 3D plot
+            xlim_low, xlim_high = compute_robust_axis_limits(diffusion_coords[:, 0], percentile_low=1.0, percentile_high=99.0)
+            ylim_low, ylim_high = compute_robust_axis_limits(diffusion_coords[:, 1], percentile_low=1.0, percentile_high=99.0)
+            zlim_low, zlim_high = compute_robust_axis_limits(diffusion_coords[:, 2], percentile_low=1.0, percentile_high=99.0)
+            ax.set_xlim(xlim_low, xlim_high)
+            ax.set_ylim(ylim_low, ylim_high)
+            ax.set_zlim(zlim_low, zlim_high)
+            
+            ax.set_xlabel('Diffusion Coordinate 1')
+            ax.set_ylabel('Diffusion Coordinate 2')
+            ax.set_zlabel('Diffusion Coordinate 3')
+            ax.set_title(f'Diffusion Map 3D - {organism_name.capitalize()}\n(Colored by Pseudotime, View: elev={elev}°, azim={azim}°)\n(Axis limits: 1st-99th percentile)')
+            ax.view_init(elev=elev, azim=azim)
+            plt.colorbar(scatter, ax=ax, label='Diffusion Pseudotime')
+            ax.legend(loc='best')
+            plot_file_3d = os.path.join(pca_test_dir, f'diffusion_map_{organism_name}_3d_{suffix}.png')
+            plt.savefig(plot_file_3d, dpi=300, bbox_inches='tight')
+            print(f"Saved 3D plot ({suffix}) to {plot_file_3d}")
+            plt.close()
+    
+    # ============================================================
+    # DC3 and DC4 Visualizations
+    # ============================================================
+    if n_diffusion_components >= 3:
+        print("\n" + "="*60)
+        print("DC3 and DC4 Visualizations")
+        print("="*60)
+        
+        # Create 2D plots for DC3 and DC4
+        fig, axes = plt.subplots(2, 3, figsize=(18, 12))
+        axes = axes.flatten()
+        
+        plot_configs = [
+            (0, 2, 'DC1 vs DC3', 'Diffusion Coordinate 1', 'Diffusion Coordinate 3'),
+            (1, 2, 'DC2 vs DC3', 'Diffusion Coordinate 2', 'Diffusion Coordinate 3'),
+        ]
+        
+        if n_diffusion_components >= 4:
+            plot_configs.extend([
+                (0, 3, 'DC1 vs DC4', 'Diffusion Coordinate 1', 'Diffusion Coordinate 4'),
+                (1, 3, 'DC2 vs DC4', 'Diffusion Coordinate 2', 'Diffusion Coordinate 4'),
+                (2, 3, 'DC3 vs DC4', 'Diffusion Coordinate 3', 'Diffusion Coordinate 4'),
+            ])
+        else:
+            # If no DC4, just show DC3 plots
+            plot_configs.append((None, None, None, None, None))
+        
+        plot_idx = 0
+        for i, j, title, xlabel, ylabel in plot_configs:
+            if i is None:
+                axes[plot_idx].axis('off')
+                plot_idx += 1
+                continue
+                
+            ax = axes[plot_idx]
+            
+            # Plot all points colored by pseudotime
+            scatter = ax.scatter(diffusion_coords[:, i], diffusion_coords[:, j], 
+                               c=diffusion_pseudotime, cmap='viridis', s=20, alpha=0.5, zorder=1)
+            
+            # Highlight root point
+            ax.scatter(diffusion_coords[root_idx, i], diffusion_coords[root_idx, j],
+                      c='red', s=150, marker='*', label='Root', zorder=5, 
+                      edgecolors='black', linewidths=1)
+            
+            # Highlight mimic points
+            if len(mimic_indices) > 0:
+                mimic_coords = diffusion_coords[mimic_indices, :]
+                ax.scatter(mimic_coords[:, i], mimic_coords[:, j],
+                          c='lime', s=200, marker='o', label=f'Mimics (n={len(mimic_indices)})', 
+                          zorder=4, edgecolors='black', linewidths=1.5, alpha=0.9)
+            
+            # Highlight candidate points
+            if len(candidate_indices) > 0:
+                candidate_coords = diffusion_coords[candidate_indices, :]
+                ax.scatter(candidate_coords[:, i], candidate_coords[:, j],
+                          c='cyan', s=200, marker='s', label=f'Candidates (n={len(candidate_indices)})', 
+                          zorder=4, edgecolors='black', linewidths=1.5, alpha=0.9)
+            
+            # Set robust axis limits
+            xlim_low, xlim_high = compute_robust_axis_limits(diffusion_coords[:, i], percentile_low=1.0, percentile_high=99.0)
+            ylim_low, ylim_high = compute_robust_axis_limits(diffusion_coords[:, j], percentile_low=1.0, percentile_high=99.0)
+            ax.set_xlim(xlim_low, xlim_high)
+            ax.set_ylim(ylim_low, ylim_high)
+            
+            ax.set_xlabel(xlabel)
+            ax.set_ylabel(ylabel)
+            ax.set_title(title)
+            plt.colorbar(scatter, ax=ax, label='Diffusion Pseudotime')
+            ax.legend(loc='best', fontsize=8)
+            ax.grid(True, alpha=0.3)
+            
+            plot_idx += 1
+        
+        # Hide unused subplots
+        for idx in range(plot_idx, len(axes)):
+            axes[idx].axis('off')
+        
+        plt.tight_layout()
+        plot_file_dc34 = os.path.join(pca_test_dir, f'diffusion_map_{organism_name}_dc3_dc4.png')
+        plt.savefig(plot_file_dc34, dpi=300, bbox_inches='tight')
+        print(f"Saved DC3/DC4 plots to {plot_file_dc34}")
+        plt.close()
+        
+        # 3D plots with DC3 and DC4 (multiple angles)
+        if n_diffusion_components >= 4:
+            from mpl_toolkits.mplot3d import Axes3D
+            
+            # Define viewing angles for DC3/DC4 plots
+            view_angles = [
+                (30, 45, 'standard'),
+                (0, 0, 'xy_plane'),
+                (90, 0, 'xz_plane'),
+                (0, 90, 'yz_plane'),
+                (30, 135, 'diagonal1'),
+                (30, 225, 'diagonal2'),
+            ]
+            
+            # DC1, DC2, DC3 - multiple angles
+            for elev, azim, suffix in view_angles:
+                fig = plt.figure(figsize=(12, 9))
+                ax = fig.add_subplot(111, projection='3d')
+                scatter = ax.scatter(diffusion_coords[:, 0], diffusion_coords[:, 1], diffusion_coords[:, 2],
+                                   c=diffusion_pseudotime, cmap='viridis', s=20, alpha=0.5)
+                ax.scatter([diffusion_coords[root_idx, 0]], [diffusion_coords[root_idx, 1]], [diffusion_coords[root_idx, 2]],
+                          c='red', s=200, marker='*', label='Root')
+                if len(mimic_indices) > 0:
+                    mimic_coords = diffusion_coords[mimic_indices, :]
+                    ax.scatter(mimic_coords[:, 0], mimic_coords[:, 1], mimic_coords[:, 2],
+                              c='lime', s=300, marker='o', label=f'Mimics (n={len(mimic_indices)})', 
+                              edgecolors='black', linewidths=1.5, alpha=0.9)
+                if len(candidate_indices) > 0:
+                    candidate_coords = diffusion_coords[candidate_indices, :]
+                    ax.scatter(candidate_coords[:, 0], candidate_coords[:, 1], candidate_coords[:, 2],
+                              c='cyan', s=300, marker='s', label=f'Candidates (n={len(candidate_indices)})', 
+                              edgecolors='black', linewidths=1.5, alpha=0.9)
+                # Set robust axis limits
+                xlim_low, xlim_high = compute_robust_axis_limits(diffusion_coords[:, 0], percentile_low=1.0, percentile_high=99.0)
+                ylim_low, ylim_high = compute_robust_axis_limits(diffusion_coords[:, 1], percentile_low=1.0, percentile_high=99.0)
+                zlim_low, zlim_high = compute_robust_axis_limits(diffusion_coords[:, 2], percentile_low=1.0, percentile_high=99.0)
+                ax.set_xlim(xlim_low, xlim_high)
+                ax.set_ylim(ylim_low, ylim_high)
+                ax.set_zlim(zlim_low, zlim_high)
+                
+                ax.set_xlabel('DC1')
+                ax.set_ylabel('DC2')
+                ax.set_zlabel('DC3')
+                ax.set_title(f'Diffusion Map 3D: DC1-DC2-DC3\n(View: elev={elev}°, azim={azim}°)\n(Axis limits: 1st-99th percentile)')
+                ax.view_init(elev=elev, azim=azim)
+                plt.colorbar(scatter, ax=ax, label='Diffusion Pseudotime')
+                ax.legend(loc='best')
+                plot_file_3d_dc123 = os.path.join(pca_test_dir, f'diffusion_map_{organism_name}_3d_dc123_{suffix}.png')
+                plt.savefig(plot_file_3d_dc123, dpi=300, bbox_inches='tight')
+                print(f"Saved 3D plot (DC1-DC2-DC3, {suffix}) to {plot_file_3d_dc123}")
+                plt.close()
+            
+            # DC1, DC3, DC4 - multiple angles
+            for elev, azim, suffix in view_angles:
+                fig = plt.figure(figsize=(12, 9))
+                ax = fig.add_subplot(111, projection='3d')
+                scatter = ax.scatter(diffusion_coords[:, 0], diffusion_coords[:, 2], diffusion_coords[:, 3],
+                                   c=diffusion_pseudotime, cmap='viridis', s=20, alpha=0.5)
+                ax.scatter([diffusion_coords[root_idx, 0]], [diffusion_coords[root_idx, 2]], [diffusion_coords[root_idx, 3]],
+                          c='red', s=200, marker='*', label='Root')
+                if len(mimic_indices) > 0:
+                    mimic_coords = diffusion_coords[mimic_indices, :]
+                    ax.scatter(mimic_coords[:, 0], mimic_coords[:, 2], mimic_coords[:, 3],
+                              c='lime', s=300, marker='o', label=f'Mimics (n={len(mimic_indices)})', 
+                              edgecolors='black', linewidths=1.5, alpha=0.9)
+                if len(candidate_indices) > 0:
+                    candidate_coords = diffusion_coords[candidate_indices, :]
+                    ax.scatter(candidate_coords[:, 0], candidate_coords[:, 2], candidate_coords[:, 3],
+                              c='cyan', s=300, marker='s', label=f'Candidates (n={len(candidate_indices)})', 
+                              edgecolors='black', linewidths=1.5, alpha=0.9)
+                # Set robust axis limits
+                xlim_low, xlim_high = compute_robust_axis_limits(diffusion_coords[:, 0], percentile_low=1.0, percentile_high=99.0)
+                ylim_low, ylim_high = compute_robust_axis_limits(diffusion_coords[:, 2], percentile_low=1.0, percentile_high=99.0)
+                zlim_low, zlim_high = compute_robust_axis_limits(diffusion_coords[:, 3], percentile_low=1.0, percentile_high=99.0)
+                ax.set_xlim(xlim_low, xlim_high)
+                ax.set_ylim(ylim_low, ylim_high)
+                ax.set_zlim(zlim_low, zlim_high)
+                
+                ax.set_xlabel('DC1')
+                ax.set_ylabel('DC3')
+                ax.set_zlabel('DC4')
+                ax.set_title(f'Diffusion Map 3D: DC1-DC3-DC4\n(View: elev={elev}°, azim={azim}°)\n(Axis limits: 1st-99th percentile)')
+                ax.view_init(elev=elev, azim=azim)
+                plt.colorbar(scatter, ax=ax, label='Diffusion Pseudotime')
+                ax.legend(loc='best')
+                plot_file_3d_dc134 = os.path.join(pca_test_dir, f'diffusion_map_{organism_name}_3d_dc134_{suffix}.png')
+                plt.savefig(plot_file_3d_dc134, dpi=300, bbox_inches='tight')
+                print(f"Saved 3D plot (DC1-DC3-DC4, {suffix}) to {plot_file_3d_dc134}")
+                plt.close()
+    
+    # ============================================================
+    # 1D Structure Analysis: Project onto DC1 alone
+    # ============================================================
+    print("\n" + "="*60)
+    print("1D Structure Analysis (DC1 Projection)")
+    print("="*60)
+    
+    # 1. Plot histogram of DC1
+    fig, axes = plt.subplots(2, 2, figsize=(14, 10))
+    
+    # Histogram of DC1
+    ax = axes[0, 0]
+    ax.hist(diffusion_coords[:, 0], bins=50, alpha=0.7, edgecolor='black')
+    ax.axvline(diffusion_coords[root_idx, 0], color='red', linestyle='--', linewidth=2, label='Root')
+    ax.set_xlabel('Diffusion Coordinate 1 (DC1)')
+    ax.set_ylabel('Frequency')
+    ax.set_title('Histogram of DC1 (1D Projection)')
+    ax.legend()
+    ax.grid(True, alpha=0.3)
+    
+    # Histogram of DC1 pseudotime
+    ax = axes[0, 1]
+    ax.hist(dc1_pseudotime, bins=50, alpha=0.7, edgecolor='black', color='green')
+    ax.set_xlabel('DC1 Pseudotime')
+    ax.set_ylabel('Frequency')
+    ax.set_title('Histogram of DC1 Pseudotime')
+    ax.grid(True, alpha=0.3)
+    
+    # Plot key features vs DC1
+    feature_cols = ['score', 'fident', 'algn_fraction', 'tcov', 'qcov']
+    available_features = [col for col in feature_cols if col in data_frame.columns]
+    
+    if len(available_features) >= 2:
+        # Plot first 2 features
+        for i, feat in enumerate(available_features[:2]):
+            ax = axes[1, i]
+            ax.scatter(diffusion_coords[:, 0], data_frame[feat].values, 
+                      alpha=0.5, s=10, c=dc1_pseudotime, cmap='viridis')
+            # Highlight mimics
+            if len(mimic_indices) > 0:
+                ax.scatter(diffusion_coords[mimic_indices, 0], 
+                          data_frame[feat].values[mimic_indices],
+                          c='lime', s=100, marker='o', edgecolors='black', 
+                          linewidths=1.5, alpha=0.9, label='Mimics', zorder=5)
+            # Highlight candidates
+            if len(candidate_indices) > 0:
+                ax.scatter(diffusion_coords[candidate_indices, 0], 
+                          data_frame[feat].values[candidate_indices],
+                          c='cyan', s=100, marker='s', edgecolors='black', 
+                          linewidths=1.5, alpha=0.9, label='Candidates', zorder=5)
+            ax.set_xlabel('Diffusion Coordinate 1 (DC1)')
+            ax.set_ylabel(feat)
+            ax.set_title(f'{feat} vs DC1')
+            ax.legend(loc='best')
+            ax.grid(True, alpha=0.3)
+    elif len(available_features) == 1:
+        # Plot single feature
+        ax = axes[1, 0]
+        ax.scatter(diffusion_coords[:, 0], data_frame[available_features[0]].values, 
+                  alpha=0.5, s=10, c=dc1_pseudotime, cmap='viridis')
+        if len(mimic_indices) > 0:
+            ax.scatter(diffusion_coords[mimic_indices, 0], 
+                      data_frame[available_features[0]].values[mimic_indices],
+                      c='lime', s=100, marker='o', edgecolors='black', 
+                      linewidths=1.5, alpha=0.9, label='Mimics', zorder=5)
+        if len(candidate_indices) > 0:
+            ax.scatter(diffusion_coords[candidate_indices, 0], 
+                      data_frame[available_features[0]].values[candidate_indices],
+                      c='cyan', s=100, marker='s', edgecolors='black', 
+                      linewidths=1.5, alpha=0.9, label='Candidates', zorder=5)
+        ax.set_xlabel('Diffusion Coordinate 1 (DC1)')
+        ax.set_ylabel(available_features[0])
+        ax.set_title(f'{available_features[0]} vs DC1')
+        ax.legend(loc='best')
+        ax.grid(True, alpha=0.3)
+        axes[1, 1].axis('off')
+    else:
+        axes[1, 0].axis('off')
+        axes[1, 1].axis('off')
+    
+    plt.tight_layout()
+    plot_file_1d = os.path.join(pca_test_dir, f'diffusion_map_{organism_name}_1d_analysis.png')
+    plt.savefig(plot_file_1d, dpi=300, bbox_inches='tight')
+    print(f"Saved 1D analysis plots to {plot_file_1d}")
+    plt.close()
+    
+    # Plot all available features vs DC1 in a grid
+    if len(available_features) > 2:
+        n_features = len(available_features)
+        n_cols = 3
+        n_rows = (n_features + n_cols - 1) // n_cols
+        
+        fig, axes = plt.subplots(n_rows, n_cols, figsize=(15, 5*n_rows))
+        if n_rows == 1:
+            axes = axes.reshape(1, -1)
+        axes = axes.flatten()
+        
+        for i, feat in enumerate(available_features):
+            ax = axes[i]
+            ax.scatter(diffusion_coords[:, 0], data_frame[feat].values, 
+                      alpha=0.5, s=10, c=dc1_pseudotime, cmap='viridis')
+            # Highlight mimics
+            if len(mimic_indices) > 0:
+                ax.scatter(diffusion_coords[mimic_indices, 0], 
+                          data_frame[feat].values[mimic_indices],
+                          c='lime', s=100, marker='o', edgecolors='black', 
+                          linewidths=1.5, alpha=0.9, label='Mimics', zorder=5)
+            # Highlight candidates
+            if len(candidate_indices) > 0:
+                ax.scatter(diffusion_coords[candidate_indices, 0], 
+                          data_frame[feat].values[candidate_indices],
+                          c='cyan', s=100, marker='s', edgecolors='black', 
+                          linewidths=1.5, alpha=0.9, label='Candidates', zorder=5)
+            ax.set_xlabel('Diffusion Coordinate 1 (DC1)')
+            ax.set_ylabel(feat)
+            ax.set_title(f'{feat} vs DC1')
+            if i == 0:
+                ax.legend(loc='best')
+            ax.grid(True, alpha=0.3)
+        
+        # Hide unused subplots
+        for i in range(len(available_features), len(axes)):
+            axes[i].axis('off')
+        
+        plt.tight_layout()
+        plot_file_features = os.path.join(pca_test_dir, f'diffusion_map_{organism_name}_features_vs_dc1.png')
+        plt.savefig(plot_file_features, dpi=300, bbox_inches='tight')
+        print(f"Saved feature vs DC1 plots to {plot_file_features}")
+        plt.close()
+    
+    # Feature vs DC3 and DC4 plots (if available)
+    if n_diffusion_components >= 3 and len(available_features) > 0:
+        # Feature vs DC3
+        n_features = len(available_features)
+        n_cols = min(3, n_features)
+        n_rows = (n_features + n_cols - 1) // n_cols
+        
+        fig, axes = plt.subplots(n_rows, n_cols, figsize=(6*n_cols, 4*n_rows))
+        if n_features == 1:
+            axes = [axes]
+        else:
+            axes = axes.flatten()
+        
+        for i, feat in enumerate(available_features):
+            ax = axes[i]
+            feat_values = data_frame[feat].values
+            
+            ax.scatter(diffusion_coords[:, 2], feat_values, 
+                      alpha=0.3, s=10, c='gray', label='All points')
+            
+            if len(mimic_indices) > 0:
+                ax.scatter(diffusion_coords[mimic_indices, 2], feat_values[mimic_indices],
+                          c='lime', s=200, marker='o', label=f'Mimics (n={len(mimic_indices)})', 
+                          edgecolors='black', linewidths=1.5, alpha=0.9, zorder=4)
+            
+            if len(candidate_indices) > 0:
+                ax.scatter(diffusion_coords[candidate_indices, 2], feat_values[candidate_indices],
+                          c='cyan', s=200, marker='s', label=f'Candidates (n={len(candidate_indices)})', 
+                          edgecolors='black', linewidths=1.5, alpha=0.9, zorder=4)
+            
+            ax.set_xlabel('Diffusion Coordinate 3 (DC3)')
+            ax.set_ylabel(feat)
+            ax.set_title(f'{feat} vs DC3')
+            ax.legend(loc='best', fontsize=8)
+            ax.grid(True, alpha=0.3)
+        
+        # Hide unused subplots
+        for i in range(n_features, len(axes)):
+            axes[i].axis('off')
+        
+        plt.tight_layout()
+        plot_file_features_dc3 = os.path.join(pca_test_dir, f'diffusion_map_{organism_name}_features_vs_dc3.png')
+        plt.savefig(plot_file_features_dc3, dpi=300, bbox_inches='tight')
+        print(f"Saved feature vs DC3 plots to {plot_file_features_dc3}")
+        plt.close()
+        
+        # Feature vs DC4 (if available)
+        if n_diffusion_components >= 4:
+            fig, axes = plt.subplots(n_rows, n_cols, figsize=(6*n_cols, 4*n_rows))
+            if n_features == 1:
+                axes = [axes]
+            else:
+                axes = axes.flatten()
+            
+            for i, feat in enumerate(available_features):
+                ax = axes[i]
+                feat_values = data_frame[feat].values
+                
+                ax.scatter(diffusion_coords[:, 3], feat_values, 
+                          alpha=0.3, s=10, c='gray', label='All points')
+                
+                if len(mimic_indices) > 0:
+                    ax.scatter(diffusion_coords[mimic_indices, 3], feat_values[mimic_indices],
+                              c='lime', s=200, marker='o', label=f'Mimics (n={len(mimic_indices)})', 
+                              edgecolors='black', linewidths=1.5, alpha=0.9, zorder=4)
+                
+                if len(candidate_indices) > 0:
+                    ax.scatter(diffusion_coords[candidate_indices, 3], feat_values[candidate_indices],
+                              c='cyan', s=200, marker='s', label=f'Candidates (n={len(candidate_indices)})', 
+                              edgecolors='black', linewidths=1.5, alpha=0.9, zorder=4)
+                
+                ax.set_xlabel('Diffusion Coordinate 4 (DC4)')
+                ax.set_ylabel(feat)
+                ax.set_title(f'{feat} vs DC4')
+                ax.legend(loc='best', fontsize=8)
+                ax.grid(True, alpha=0.3)
+            
+            # Hide unused subplots
+            for i in range(n_features, len(axes)):
+                axes[i].axis('off')
+            
+            plt.tight_layout()
+            plot_file_features_dc4 = os.path.join(pca_test_dir, f'diffusion_map_{organism_name}_features_vs_dc4.png')
+            plt.savefig(plot_file_features_dc4, dpi=300, bbox_inches='tight')
+            print(f"Saved feature vs DC4 plots to {plot_file_features_dc4}")
+            plt.close()
+    
+    # Summary statistics
+    print(f"\nDC1 Statistics:")
+    print(f"  Mean: {np.mean(diffusion_coords[:, 0]):.4f}")
+    print(f"  Std: {np.std(diffusion_coords[:, 0]):.4f}")
+    print(f"  Min: {np.min(diffusion_coords[:, 0]):.4f}")
+    print(f"  Max: {np.max(diffusion_coords[:, 0]):.4f}")
+    print(f"  Range: {np.max(diffusion_coords[:, 0]) - np.min(diffusion_coords[:, 0]):.4f}")
+    
+    if len(eigenvalues) >= 2 if eigenvalues is not None else False:
+        dc1_variance = np.var(diffusion_coords[:, 0])
+        dc2_variance = np.var(diffusion_coords[:, 1])
+        variance_ratio = dc1_variance / dc2_variance if dc2_variance > 0 else np.inf
+        print(f"\nVariance Analysis:")
+        print(f"  DC1 variance: {dc1_variance:.4f}")
+        print(f"  DC2 variance: {dc2_variance:.4f}")
+        print(f"  DC1/DC2 variance ratio: {variance_ratio:.4f}")
+        if variance_ratio > 5:
+            print(f"  → DC1 dominates; DC2 likely noise correction")
+        elif variance_ratio < 2:
+            print(f"  → DC2 contains significant signal; consider 2D analysis")
+    
+    print("\n" + "="*60)
+    
+    # ============================================================
+    # Distance from Attractor Analysis
+    # ============================================================
+    print("\n" + "="*60)
+    print("Distance from Attractor Analysis")
+    print("="*60)
+    
+    # Find reference point in dense region (attractor)
+    # Default: use highest local density among known mimics
+    # With --natural_attractor flag: use highest local density among all samples
+    if use_natural_attractor:
+        # Use natural attractor (highest density among all samples)
+        from sklearn.neighbors import NearestNeighbors
+        n_neighbors_density = min(50, len(diffusion_coords) // 10)
+        nn = NearestNeighbors(n_neighbors=n_neighbors_density)
+        nn.fit(diffusion_coords[:, :2])  # Use DC1 and DC2
+        distances_to_neighbors, _ = nn.kneighbors(diffusion_coords[:, :2])
+        local_density = 1.0 / (distances_to_neighbors.mean(axis=1) + 1e-10)
+        attractor_idx = np.argmax(local_density)
+        attractor_coords = diffusion_coords[attractor_idx, :2]
+        print(f"Attractor point (natural/highest density among all samples): index {attractor_idx}")
+        print(f"  DC1: {attractor_coords[0]:.4f}, DC2: {attractor_coords[1]:.4f}")
+        print(f"  Local density: {local_density[attractor_idx]:.4f}")
+    elif len(mimic_indices) > 0:
+        # Use mimic-based attractor (highest density among known mimics) - DEFAULT
+        # This ensures the attractor represents where mimics cluster, not just where all data clusters
+        # Get mimic coordinates in 2D diffusion space
+        mimic_coords_2d = diffusion_coords[mimic_indices, :2]
+        
+        # Compute local density among mimics only
+        from sklearn.neighbors import NearestNeighbors
+        n_neighbors_density = min(len(mimic_indices) - 1, 10)  # Use fewer neighbors for mimics
+        if n_neighbors_density < 1:
+            n_neighbors_density = 1
+        
+        if len(mimic_indices) > 1:
+            nn = NearestNeighbors(n_neighbors=n_neighbors_density + 1)  # +1 to exclude self
+            nn.fit(mimic_coords_2d)
+            distances_to_neighbors, _ = nn.kneighbors(mimic_coords_2d)
+            # Local density = inverse of mean distance to neighbors (exclude self, distance 0)
+            local_density_mimics = 1.0 / (distances_to_neighbors[:, 1:].mean(axis=1) + 1e-10)
+            
+            # Find mimic with highest density (attractor)
+            mimic_attractor_idx = np.argmax(local_density_mimics)
+            attractor_idx = mimic_indices[mimic_attractor_idx]
+            attractor_coords = diffusion_coords[attractor_idx, :2]
+            
+            print(f"Attractor point (highest density among known mimics): index {attractor_idx}")
+            print(f"  Mimic query: {data_frame.iloc[attractor_idx]['query']}")
+            print(f"  DC1: {attractor_coords[0]:.4f}, DC2: {attractor_coords[1]:.4f}")
+            print(f"  Local density (among mimics): {local_density_mimics[mimic_attractor_idx]:.4f}")
+            print(f"  Total mimics used: {len(mimic_indices)}")
+        else:
+            # Only one mimic, use it as attractor
+            attractor_idx = mimic_indices[0]
+            attractor_coords = diffusion_coords[attractor_idx, :2]
+            print(f"Attractor point (only one known mimic): index {attractor_idx}")
+            print(f"  Mimic query: {data_frame.iloc[attractor_idx]['query']}")
+            print(f"  DC1: {attractor_coords[0]:.4f}, DC2: {attractor_coords[1]:.4f}")
+    else:
+        # Fallback: no mimics found, use highest density among all samples
+        print("Warning: No known mimics found. Using highest density among all samples as attractor.")
+        from sklearn.neighbors import NearestNeighbors
+        n_neighbors_density = min(50, len(diffusion_coords) // 10)
+        nn = NearestNeighbors(n_neighbors=n_neighbors_density)
+        nn.fit(diffusion_coords[:, :2])
+        distances_to_neighbors, _ = nn.kneighbors(diffusion_coords[:, :2])
+        local_density = 1.0 / (distances_to_neighbors.mean(axis=1) + 1e-10)
+        attractor_idx = np.argmax(local_density)
+        attractor_coords = diffusion_coords[attractor_idx, :2]
+        print(f"Attractor point (highest density among all samples): index {attractor_idx}")
+        print(f"  DC1: {attractor_coords[0]:.4f}, DC2: {attractor_coords[1]:.4f}")
+        print(f"  Local density: {local_density[attractor_idx]:.4f}")
+    
+    # Compute Euclidean distance in (DC1, DC2) space from attractor
+    distances_from_attractor = np.sqrt(
+        (diffusion_coords[:, 0] - attractor_coords[0])**2 + 
+        (diffusion_coords[:, 1] - attractor_coords[1])**2
+    )
+    
+    # Also compute diffusion distance if we have the transition matrix
+    # Diffusion distance: d²(x,y) = Σᵢ (ψᵢ(x) - ψᵢ(y))² / λᵢ
+    # where ψᵢ are eigenvectors and λᵢ are eigenvalues
+    # Note: eigenvalues array already starts from index 1 (DC1), so index 0 in eigenvalues = DC1
+    diffusion_distances = None
+    if eigenvalues is not None and len(eigenvalues) >= 1:
+        # Use first few components for diffusion distance
+        # eigenvalues already excludes DC0, so we can use indices 0, 1, 2, ...
+        # eigenvecs[:, 1:] corresponds to DC1, DC2, ... (skipping DC0 at index 0)
+        max_available_eigenvals = len(eigenvalues)
+        if eigenvecs is not None:
+            max_available_eigenvecs = eigenvecs.shape[1] - 1  # -1 because we skip eigenvector 0 (DC0)
+            max_available = min(max_available_eigenvals, max_available_eigenvecs)
+        else:
+            max_available = max_available_eigenvals
+        
+        n_components_dist = min(5, max_available)
+        if n_components_dist > 0 and n_samples < 5000:  # Only if we computed exact eigenvectors
+            # Ensure we have enough eigenvalues and eigenvectors
+            if len(eigenvalues) >= n_components_dist and eigenvecs is not None and eigenvecs.shape[1] > n_components_dist:
+                # eigenvecs[:, 1:n_components_dist+1] gives DC1, DC2, ..., DC(n_components_dist)
+                # eigenvalues[0:n_components_dist] gives λ1, λ2, ..., λ(n_components_dist)
+                attractor_eigenvec = eigenvecs[attractor_idx, 1:n_components_dist+1]
+                all_eigenvecs = eigenvecs[:, 1:n_components_dist+1]
+                eigenvals_dist = eigenvalues[0:n_components_dist]
+                
+                # Ensure shapes match
+                if all_eigenvecs.shape[1] == len(eigenvals_dist):
+                    # Diffusion distance: weighted by 1/λ (higher weight for larger eigenvalues)
+                    diff_vec = all_eigenvecs - attractor_eigenvec
+                    diffusion_distances = np.sqrt(np.sum((diff_vec**2) / eigenvals_dist[np.newaxis, :], axis=1))
+                    print(f"Computed diffusion distances using {n_components_dist} components")
+                else:
+                    print(f"  (Shape mismatch: eigenvecs has {all_eigenvecs.shape[1]} components, eigenvalues has {len(eigenvals_dist)}. Skipping diffusion distance.)")
+            else:
+                print(f"  (Not enough eigenvalues/eigenvectors: have {len(eigenvalues)} eigenvalues, {eigenvecs.shape[1]-1 if eigenvecs is not None else 0} eigenvectors. Skipping diffusion distance.)")
+        else:
+            print("  (Diffusion distance not computed - using SpectralEmbedding approximation)")
+    
+    # Add to results
+    results_df['distance_from_attractor_euclidean'] = distances_from_attractor
+    if diffusion_distances is not None:
+        results_df['distance_from_attractor_diffusion'] = diffusion_distances
+    
+    # Use diffusion distance for plateau analysis if available, otherwise fall back to Euclidean
+    if diffusion_distances is not None:
+        distances_for_plateau = diffusion_distances
+        distance_type = "Diffusion"
+        print(f"\nUsing DIFFUSION DISTANCE for plateau analysis")
+    else:
+        distances_for_plateau = distances_from_attractor
+        distance_type = "Euclidean"
+        print(f"\nUsing EUCLIDEAN DISTANCE for plateau analysis (diffusion distance not available)")
+    
+    print(f"\nDistance Statistics ({distance_type} distance):")
+    print(f"  Mean: {np.mean(distances_for_plateau):.4f}")
+    print(f"  Std: {np.std(distances_for_plateau):.4f}")
+    print(f"  Min: {np.min(distances_for_plateau):.4f}")
+    print(f"  Max: {np.max(distances_for_plateau):.4f}")
+    
+    # Also report Euclidean for reference
+    print(f"\nDistance Statistics (Euclidean in DC1,DC2 space - for reference):")
+    print(f"  Mean: {np.mean(distances_from_attractor):.4f}")
+    print(f"  Std: {np.std(distances_from_attractor):.4f}")
+    print(f"  Min: {np.min(distances_from_attractor):.4f}")
+    print(f"  Max: {np.max(distances_from_attractor):.4f}")
+    
+    # ============================================================
+    # Feature Dynamics Analysis
+    # ============================================================
+    print("\n" + "="*60)
+    print("Feature Dynamics Along Diffusion Space")
+    print("="*60)
+    
+    # Plot features against DC1, DC2, and distance-to-attractor
+    feature_cols = ['score', 'fident', 'algn_fraction', 'tcov', 'qcov']
+    available_features = [col for col in feature_cols if col in data_frame.columns]
+    
+    if len(available_features) > 0:
+        # Create comprehensive feature dynamics plot
+        n_features = len(available_features)
+        n_cols = 3  # DC1, DC2, distance
+        n_rows = n_features
+        
+        fig, axes = plt.subplots(n_rows, n_cols, figsize=(18, 5*n_rows))
+        if n_rows == 1:
+            axes = axes.reshape(1, -1)
+        
+        for i, feat in enumerate(available_features):
+            feat_values = data_frame[feat].values
+            
+            # Plot vs DC1
+            ax = axes[i, 0]
+            ax.scatter(diffusion_coords[:, 0], feat_values, 
+                      alpha=0.5, s=10, c=dc1_pseudotime, cmap='viridis')
+            if len(mimic_indices) > 0:
+                ax.scatter(diffusion_coords[mimic_indices, 0], feat_values[mimic_indices],
+                          c='lime', s=100, marker='o', edgecolors='black', 
+                          linewidths=1.5, alpha=0.9, label='Mimics', zorder=5)
+            if len(candidate_indices) > 0:
+                ax.scatter(diffusion_coords[candidate_indices, 0], feat_values[candidate_indices],
+                          c='cyan', s=100, marker='s', edgecolors='black', 
+                          linewidths=1.5, alpha=0.9, label='Candidates', zorder=5)
+            ax.set_xlabel('DC1')
+            ax.set_ylabel(feat)
+            ax.set_title(f'{feat} vs DC1')
+            if i == 0:
+                ax.legend(loc='best')
+            ax.grid(True, alpha=0.3)
+            
+            # Plot vs DC2
+            ax = axes[i, 1]
+            ax.scatter(diffusion_coords[:, 1], feat_values, 
+                      alpha=0.5, s=10, c=dc1_pseudotime, cmap='viridis')
+            if len(mimic_indices) > 0:
+                ax.scatter(diffusion_coords[mimic_indices, 1], feat_values[mimic_indices],
+                          c='lime', s=100, marker='o', edgecolors='black', 
+                          linewidths=1.5, alpha=0.9, label='Mimics', zorder=5)
+            if len(candidate_indices) > 0:
+                ax.scatter(diffusion_coords[candidate_indices, 1], feat_values[candidate_indices],
+                          c='cyan', s=100, marker='s', edgecolors='black', 
+                          linewidths=1.5, alpha=0.9, label='Candidates', zorder=5)
+            ax.set_xlabel('DC2')
+            ax.set_ylabel(feat)
+            ax.set_title(f'{feat} vs DC2')
+            ax.grid(True, alpha=0.3)
+            
+            # Plot vs distance from attractor (using diffusion distance if available)
+            ax = axes[i, 2]
+            ax.scatter(distances_for_plateau, feat_values, 
+                      alpha=0.5, s=10, c=dc1_pseudotime, cmap='viridis')
+            if len(mimic_indices) > 0:
+                ax.scatter(distances_for_plateau[mimic_indices], feat_values[mimic_indices],
+                          c='lime', s=100, marker='o', edgecolors='black', 
+                          linewidths=1.5, alpha=0.9, label='Mimics', zorder=5)
+            if len(candidate_indices) > 0:
+                ax.scatter(distances_for_plateau[candidate_indices], feat_values[candidate_indices],
+                          c='cyan', s=100, marker='s', edgecolors='black', 
+                          linewidths=1.5, alpha=0.9, label='Candidates', zorder=5)
+            ax.set_xlabel(f'Distance from Attractor ({distance_type})')
+            ax.set_ylabel(feat)
+            ax.set_title(f'{feat} vs Distance from Attractor ({distance_type})')
+            ax.grid(True, alpha=0.3)
+            
+            # Analyze feature dynamics: check for plateau vs variation
+            # Divide distance into bins and check variance within dense region
+            n_bins = 10
+            bin_edges = np.linspace(0, np.max(distances_for_plateau), n_bins+1)
+            bin_centers = (bin_edges[:-1] + bin_edges[1:]) / 2
+            bin_vars = []
+            bin_means = []
+            bin_counts = []
+            
+            for j in range(n_bins):
+                mask = (distances_for_plateau >= bin_edges[j]) & (distances_for_plateau < bin_edges[j+1])
+                if j == n_bins - 1:  # Include last point
+                    mask = (distances_for_plateau >= bin_edges[j]) & (distances_for_plateau <= bin_edges[j+1])
+                if mask.sum() > 0:
+                    bin_vars.append(np.var(feat_values[mask]))
+                    bin_means.append(np.mean(feat_values[mask]))
+                    bin_counts.append(mask.sum())
+                else:
+                    bin_vars.append(np.nan)
+                    bin_means.append(np.nan)
+                    bin_counts.append(0)
+            
+            # Check if feature plateaus in dense region (low distance)
+            # Compare variance in closest 30% vs farthest 30%
+            sorted_indices = np.argsort(distances_from_attractor)
+            n_close = int(len(sorted_indices) * 0.3)
+            n_far = int(len(sorted_indices) * 0.3)
+            
+            close_var = np.var(feat_values[sorted_indices[:n_close]])
+            far_var = np.var(feat_values[sorted_indices[-n_far:]])
+            close_mean = np.mean(feat_values[sorted_indices[:n_close]])
+            far_mean = np.mean(feat_values[sorted_indices[-n_far:]])
+            
+            # Add trend line to plot
+            if len(bin_centers) > 0 and not np.isnan(bin_means).all():
+                valid_mask = ~np.isnan(bin_means)
+                if valid_mask.sum() > 1:
+                    ax.plot(bin_centers[valid_mask], np.array(bin_means)[valid_mask], 
+                           'r-', linewidth=2, alpha=0.7, label='Mean trend')
+                    if i == 0:
+                        ax.legend(loc='best')
+        
+        plt.tight_layout()
+        plot_file_dynamics = os.path.join(pca_test_dir, f'diffusion_map_{organism_name}_feature_dynamics.png')
+        plt.savefig(plot_file_dynamics, dpi=300, bbox_inches='tight')
+        print(f"Saved feature dynamics plots to {plot_file_dynamics}")
+        plt.close()
+        
+        # Print analysis for each feature and collect results
+        print(f"\nFeature Dynamics Analysis (Plateau Detection):")
+        print("="*60)
+        
+        plateau_results = []
+        
+        for i, feat in enumerate(available_features):
+            feat_values = data_frame[feat].values
+            sorted_indices = np.argsort(distances_for_plateau)
+            n_close = int(len(sorted_indices) * 0.3)
+            n_far = int(len(sorted_indices) * 0.3)
+            
+            close_var = np.var(feat_values[sorted_indices[:n_close]])
+            far_var = np.var(feat_values[sorted_indices[-n_far:]])
+            close_mean = np.mean(feat_values[sorted_indices[:n_close]])
+            far_mean = np.mean(feat_values[sorted_indices[-n_far:]])
+            total_var = np.var(feat_values)
+            
+            # Additional metrics for plateau detection
+            # 1. Variance ratio (close/far)
+            var_ratio = close_var / far_var if far_var > 0 else np.inf
+            
+            # 2. Coefficient of variation in close region
+            close_std = np.std(feat_values[sorted_indices[:n_close]])
+            close_cv = close_std / close_mean if close_mean != 0 else np.inf
+            
+            # 3. Slope estimate (linear regression on binned means)
+            # Use bins computed earlier
+            bin_edges = np.linspace(0, np.max(distances_for_plateau), 11)
+            bin_centers = (bin_edges[:-1] + bin_edges[1:]) / 2
+            bin_means = []
+            for j in range(10):
+                mask = (distances_for_plateau >= bin_edges[j]) & (distances_for_plateau < bin_edges[j+1])
+                if j == 9:
+                    mask = (distances_for_plateau >= bin_edges[j]) & (distances_for_plateau <= bin_edges[j+1])
+                if mask.sum() > 0:
+                    bin_means.append(np.mean(feat_values[mask]))
+                else:
+                    bin_means.append(np.nan)
+            
+            # Compute slope (rate of change)
+            valid_bins = ~np.isnan(bin_means)
+            if valid_bins.sum() > 1:
+                slope, intercept = np.polyfit(bin_centers[valid_bins], np.array(bin_means)[valid_bins], 1)
+            else:
+                slope = np.nan
+            
+            # 4. Plateau score: low variance in close region relative to total
+            plateau_score = 1.0 - (close_var / total_var) if total_var > 0 else 0.0
+            
+            # Classification
+            if close_var < 0.01 * total_var and abs(slope) < 0.1 * np.std(feat_values):
+                classification = "Strong Plateau (Terminal Regime)"
+                plateau_detected = True
+            elif close_var < 0.05 * total_var:
+                classification = "Moderate Plateau"
+                plateau_detected = True
+            elif close_var > 0.5 * total_var:
+                classification = "No Plateau (Unresolved/Noise)"
+                plateau_detected = False
+            else:
+                classification = "Variable (Some Structure)"
+                plateau_detected = False
+            
+            print(f"\n  {feat}:")
+            print(f"    Close to attractor (30%): mean={close_mean:.4f}, std={close_std:.4f}, var={close_var:.4f}")
+            print(f"    Far from attractor (30%): mean={far_mean:.4f}, var={far_var:.4f}")
+            print(f"    Variance ratio (close/far): {var_ratio:.4f}")
+            print(f"    Coefficient of variation (close): {close_cv:.4f}")
+            print(f"    Slope (feature change per distance unit): {slope:.6f}")
+            print(f"    Plateau score: {plateau_score:.4f} (1.0 = perfect plateau)")
+            print(f"    → {classification}")
+            
+            plateau_results.append({
+                'feature': feat,
+                'close_mean': close_mean,
+                'close_std': close_std,
+                'close_var': close_var,
+                'far_mean': far_mean,
+                'far_var': far_var,
+                'var_ratio': var_ratio,
+                'close_cv': close_cv,
+                'slope': slope,
+                'plateau_score': plateau_score,
+                'classification': classification,
+                'plateau_detected': plateau_detected
+            })
+        
+        # Save plateau detection results
+        plateau_df = pd.DataFrame(plateau_results)
+        plateau_file = os.path.join(pca_test_dir, f'{organism_name}_plateau_detection.csv')
+        plateau_df.to_csv(plateau_file, index=False)
+        print(f"\n✓ Plateau detection results saved to: {plateau_file}")
+        
+        # Summary
+        n_plateaus = plateau_df['plateau_detected'].sum()
+        print(f"\nSummary:")
+        print(f"  Features with plateaus: {n_plateaus}/{len(available_features)}")
+        if n_plateaus > 0:
+            plateau_features = plateau_df[plateau_df['plateau_detected']]['feature'].tolist()
+            print(f"  Plateau features: {', '.join(plateau_features)}")
+        
+        # Create compact plateau visualization for PowerPoint
+        # Layout: 2 plots on left, 3 plots on right, summary stats in middle/bottom
+        if len(available_features) > 0:
+            from matplotlib.gridspec import GridSpec
+            
+            # Create figure optimized for PowerPoint (10x7.5 inches, 16:9 aspect ratio)
+            fig = plt.figure(figsize=(10, 7.5))
+            gs = GridSpec(3, 3, figure=fig, hspace=0.4, wspace=0.4, 
+                         left=0.08, right=0.95, top=0.95, bottom=0.08)
+            
+            # Left column: 2 plots stacked
+            plot_axes_left = []
+            if len(available_features) >= 1:
+                plot_axes_left.append(fig.add_subplot(gs[0, 0]))
+            if len(available_features) >= 2:
+                plot_axes_left.append(fig.add_subplot(gs[1, 0]))
+            
+            # Right column: 3 plots stacked
+            plot_axes_right = []
+            if len(available_features) >= 3:
+                plot_axes_right.append(fig.add_subplot(gs[0, 2]))
+            if len(available_features) >= 4:
+                plot_axes_right.append(fig.add_subplot(gs[1, 2]))
+            if len(available_features) >= 5:
+                plot_axes_right.append(fig.add_subplot(gs[2, 2]))
+            
+            # Middle column: Summary statistics
+            summary_ax = fig.add_subplot(gs[:, 1])
+            summary_ax.axis('off')
+            
+            # Helper function to create a single plateau plot
+            def create_plateau_plot(ax, feat, result, feat_values, distances_for_plateau, distance_type):
+                # Scatter plot
+                ax.scatter(distances_for_plateau, feat_values, 
+                          alpha=0.3, s=8, c='gray', label='All points')
+                
+                # Highlight close region
+                sorted_indices = np.argsort(distances_for_plateau)
+                n_close = int(len(sorted_indices) * 0.3)
+                close_mask = np.zeros(len(distances_for_plateau), dtype=bool)
+                close_mask[sorted_indices[:n_close]] = True
+                
+                ax.scatter(distances_for_plateau[close_mask], feat_values[close_mask],
+                          alpha=0.7, s=20, c='red', label='Close (30%)', zorder=5)
+                
+                # Add binned mean trend
+                bin_edges = np.linspace(0, np.max(distances_for_plateau), 11)
+                bin_centers = (bin_edges[:-1] + bin_edges[1:]) / 2
+                bin_means = []
+                bin_stds = []
+                for j in range(10):
+                    mask = (distances_for_plateau >= bin_edges[j]) & (distances_for_plateau < bin_edges[j+1])
+                    if j == 9:
+                        mask = (distances_for_plateau >= bin_edges[j]) & (distances_for_plateau <= bin_edges[j+1])
+                    if mask.sum() > 0:
+                        bin_means.append(np.mean(feat_values[mask]))
+                        bin_stds.append(np.std(feat_values[mask]))
+                    else:
+                        bin_means.append(np.nan)
+                        bin_stds.append(np.nan)
+                
+                valid_mask = ~np.isnan(bin_means)
+                if valid_mask.sum() > 1:
+                    ax.plot(bin_centers[valid_mask], np.array(bin_means)[valid_mask], 
+                           'b-', linewidth=2, alpha=0.8, label='Mean', zorder=4)
+                    ax.fill_between(bin_centers[valid_mask], 
+                                   np.array(bin_means)[valid_mask] - np.array(bin_stds)[valid_mask],
+                                   np.array(bin_means)[valid_mask] + np.array(bin_stds)[valid_mask],
+                                   alpha=0.15, color='blue')
+                
+                # Add plateau region highlight
+                close_threshold = np.percentile(distances_for_plateau, 30)
+                ax.axvspan(0, close_threshold, alpha=0.1, color='red')
+                
+                ax.set_xlabel(f'Distance ({distance_type})', fontsize=9)
+                ax.set_ylabel(feat, fontsize=9)
+                ax.set_title(f'{feat}: {result["classification"]}\nScore: {result["plateau_score"]:.3f}, Slope: {result["slope"]:.4f}', 
+                           fontsize=8)
+                ax.tick_params(labelsize=8)
+                ax.grid(True, alpha=0.3)
+            
+            # Plot left column (first 2 features)
+            for i, (feat, result) in enumerate(zip(available_features[:2], plateau_results[:2])):
+                if i < len(plot_axes_left):
+                    feat_values = data_frame[feat].values
+                    create_plateau_plot(plot_axes_left[i], feat, result, feat_values, distances_for_plateau, distance_type)
+            
+            # Plot right column (remaining features, up to 3)
+            for i, (feat, result) in enumerate(zip(available_features[2:5], plateau_results[2:5])):
+                if i < len(plot_axes_right):
+                    feat_values = data_frame[feat].values
+                    create_plateau_plot(plot_axes_right[i], feat, result, feat_values, distances_for_plateau, distance_type)
+            
+            # Add summary statistics in middle column
+            summary_text = "Plateau Detection Summary\n" + "="*40 + "\n\n"
+            summary_text += f"Distance Type: {distance_type}\n"
+            summary_text += f"Total Features: {len(available_features)}\n\n"
+            
+            n_plateaus = plateau_df['plateau_detected'].sum()
+            summary_text += f"Features with Plateaus: {n_plateaus}/{len(available_features)}\n\n"
+            
+            summary_text += "Feature Classifications:\n"
+            for _, row in plateau_df.iterrows():
+                status = "✓" if row['plateau_detected'] else "✗"
+                summary_text += f"  {status} {row['feature']:15s}: {row['classification']}\n"
+            
+            summary_text += "\n" + "="*40 + "\n"
+            summary_text += "Metrics Summary:\n\n"
+            summary_text += f"Avg Plateau Score: {plateau_df['plateau_score'].mean():.3f}\n"
+            summary_text += f"Avg Slope: {plateau_df['slope'].abs().mean():.6f}\n"
+            summary_text += f"Avg Var Ratio: {plateau_df['var_ratio'].mean():.3f}\n"
+            
+            summary_ax.text(0.1, 0.95, summary_text, transform=summary_ax.transAxes,
+                          fontsize=9, verticalalignment='top', family='monospace',
+                          bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.3))
+            
+            # Add overall title
+            fig.suptitle(f'Feature Plateau Analysis: Distance from Attractor ({distance_type})', 
+                        fontsize=12, fontweight='bold', y=0.98)
+            
+            plateau_plot_file = os.path.join(pca_test_dir, f'diffusion_map_{organism_name}_plateau_detection.png')
+            plt.savefig(plateau_plot_file, dpi=300, bbox_inches='tight')
+            print(f"✓ Plateau detection visualization saved to: {plateau_plot_file}")
+            plt.close()
+    
+    # ============================================================
+    # 3D Distance Plateau Analysis (DC1, DC2, DC3)
+    # ============================================================
+    if n_diffusion_components >= 3:
+        print("\n" + "="*60)
+        print("3D Distance Plateau Analysis (DC1-DC2-DC3)")
+        print("="*60)
+        
+        # Find attractor in 3D space (DC1, DC2, DC3)
+        # Use same method as 2D attractor (mimic-based or natural)
+        if use_natural_attractor:
+            # Use natural attractor (highest density among all samples)
+            n_neighbors_density_3d = min(50, len(diffusion_coords) // 10)
+            nn_3d = NearestNeighbors(n_neighbors=n_neighbors_density_3d)
+            nn_3d.fit(diffusion_coords[:, :3])  # Use DC1, DC2, DC3
+            distances_to_neighbors_3d, _ = nn_3d.kneighbors(diffusion_coords[:, :3])
+            local_density_3d = 1.0 / (distances_to_neighbors_3d.mean(axis=1) + 1e-10)
+            attractor_idx_3d = np.argmax(local_density_3d)
+            attractor_coords_3d = diffusion_coords[attractor_idx_3d, :3]
+            print(f"3D Attractor point (natural/highest density among all samples): index {attractor_idx_3d}")
+            print(f"  DC1: {attractor_coords_3d[0]:.4f}, DC2: {attractor_coords_3d[1]:.4f}, DC3: {attractor_coords_3d[2]:.4f}")
+            print(f"  Local density: {local_density_3d[attractor_idx_3d]:.4f}")
+        elif len(mimic_indices) > 0:
+            # Use mimic-based attractor (highest density among known mimics) - DEFAULT
+            # Get mimic coordinates in 3D diffusion space
+            mimic_coords_3d = diffusion_coords[mimic_indices, :3]
+            
+            # Compute local density among mimics only
+            n_neighbors_density_3d = min(len(mimic_indices) - 1, 10)
+            if n_neighbors_density_3d < 1:
+                n_neighbors_density_3d = 1
+            
+            if len(mimic_indices) > 1:
+                nn_3d = NearestNeighbors(n_neighbors=n_neighbors_density_3d + 1)  # +1 to exclude self
+                nn_3d.fit(mimic_coords_3d)
+                distances_to_neighbors_3d, _ = nn_3d.kneighbors(mimic_coords_3d)
+                # Local density = inverse of mean distance to neighbors (exclude self)
+                local_density_3d_mimics = 1.0 / (distances_to_neighbors_3d[:, 1:].mean(axis=1) + 1e-10)
+                
+                # Find mimic with highest density in 3D space
+                mimic_attractor_idx_3d = np.argmax(local_density_3d_mimics)
+                attractor_idx_3d = mimic_indices[mimic_attractor_idx_3d]
+                attractor_coords_3d = diffusion_coords[attractor_idx_3d, :3]
+                print(f"3D Attractor point (highest density among known mimics): index {attractor_idx_3d}")
+                print(f"  Mimic query: {data_frame.iloc[attractor_idx_3d]['query']}")
+                print(f"  DC1: {attractor_coords_3d[0]:.4f}, DC2: {attractor_coords_3d[1]:.4f}, DC3: {attractor_coords_3d[2]:.4f}")
+                print(f"  Local density (among mimics): {local_density_3d_mimics[mimic_attractor_idx_3d]:.4f}")
+            else:
+                # Only one mimic, use it as attractor
+                attractor_idx_3d = mimic_indices[0]
+                attractor_coords_3d = diffusion_coords[attractor_idx_3d, :3]
+                print(f"3D Attractor point (only one known mimic): index {attractor_idx_3d}")
+                print(f"  Mimic query: {data_frame.iloc[attractor_idx_3d]['query']}")
+                print(f"  DC1: {attractor_coords_3d[0]:.4f}, DC2: {attractor_coords_3d[1]:.4f}, DC3: {attractor_coords_3d[2]:.4f}")
+        else:
+            # Fallback: no mimics found, use highest density among all samples
+            print("Warning: No known mimics found. Using highest density among all samples as 3D attractor.")
+            n_neighbors_density_3d = min(50, len(diffusion_coords) // 10)
+            nn_3d = NearestNeighbors(n_neighbors=n_neighbors_density_3d)
+            nn_3d.fit(diffusion_coords[:, :3])
+            distances_to_neighbors_3d, _ = nn_3d.kneighbors(diffusion_coords[:, :3])
+            local_density_3d = 1.0 / (distances_to_neighbors_3d.mean(axis=1) + 1e-10)
+            attractor_idx_3d = np.argmax(local_density_3d)
+            attractor_coords_3d = diffusion_coords[attractor_idx_3d, :3]
+            print(f"3D Attractor point (highest density among all samples): index {attractor_idx_3d}")
+            print(f"  DC1: {attractor_coords_3d[0]:.4f}, DC2: {attractor_coords_3d[1]:.4f}, DC3: {attractor_coords_3d[2]:.4f}")
+            print(f"  Local density: {local_density_3d[attractor_idx_3d]:.4f}")
+        
+        # Compute Euclidean distance in (DC1, DC2, DC3) space from attractor
+        distances_from_attractor_3d_euclidean = np.sqrt(
+            (diffusion_coords[:, 0] - attractor_coords_3d[0])**2 + 
+            (diffusion_coords[:, 1] - attractor_coords_3d[1])**2 +
+            (diffusion_coords[:, 2] - attractor_coords_3d[2])**2
+        )
+        
+        # Compute 3D diffusion distance if available
+        # Note: eigenvalues array already starts from index 1 (DC1), so index 0 in eigenvalues = DC1
+        diffusion_distances_3d = None
+        if eigenvalues is not None and len(eigenvalues) >= 3:
+            max_available_eigenvals = len(eigenvalues)
+            if eigenvecs is not None:
+                max_available_eigenvecs = eigenvecs.shape[1] - 1  # -1 because we skip eigenvector 0 (DC0)
+                max_available = min(max_available_eigenvals, max_available_eigenvecs)
+            else:
+                max_available = max_available_eigenvals
+            
+            n_components_dist_3d = min(3, max_available)
+            if n_components_dist_3d > 0 and n_samples < 5000:  # Only if we computed exact eigenvectors
+                if len(eigenvalues) >= n_components_dist_3d and eigenvecs is not None and eigenvecs.shape[1] > n_components_dist_3d:
+                    # eigenvecs[:, 1:n_components_dist_3d+1] gives DC1, DC2, DC3
+                    # eigenvalues[0:n_components_dist_3d] gives λ1, λ2, λ3
+                    attractor_eigenvec_3d = eigenvecs[attractor_idx_3d, 1:n_components_dist_3d+1]
+                    all_eigenvecs_3d = eigenvecs[:, 1:n_components_dist_3d+1]
+                    eigenvals_dist_3d = eigenvalues[0:n_components_dist_3d]
+                    
+                    # Ensure shapes match
+                    if all_eigenvecs_3d.shape[1] == len(eigenvals_dist_3d):
+                        # Diffusion distance: weighted by 1/λ (higher weight for larger eigenvalues)
+                        diff_vec_3d = all_eigenvecs_3d - attractor_eigenvec_3d
+                        diffusion_distances_3d = np.sqrt(np.sum((diff_vec_3d**2) / eigenvals_dist_3d[np.newaxis, :], axis=1))
+                        print(f"Computed 3D diffusion distances using {n_components_dist_3d} components")
+                    else:
+                        print(f"  (Shape mismatch: eigenvecs has {all_eigenvecs_3d.shape[1]} components, eigenvalues has {len(eigenvals_dist_3d)}. Skipping 3D diffusion distance.)")
+                else:
+                    print(f"  (Not enough eigenvalues/eigenvectors: have {len(eigenvalues)} eigenvalues, {eigenvecs.shape[1]-1 if eigenvecs is not None else 0} eigenvectors. Skipping 3D diffusion distance.)")
+            else:
+                print("  (3D Diffusion distance not computed - using SpectralEmbedding approximation)")
+        
+        # Use diffusion distance for 3D plateau analysis if available, otherwise fall back to Euclidean
+        if diffusion_distances_3d is not None:
+            distances_for_plateau_3d = diffusion_distances_3d
+            distance_type_3d = "Diffusion"
+            print(f"Using 3D DIFFUSION DISTANCE for plateau analysis")
+        else:
+            distances_for_plateau_3d = distances_from_attractor_3d_euclidean
+            distance_type_3d = "Euclidean"
+            print(f"Using 3D EUCLIDEAN DISTANCE for plateau analysis (diffusion distance not available)")
+        
+        # Add to results DataFrame
+        results_df['distance_from_attractor_3d_euclidean'] = distances_from_attractor_3d_euclidean
+        if diffusion_distances_3d is not None:
+            results_df['distance_from_attractor_3d_diffusion'] = diffusion_distances_3d
+        
+        print(f"\n3D Distance Statistics ({distance_type_3d} distance):")
+        print(f"  Mean: {np.mean(distances_for_plateau_3d):.4f}")
+        print(f"  Std: {np.std(distances_for_plateau_3d):.4f}")
+        print(f"  Min: {np.min(distances_for_plateau_3d):.4f}")
+        print(f"  Max: {np.max(distances_for_plateau_3d):.4f}")
+        
+        # Also report Euclidean for reference
+        print(f"\n3D Distance Statistics (Euclidean - for reference):")
+        print(f"  Mean: {np.mean(distances_from_attractor_3d_euclidean):.4f}")
+        print(f"  Std: {np.std(distances_from_attractor_3d_euclidean):.4f}")
+        print(f"  Min: {np.min(distances_from_attractor_3d_euclidean):.4f}")
+        print(f"  Max: {np.max(distances_from_attractor_3d_euclidean):.4f}")
+        
+        # Feature dynamics plots vs 3D distance
+        if len(available_features) > 0:
+            n_features = len(available_features)
+            n_cols = min(3, n_features)
+            n_rows = (n_features + n_cols - 1) // n_cols
+            
+            fig, axes = plt.subplots(n_rows, n_cols, figsize=(6*n_cols, 4*n_rows))
+            if n_features == 1:
+                axes = [axes]
+            else:
+                axes = axes.flatten()
+            
+            for i, feat in enumerate(available_features):
+                ax = axes[i]
+                feat_values = data_frame[feat].values
+                
+                ax.scatter(distances_for_plateau_3d, feat_values, 
+                          alpha=0.3, s=10, c='gray', label='All points')
+                
+                if len(mimic_indices) > 0:
+                    ax.scatter(distances_for_plateau_3d[mimic_indices], feat_values[mimic_indices],
+                              c='lime', s=200, marker='o', label=f'Mimics (n={len(mimic_indices)})', 
+                              edgecolors='black', linewidths=1.5, alpha=0.9, zorder=4)
+                
+                if len(candidate_indices) > 0:
+                    ax.scatter(distances_for_plateau_3d[candidate_indices], feat_values[candidate_indices],
+                              c='cyan', s=200, marker='s', label=f'Candidates (n={len(candidate_indices)})', 
+                              edgecolors='black', linewidths=1.5, alpha=0.9, zorder=4)
+                
+                # Add binned mean trend
+                n_bins = 20
+                bin_edges = np.linspace(0, np.max(distances_for_plateau_3d), n_bins+1)
+                bin_centers = (bin_edges[:-1] + bin_edges[1:]) / 2
+                bin_means = []
+                bin_stds = []
+                for j in range(n_bins):
+                    mask = (distances_for_plateau_3d >= bin_edges[j]) & (distances_for_plateau_3d < bin_edges[j+1])
+                    if j == n_bins - 1:
+                        mask = (distances_for_plateau_3d >= bin_edges[j]) & (distances_for_plateau_3d <= bin_edges[j+1])
+                    if mask.sum() > 0:
+                        bin_means.append(np.mean(feat_values[mask]))
+                        bin_stds.append(np.std(feat_values[mask]))
+                    else:
+                        bin_means.append(np.nan)
+                        bin_stds.append(np.nan)
+                
+                valid_mask = ~np.isnan(bin_means)
+                if valid_mask.sum() > 1:
+                    ax.plot(bin_centers[valid_mask], np.array(bin_means)[valid_mask], 
+                           'b-', linewidth=3, alpha=0.8, label='Binned mean', zorder=4)
+                    ax.fill_between(bin_centers[valid_mask], 
+                                   np.array(bin_means)[valid_mask] - np.array(bin_stds)[valid_mask],
+                                   np.array(bin_means)[valid_mask] + np.array(bin_stds)[valid_mask],
+                                   alpha=0.2, color='blue', label='±1 std')
+                
+                ax.set_xlabel(f'Distance from Attractor (3D: DC1-DC2-DC3, {distance_type_3d})')
+                ax.set_ylabel(feat)
+                ax.set_title(f'{feat} vs 3D Distance ({distance_type_3d})')
+                ax.legend(loc='best', fontsize=8)
+                ax.grid(True, alpha=0.3)
+            
+            # Hide unused subplots
+            for i in range(n_features, len(axes)):
+                axes[i].axis('off')
+            
+            plt.tight_layout()
+            plot_file_dynamics_3d = os.path.join(pca_test_dir, f'diffusion_map_{organism_name}_feature_dynamics_3d.png')
+            plt.savefig(plot_file_dynamics_3d, dpi=300, bbox_inches='tight')
+            print(f"Saved feature dynamics vs 3D distance plots to {plot_file_dynamics_3d}")
+            plt.close()
+        
+        # Plateau detection using 3D distance
+        print(f"\n3D Plateau Detection Analysis:")
+        print("="*60)
+        
+        plateau_results_3d = []
+        
+        for i, feat in enumerate(available_features):
+            feat_values = data_frame[feat].values
+            sorted_indices = np.argsort(distances_for_plateau_3d)
+            n_close = int(len(sorted_indices) * 0.3)
+            n_far = int(len(sorted_indices) * 0.3)
+            
+            close_var = np.var(feat_values[sorted_indices[:n_close]])
+            far_var = np.var(feat_values[sorted_indices[-n_far:]])
+            close_mean = np.mean(feat_values[sorted_indices[:n_close]])
+            far_mean = np.mean(feat_values[sorted_indices[-n_far:]])
+            total_var = np.var(feat_values)
+            
+            # Additional metrics for plateau detection
+            var_ratio = close_var / far_var if far_var > 0 else np.inf
+            
+            close_std = np.std(feat_values[sorted_indices[:n_close]])
+            close_cv = close_std / close_mean if close_mean != 0 else np.inf
+            
+            # Slope estimate (linear regression on binned means)
+            bin_edges = np.linspace(0, np.max(distances_for_plateau_3d), 11)
+            bin_centers = (bin_edges[:-1] + bin_edges[1:]) / 2
+            bin_means = []
+            for j in range(10):
+                mask = (distances_for_plateau_3d >= bin_edges[j]) & (distances_for_plateau_3d < bin_edges[j+1])
+                if j == 9:
+                    mask = (distances_for_plateau_3d >= bin_edges[j]) & (distances_for_plateau_3d <= bin_edges[j+1])
+                if mask.sum() > 0:
+                    bin_means.append(np.mean(feat_values[mask]))
+                else:
+                    bin_means.append(np.nan)
+            
+            valid_bins = ~np.isnan(bin_means)
+            if valid_bins.sum() > 1:
+                slope, intercept = np.polyfit(bin_centers[valid_bins], np.array(bin_means)[valid_bins], 1)
+            else:
+                slope = np.nan
+            
+            # Plateau score: low variance in close region relative to total
+            plateau_score = 1.0 - (close_var / total_var) if total_var > 0 else 0.0
+            
+            # Classification
+            if close_var < 0.01 * total_var and abs(slope) < 0.1 * np.std(feat_values):
+                classification = "Strong Plateau (Terminal Regime)"
+                plateau_detected = True
+            elif close_var < 0.05 * total_var:
+                classification = "Moderate Plateau"
+                plateau_detected = True
+            elif close_var > 0.5 * total_var:
+                classification = "No Plateau (Unresolved/Noise)"
+                plateau_detected = False
+            else:
+                classification = "Variable (Some Structure)"
+                plateau_detected = False
+            
+            print(f"\n  {feat} (3D distance):")
+            print(f"    Close to attractor (30%): mean={close_mean:.4f}, std={close_std:.4f}, var={close_var:.4f}")
+            print(f"    Far from attractor (30%): mean={far_mean:.4f}, var={far_var:.4f}")
+            print(f"    Variance ratio (close/far): {var_ratio:.4f}")
+            print(f"    Coefficient of variation (close): {close_cv:.4f}")
+            print(f"    Slope (feature change per distance unit): {slope:.6f}")
+            print(f"    Plateau score: {plateau_score:.4f} (1.0 = perfect plateau)")
+            print(f"    → {classification}")
+            
+            plateau_results_3d.append({
+                'feature': feat,
+                'close_mean': close_mean,
+                'close_std': close_std,
+                'close_var': close_var,
+                'far_mean': far_mean,
+                'far_var': far_var,
+                'var_ratio': var_ratio,
+                'close_cv': close_cv,
+                'slope': slope,
+                'plateau_score': plateau_score,
+                'classification': classification,
+                'plateau_detected': plateau_detected
+            })
+        
+        # Save 3D plateau detection results
+        plateau_df_3d = pd.DataFrame(plateau_results_3d)
+        plateau_file_3d = os.path.join(pca_test_dir, f'{organism_name}_plateau_detection_3d.csv')
+        plateau_df_3d.to_csv(plateau_file_3d, index=False)
+        print(f"\n✓ 3D plateau detection results saved to: {plateau_file_3d}")
+        
+        # Summary
+        n_plateaus_3d = plateau_df_3d['plateau_detected'].sum()
+        print(f"\n3D Plateau Summary:")
+        print(f"  Features with plateaus: {n_plateaus_3d}/{len(available_features)}")
+        if n_plateaus_3d > 0:
+            plateau_features_3d = plateau_df_3d[plateau_df_3d['plateau_detected']]['feature'].tolist()
+            print(f"  Plateau features: {', '.join(plateau_features_3d)}")
+        
+        # Create compact 3D plateau visualization for PowerPoint (same layout as 2D)
+        if len(available_features) > 0:
+            from matplotlib.gridspec import GridSpec
+            
+            # Create figure optimized for PowerPoint (10x7.5 inches)
+            fig = plt.figure(figsize=(10, 7.5))
+            gs = GridSpec(3, 3, figure=fig, hspace=0.4, wspace=0.4, 
+                         left=0.08, right=0.95, top=0.95, bottom=0.08)
+            
+            # Left column: 2 plots stacked
+            plot_axes_left = []
+            if len(available_features) >= 1:
+                plot_axes_left.append(fig.add_subplot(gs[0, 0]))
+            if len(available_features) >= 2:
+                plot_axes_left.append(fig.add_subplot(gs[1, 0]))
+            
+            # Right column: 3 plots stacked
+            plot_axes_right = []
+            if len(available_features) >= 3:
+                plot_axes_right.append(fig.add_subplot(gs[0, 2]))
+            if len(available_features) >= 4:
+                plot_axes_right.append(fig.add_subplot(gs[1, 2]))
+            if len(available_features) >= 5:
+                plot_axes_right.append(fig.add_subplot(gs[2, 2]))
+            
+            # Middle column: Summary statistics
+            summary_ax = fig.add_subplot(gs[:, 1])
+            summary_ax.axis('off')
+            
+            # Helper function to create a single 3D plateau plot
+            def create_plateau_plot_3d(ax, feat, result, feat_values, distances_for_plateau_3d, distance_type_3d):
+                # Scatter plot
+                ax.scatter(distances_for_plateau_3d, feat_values, 
+                          alpha=0.3, s=8, c='gray', label='All points')
+                
+                # Highlight close region
+                sorted_indices = np.argsort(distances_for_plateau_3d)
+                n_close = int(len(sorted_indices) * 0.3)
+                close_mask = np.zeros(len(distances_for_plateau_3d), dtype=bool)
+                close_mask[sorted_indices[:n_close]] = True
+                
+                ax.scatter(distances_for_plateau_3d[close_mask], feat_values[close_mask],
+                          alpha=0.7, s=20, c='red', label='Close (30%)', zorder=5)
+                
+                # Add binned mean trend
+                bin_edges = np.linspace(0, np.max(distances_for_plateau_3d), 11)
+                bin_centers = (bin_edges[:-1] + bin_edges[1:]) / 2
+                bin_means = []
+                bin_stds = []
+                for j in range(10):
+                    mask = (distances_for_plateau_3d >= bin_edges[j]) & (distances_for_plateau_3d < bin_edges[j+1])
+                    if j == 9:
+                        mask = (distances_for_plateau_3d >= bin_edges[j]) & (distances_for_plateau_3d <= bin_edges[j+1])
+                    if mask.sum() > 0:
+                        bin_means.append(np.mean(feat_values[mask]))
+                        bin_stds.append(np.std(feat_values[mask]))
+                    else:
+                        bin_means.append(np.nan)
+                        bin_stds.append(np.nan)
+                
+                valid_mask = ~np.isnan(bin_means)
+                if valid_mask.sum() > 1:
+                    ax.plot(bin_centers[valid_mask], np.array(bin_means)[valid_mask], 
+                           'b-', linewidth=2, alpha=0.8, label='Mean', zorder=4)
+                    ax.fill_between(bin_centers[valid_mask], 
+                                   np.array(bin_means)[valid_mask] - np.array(bin_stds)[valid_mask],
+                                   np.array(bin_means)[valid_mask] + np.array(bin_stds)[valid_mask],
+                                   alpha=0.15, color='blue')
+                
+                # Add plateau region highlight
+                close_threshold = np.percentile(distances_for_plateau_3d, 30)
+                ax.axvspan(0, close_threshold, alpha=0.1, color='red')
+                
+                ax.set_xlabel(f'Distance 3D ({distance_type_3d})', fontsize=9)
+                ax.set_ylabel(feat, fontsize=9)
+                ax.set_title(f'{feat}: {result["classification"]}\nScore: {result["plateau_score"]:.3f}, Slope: {result["slope"]:.4f}', 
+                           fontsize=8)
+                ax.tick_params(labelsize=8)
+                ax.grid(True, alpha=0.3)
+            
+            # Plot left column (first 2 features)
+            for i, (feat, result) in enumerate(zip(available_features[:2], plateau_results_3d[:2])):
+                if i < len(plot_axes_left):
+                    feat_values = data_frame[feat].values
+                    create_plateau_plot_3d(plot_axes_left[i], feat, result, feat_values, distances_for_plateau_3d, distance_type_3d)
+            
+            # Plot right column (remaining features, up to 3)
+            for i, (feat, result) in enumerate(zip(available_features[2:5], plateau_results_3d[2:5])):
+                if i < len(plot_axes_right):
+                    feat_values = data_frame[feat].values
+                    create_plateau_plot_3d(plot_axes_right[i], feat, result, feat_values, distances_for_plateau_3d, distance_type_3d)
+            
+            # Add summary statistics in middle column
+            summary_text = "3D Plateau Detection Summary\n" + "="*40 + "\n\n"
+            summary_text += f"Distance Type: {distance_type_3d}\n"
+            summary_text += f"Total Features: {len(available_features)}\n\n"
+            
+            n_plateaus_3d = plateau_df_3d['plateau_detected'].sum()
+            summary_text += f"Features with Plateaus: {n_plateaus_3d}/{len(available_features)}\n\n"
+            
+            summary_text += "Feature Classifications:\n"
+            for _, row in plateau_df_3d.iterrows():
+                status = "✓" if row['plateau_detected'] else "✗"
+                summary_text += f"  {status} {row['feature']:15s}: {row['classification']}\n"
+            
+            summary_text += "\n" + "="*40 + "\n"
+            summary_text += "Metrics Summary:\n\n"
+            summary_text += f"Avg Plateau Score: {plateau_df_3d['plateau_score'].mean():.3f}\n"
+            summary_text += f"Avg Slope: {plateau_df_3d['slope'].abs().mean():.6f}\n"
+            summary_text += f"Avg Var Ratio: {plateau_df_3d['var_ratio'].mean():.3f}\n"
+            
+            summary_ax.text(0.1, 0.95, summary_text, transform=summary_ax.transAxes,
+                          fontsize=9, verticalalignment='top', family='monospace',
+                          bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.3))
+            
+            # Add overall title
+            fig.suptitle(f'Feature Plateau Analysis: 3D Distance from Attractor ({distance_type_3d})', 
+                        fontsize=12, fontweight='bold', y=0.98)
+            
+            plateau_plot_file_3d = os.path.join(pca_test_dir, f'diffusion_map_{organism_name}_plateau_detection_3d.png')
+            plt.savefig(plateau_plot_file_3d, dpi=300, bbox_inches='tight')
+            print(f"✓ 3D plateau detection visualization saved to: {plateau_plot_file_3d}")
+            plt.close()
+    
+    # Update saved results with new distance columns
+    results_df.to_csv(output_file, index=False)
+    print(f"\nUpdated results saved to {output_file}")
+    
+    # Generate diffusion map summary: samples within 3D distance of top 10 closest known mimics
+    print("\n" + "="*60)
+    print("Generating Diffusion Map Summary: Samples near Top 10 Closest Known Mimics")
+    print("="*60)
+    
+    # Find known mimics in results
+    if 'query' in results_df.columns:
+        mimic_mask = results_df['query'].isin(validation_list).values
+        mimic_indices = np.where(mimic_mask)[0]
+        
+        if len(mimic_indices) > 0:
+            # Get 3D diffusion coordinates for mimics
+            dc_cols = [col for col in results_df.columns if col.startswith('Diffusion')]
+            if len(dc_cols) >= 3:
+                mimic_coords_3d = results_df.iloc[mimic_indices][dc_cols[:3]].values
+                all_coords_3d = results_df[dc_cols[:3]].values
+                
+                # Find mimics that are close neighbors to each other in diffusion space
+                # Goal: Include at least 10 mimics (or all available if less than 10)
+                # Strategy: Start with a reasonable threshold and expand if needed
+                # Compute pairwise distances between all mimics in 3D space
+                mimic_coords_all = all_coords_3d[mimic_indices]
+                from scipy.spatial.distance import cdist
+                mimic_pairwise_distances_all = cdist(mimic_coords_all, mimic_coords_all, metric='euclidean')
+                
+                target_num_mimics = min(10, len(mimic_indices))  # Want at least 10, or all if less
+                
+                if len(mimic_indices) > 1:
+                    upper_triangle = np.triu(mimic_pairwise_distances_all, k=1)
+                    mimic_pairwise_flat = upper_triangle[upper_triangle > 0]
+                    
+                    if len(mimic_pairwise_flat) > 0:
+                        # Calculate distance statistics
+                        min_pairwise_dist = np.min(mimic_pairwise_flat)
+                        q25_pairwise_dist = np.percentile(mimic_pairwise_flat, 25)
+                        q50_pairwise_dist = np.median(mimic_pairwise_flat)
+                        q75_pairwise_dist = np.percentile(mimic_pairwise_flat, 75)
+                        max_pairwise_dist = np.max(mimic_pairwise_flat)
+                        
+                        print(f"  Mimic pairwise distance statistics:")
+                        print(f"    Min: {min_pairwise_dist:.6f}")
+                        print(f"    25th percentile: {q25_pairwise_dist:.6f}")
+                        print(f"    Median: {q50_pairwise_dist:.6f}")
+                        print(f"    75th percentile: {q75_pairwise_dist:.6f}")
+                        print(f"    Max: {max_pairwise_dist:.6f}")
+                        
+                        # Start with median distance as threshold (less conservative than 25th percentile)
+                        # Try progressively larger thresholds until we get enough mimics
+                        thresholds_to_try = [
+                            q50_pairwise_dist,  # Start with median
+                            q75_pairwise_dist,  # Then 75th percentile
+                            max_pairwise_dist * 0.8,  # Then 80% of max
+                            max_pairwise_dist,  # Then max
+                            max_pairwise_dist * 1.5  # Finally, 1.5x max (includes all)
+                        ]
+                        
+                        core_mimic_indices = None
+                        final_threshold = None
+                        
+                        for threshold in thresholds_to_try:
+                            # Count neighbors for each mimic at this threshold
+                            neighbor_counts = []
+                            for i in range(len(mimic_indices)):
+                                neighbors = np.sum((mimic_pairwise_distances_all[i, :] <= threshold) & 
+                                                  (mimic_pairwise_distances_all[i, :] > 0))
+                                neighbor_counts.append(neighbors)
+                            
+                            # Start with the mimic that has the most neighbors
+                            core_mimic_idx = np.argmax(neighbor_counts)
+                            candidate_indices = [core_mimic_idx]
+                            
+                            # Add all mimics that are neighbors of the core mimic
+                            for i in range(len(mimic_indices)):
+                                if i != core_mimic_idx:
+                                    if mimic_pairwise_distances_all[core_mimic_idx, i] <= threshold:
+                                        candidate_indices.append(i)
+                            
+                            # If we have enough mimics, use this threshold
+                            if len(candidate_indices) >= target_num_mimics:
+                                core_mimic_indices = candidate_indices
+                                final_threshold = threshold
+                                print(f"  Using threshold: {final_threshold:.6f}")
+                                print(f"  Found {len(core_mimic_indices)} mimics (target: {target_num_mimics})")
+                                break
+                        
+                        # If we still don't have enough, use all mimics
+                        if core_mimic_indices is None or len(core_mimic_indices) < target_num_mimics:
+                            core_mimic_indices = list(range(len(mimic_indices)))
+                            final_threshold = max_pairwise_dist * 2  # Effectively includes all
+                            print(f"  Warning: Could not find {target_num_mimics} clustered mimics, using all {len(mimic_indices)} mimics")
+                        
+                        top_10_mimic_indices = mimic_indices[core_mimic_indices]
+                    else:
+                        # Only one unique mimic, use all
+                        top_10_mimic_indices = mimic_indices
+                        print(f"  Using all {len(mimic_indices)} mimics (only one unique position)")
+                    
+                    top_10_mimic_queries = results_df.iloc[top_10_mimic_indices]['query'].values
+                else:
+                    top_10_mimic_indices = mimic_indices
+                    top_10_mimic_queries = results_df.iloc[mimic_indices]['query'].values
+                
+                # Create a "cloud" region around all known mimics
+                # Get all mimic coordinates in 3D space
+                mimic_coords_3d = all_coords_3d[top_10_mimic_indices]
+                
+                # Compute distances from each sample to the nearest mimic
+                from scipy.spatial.distance import cdist
+                distances_to_mimics = cdist(all_coords_3d, mimic_coords_3d, metric='euclidean')
+                min_dist_to_any_mimic = np.min(distances_to_mimics, axis=1)
+                
+                # Define the "cloud" region
+                # Option 1: Use convex hull approach (more complex, but captures shape)
+                # Option 2: Use distance-based: samples within X distance of any mimic
+                # Option 3: Use bounding box with padding
+                
+                # Calculate the spread of mimics to determine appropriate buffer
+                mimic_spread = np.max(mimic_coords_3d, axis=0) - np.min(mimic_coords_3d, axis=0)
+                avg_spread = np.mean(mimic_spread)
+                
+                # Calculate pairwise distances between mimics
+                mimic_pairwise_distances = cdist(mimic_coords_3d, mimic_coords_3d, metric='euclidean')
+                # Get upper triangle (exclude diagonal and lower triangle)
+                upper_triangle = np.triu(mimic_pairwise_distances, k=1)
+                mimic_pairwise_distances_flat = upper_triangle[upper_triangle > 0]
+                
+                if len(mimic_pairwise_distances_flat) > 0:
+                    median_mimic_distance = np.median(mimic_pairwise_distances_flat)
+                    max_mimic_distance = np.max(mimic_pairwise_distances_flat)
+                else:
+                    median_mimic_distance = avg_spread
+                    max_mimic_distance = avg_spread
+                
+                # Define thresholds (more conservative):
+                # 1. "Within cloud": distance <= 75th percentile of mimic pairwise distances (tighter than median)
+                # 2. "Just around cloud": distance <= max distance between mimics + smaller buffer (more conservative)
+                if len(mimic_pairwise_distances_flat) > 0:
+                    q75_mimic_distance = np.percentile(mimic_pairwise_distances_flat, 75)
+                    # Use 75th percentile instead of median for tighter "within cloud"
+                    threshold_within = q75_mimic_distance
+                else:
+                    threshold_within = median_mimic_distance
+                
+                # Use smaller buffer (25% instead of 50%) for more conservative "around cloud"
+                buffer_factor = 0.25  # Add 25% buffer beyond max mimic distance (more conservative)
+                threshold_around = max_mimic_distance * (1 + buffer_factor)
+                
+                # Count samples
+                samples_within_cloud = np.sum(min_dist_to_any_mimic <= threshold_within)
+                samples_around_cloud = np.sum(min_dist_to_any_mimic <= threshold_around)
+                samples_outside_cloud = len(results_df) - samples_around_cloud
+                
+                # Also compute statistics
+                mimic_center = np.mean(mimic_coords_3d, axis=0)
+                distances_to_center = np.sqrt(np.sum((all_coords_3d - mimic_center)**2, axis=1))
+                
+                summary_data = {
+                    'mimic_queries': results_df.iloc[top_10_mimic_indices]['query'].tolist(),
+                    'num_mimics': len(top_10_mimic_indices),
+                    'mimic_coords': mimic_coords_3d,
+                    'mimic_center': mimic_center,
+                    'mimic_spread': mimic_spread,
+                    'median_mimic_distance': median_mimic_distance,
+                    'max_mimic_distance': max_mimic_distance,
+                    'threshold_within': threshold_within,
+                    'threshold_around': threshold_around,
+                    'samples_within_cloud': samples_within_cloud,
+                    'samples_around_cloud': samples_around_cloud,
+                    'samples_outside_cloud': samples_outside_cloud,
+                    'total_samples': len(results_df),
+                    'min_dist_to_any_mimic': min_dist_to_any_mimic,
+                    'distances_to_center': distances_to_center
+                }
+                
+                # Write summary to file
+                summary_file = os.path.join(pca_test_dir, f'{organism_name}_diffusion_map_mimic_proximity_summary.txt')
+                with open(summary_file, 'w') as f:
+                    f.write("Diffusion Map Summary: Samples within Mimic Cloud Region\n")
+                    f.write("="*80 + "\n\n")
+                    f.write(f"Total samples in analysis: {len(results_df)}\n")
+                    f.write(f"Total known mimics found: {len(mimic_indices)}\n")
+                    f.write(f"Analyzing top {len(top_10_mimic_indices)} closest mimics\n\n")
+                    
+                    f.write("Mimic Cloud Definition:\n")
+                    f.write("  - We define a 'cloud' region around all known mimics\n")
+                    f.write("  - 'Within cloud': samples within median distance between mimics\n")
+                    f.write("  - 'Around cloud': samples within max distance + 50% buffer\n\n")
+                    
+                    f.write("-"*80 + "\n")
+                    f.write("Mimic Cloud Statistics\n")
+                    f.write("-"*80 + "\n")
+                    f.write(f"Number of mimics in cloud: {summary_data['num_mimics']}\n")
+                    f.write(f"Mimic queries: {', '.join(summary_data['mimic_queries'])}\n\n")
+                    
+                    f.write(f"Cloud dimensions (spread of mimics):\n")
+                    f.write(f"  DC1 spread: {summary_data['mimic_spread'][0]:.6f}\n")
+                    f.write(f"  DC2 spread: {summary_data['mimic_spread'][1]:.6f}\n")
+                    f.write(f"  DC3 spread: {summary_data['mimic_spread'][2]:.6f}\n")
+                    f.write(f"  Average spread: {np.mean(summary_data['mimic_spread']):.6f}\n\n")
+                    
+                    f.write(f"Distances between mimics:\n")
+                    f.write(f"  Median pairwise distance: {summary_data['median_mimic_distance']:.6f}\n")
+                    f.write(f"  Maximum pairwise distance: {summary_data['max_mimic_distance']:.6f}\n\n")
+                    
+                    f.write(f"Cloud boundaries:\n")
+                    f.write(f"  'Within cloud' threshold: {summary_data['threshold_within']:.6f} (median mimic distance)\n")
+                    f.write(f"  'Around cloud' threshold: {summary_data['threshold_around']:.6f} (max distance + 50% buffer)\n\n")
+                    
+                    f.write("-"*80 + "\n")
+                    f.write("Sample Counts\n")
+                    f.write("-"*80 + "\n")
+                    f.write(f"Samples within cloud: {summary_data['samples_within_cloud']} / {summary_data['total_samples']} ({100.0*summary_data['samples_within_cloud']/summary_data['total_samples']:.2f}%)\n")
+                    f.write(f"Samples around cloud (including within): {summary_data['samples_around_cloud']} / {summary_data['total_samples']} ({100.0*summary_data['samples_around_cloud']/summary_data['total_samples']:.2f}%)\n")
+                    f.write(f"Samples outside cloud: {summary_data['samples_outside_cloud']} / {summary_data['total_samples']} ({100.0*summary_data['samples_outside_cloud']/summary_data['total_samples']:.2f}%)\n\n")
+                    
+                    # Distance statistics
+                    f.write("-"*80 + "\n")
+                    f.write("Distance Statistics\n")
+                    f.write("-"*80 + "\n")
+                    f.write(f"Distance from samples to nearest mimic:\n")
+                    f.write(f"  Min: {np.min(summary_data['min_dist_to_any_mimic']):.6f}\n")
+                    f.write(f"  25th percentile: {np.percentile(summary_data['min_dist_to_any_mimic'], 25):.6f}\n")
+                    f.write(f"  Median: {np.median(summary_data['min_dist_to_any_mimic']):.6f}\n")
+                    f.write(f"  75th percentile: {np.percentile(summary_data['min_dist_to_any_mimic'], 75):.6f}\n")
+                    f.write(f"  Max: {np.max(summary_data['min_dist_to_any_mimic']):.6f}\n\n")
+                    
+                    f.write(f"Distance from samples to cloud center:\n")
+                    f.write(f"  Min: {np.min(summary_data['distances_to_center']):.6f}\n")
+                    f.write(f"  Median: {np.median(summary_data['distances_to_center']):.6f}\n")
+                    f.write(f"  Max: {np.max(summary_data['distances_to_center']):.6f}\n")
+                
+                print(f"✓ Diffusion map proximity summary saved to: {summary_file}")
+                
+                # Create 3D visualization of the mimic cloud
+                print("\nCreating 3D visualization of mimic cloud...")
+                from mpl_toolkits.mplot3d import Axes3D
+                
+                # Classify samples based on distance to mimics
+                within_mask = summary_data['min_dist_to_any_mimic'] <= summary_data['threshold_within']
+                around_mask = summary_data['min_dist_to_any_mimic'] <= summary_data['threshold_around']
+                outside_mask = ~around_mask
+                
+                # Create figure with multiple viewing angles
+                viewing_angles = [
+                    {'elev': 20, 'azim': 45, 'suffix': 'standard'},
+                    {'elev': 20, 'azim': 135, 'suffix': 'rotated'},
+                    {'elev': 90, 'azim': 0, 'suffix': 'top_down'},
+                    {'elev': 0, 'azim': 0, 'suffix': 'side_view'}
+                ]
+                
+                for view in viewing_angles:
+                    fig = plt.figure(figsize=(14, 10))
+                    ax = fig.add_subplot(111, projection='3d')
+                    
+                    # Plot samples outside cloud (gray, low alpha)
+                    if outside_mask.sum() > 0:
+                        ax.scatter(all_coords_3d[outside_mask, 0], 
+                                 all_coords_3d[outside_mask, 1], 
+                                 all_coords_3d[outside_mask, 2],
+                                 c='lightgray', s=5, alpha=0.2, label=f'Outside cloud ({outside_mask.sum()})', zorder=1)
+                    
+                    # Plot samples around cloud but not within (yellow/orange)
+                    around_not_within = around_mask & ~within_mask
+                    if around_not_within.sum() > 0:
+                        ax.scatter(all_coords_3d[around_not_within, 0], 
+                                 all_coords_3d[around_not_within, 1], 
+                                 all_coords_3d[around_not_within, 2],
+                                 c='orange', s=8, alpha=0.4, label=f'Around cloud ({around_not_within.sum()})', zorder=2)
+                    
+                    # Plot samples within cloud (blue)
+                    if within_mask.sum() > 0:
+                        ax.scatter(all_coords_3d[within_mask, 0], 
+                                 all_coords_3d[within_mask, 1], 
+                                 all_coords_3d[within_mask, 2],
+                                 c='blue', s=10, alpha=0.6, label=f'Within cloud ({within_mask.sum()})', zorder=3)
+                    
+                    # Plot mimics (red, large, high zorder)
+                    ax.scatter(summary_data['mimic_coords'][:, 0], 
+                             summary_data['mimic_coords'][:, 1], 
+                             summary_data['mimic_coords'][:, 2],
+                             c='red', s=100, alpha=1.0, edgecolors='black', linewidths=2, 
+                             label=f'Known mimics ({len(summary_data["mimic_queries"])})', zorder=10)
+                    
+                    # Plot cloud center (green star)
+                    ax.scatter([summary_data['mimic_center'][0]], 
+                             [summary_data['mimic_center'][1]], 
+                             [summary_data['mimic_center'][2]],
+                             c='green', marker='*', s=300, alpha=1.0, edgecolors='black', linewidths=1,
+                             label='Cloud center', zorder=11)
+                    
+                    # Draw spheres representing cloud boundaries (optional, can be slow)
+                    # Instead, draw bounding box or convex hull outline
+                    try:
+                        from scipy.spatial import ConvexHull
+                        if len(summary_data['mimic_coords']) >= 4:
+                            hull = ConvexHull(summary_data['mimic_coords'])
+                            # Plot edges of convex hull
+                            for simplex in hull.simplices:
+                                ax.plot3D(summary_data['mimic_coords'][simplex, 0],
+                                        summary_data['mimic_coords'][simplex, 1],
+                                        summary_data['mimic_coords'][simplex, 2],
+                                        'r--', alpha=0.3, linewidth=1, zorder=5)
+                    except:
+                        pass  # Skip if convex hull fails
+                    
+                    # Set labels and title
+                    ax.set_xlabel('DC1', fontsize=12)
+                    ax.set_ylabel('DC2', fontsize=12)
+                    ax.set_zlabel('DC3', fontsize=12)
+                    ax.set_title(f'Mimic Cloud in 3D Diffusion Space\n(View: elev={view["elev"]}°, azim={view["azim"]}°)\n' +
+                               f'Within: {within_mask.sum()} | Around: {around_not_within.sum()} | Outside: {outside_mask.sum()}', 
+                               fontsize=11)
+                    
+                    # Set viewing angle
+                    ax.view_init(elev=view['elev'], azim=view['azim'])
+                    
+                    # Set robust axis limits
+                    def compute_robust_axis_limits_3d(data, percentile_low=1.0, percentile_high=99.0, padding_factor=0.05):
+                        if len(data) == 0:
+                            return -1, 1
+                        low_bound = np.percentile(data, percentile_low)
+                        high_bound = np.percentile(data, percentile_high)
+                        data_range = high_bound - low_bound
+                        if data_range == 0:
+                            padding = abs(low_bound * 0.1) if low_bound != 0 else 1.0
+                            return low_bound - padding, high_bound + padding
+                        padding = data_range * padding_factor
+                        return low_bound - padding, high_bound + padding
+                    
+                    xlim = compute_robust_axis_limits_3d(all_coords_3d[:, 0])
+                    ylim = compute_robust_axis_limits_3d(all_coords_3d[:, 1])
+                    zlim = compute_robust_axis_limits_3d(all_coords_3d[:, 2])
+                    ax.set_xlim(xlim)
+                    ax.set_ylim(ylim)
+                    ax.set_zlim(zlim)
+                    
+                    ax.legend(loc='upper left', fontsize=9, bbox_to_anchor=(0, 1))
+                    ax.grid(True, alpha=0.3)
+                    
+                    # Save plot
+                    cloud_plot_file = os.path.join(pca_test_dir, f'diffusion_map_{organism_name}_mimic_cloud_3d_{view["suffix"]}.png')
+                    plt.savefig(cloud_plot_file, dpi=300, bbox_inches='tight')
+                    plt.close()
+                    print(f"  ✓ Saved: {cloud_plot_file}")
+                
+                print("✓ Mimic cloud 3D visualizations complete")
+            else:
+                print("  (Skipping: Need at least 3 diffusion components for 3D analysis)")
+        else:
+            print("  (Skipping: No known mimics found in results)")
+    else:
+        print("  (Skipping: 'query' column not found in results)")
+    
+    print("\n" + "="*60)
+    
+    return results_df
+
+
+def estimate_optimal_clusters(reduced_data, clustering_method='kmeans', k_range=None, method='silhouette'):
+    """
+    Estimate optimal number of clusters using silhouette score or elbow method.
+    
+    Args:
+        reduced_data: Data to cluster (already reduced dimensionality)
+        clustering_method: 'kmeans' or 'agglomerative'
+        k_range: Range of k values to test (default: 2 to min(20, n_samples//10))
+        method: 'silhouette' (maximize) or 'elbow' (minimize WCSS)
+    
+    Returns:
+        optimal_k: Best number of clusters
+        scores: Dictionary with scores for each k
+    """
+    n_samples = len(reduced_data)
+    
+    if k_range is None:
+        # Reasonable range: 2 to min(20, n_samples//10, or 50% of samples)
+        max_k = min(20, max(2, n_samples // 10))
+        k_range = range(2, max_k + 1)
+    else:
+        k_range = range(k_range[0], k_range[1] + 1)
+    
+    print(f"\nEstimating optimal number of clusters (testing k={min(k_range)} to {max(k_range)})...")
+    print(f"Method: {method}")
+    
+    scores = {}
+    wcss_scores = {}  # For elbow method
+    
+    for k in k_range:
+        try:
+            if clustering_method == 'kmeans':
+                clusterer = KMeans(n_clusters=k, n_init=10, random_state=42, max_iter=300)
+            elif clustering_method == 'agglomerative':
+                clusterer = AgglomerativeClustering(n_clusters=k)
+            else:
+                raise ValueError(f"Unknown clustering method: {clustering_method}")
+            
+            cluster_labels = clusterer.fit_predict(reduced_data)
+            
+            # Compute silhouette score
+            if len(np.unique(cluster_labels)) > 1:  # Need at least 2 clusters
+                sil_score = silhouette_score(reduced_data, cluster_labels)
+                scores[k] = sil_score
+                
+                # For elbow method, compute WCSS (within-cluster sum of squares)
+                if method == 'elbow' and clustering_method == 'kmeans':
+                    wcss = clusterer.inertia_
+                    wcss_scores[k] = wcss
+                
+                print(f"  k={k:2d}: Silhouette={sil_score:.4f}", end="")
+                if method == 'elbow' and clustering_method == 'kmeans':
+                    print(f", WCSS={wcss:.2f}")
+                else:
+                    print()
+            else:
+                print(f"  k={k:2d}: Skipped (only 1 cluster)")
+        except Exception as e:
+            print(f"  k={k:2d}: Error - {e}")
+            continue
+    
+    if not scores:
+        print("Warning: Could not compute scores for any k. Using default k=15.")
+        return 15, {}
+    
+    if method == 'silhouette':
+        # Maximize silhouette score
+        optimal_k = max(scores, key=scores.get)
+        optimal_score = scores[optimal_k]
+        print(f"\nOptimal k={optimal_k} (silhouette score: {optimal_score:.4f})")
+    elif method == 'elbow':
+        if not wcss_scores:
+            # Fallback to silhouette if elbow not available
+            optimal_k = max(scores, key=scores.get)
+            optimal_score = scores[optimal_k]
+            print(f"\nOptimal k={optimal_k} (silhouette score: {optimal_score:.4f}, elbow method not available)")
+        else:
+            # Find elbow: look for largest decrease in WCSS
+            k_list = sorted(wcss_scores.keys())
+            if len(k_list) >= 2:
+                # Compute rate of change (second derivative approximation)
+                decreases = []
+                for i in range(1, len(k_list)):
+                    k_prev = k_list[i-1]
+                    k_curr = k_list[i]
+                    wcss_prev = wcss_scores[k_prev]
+                    wcss_curr = wcss_scores[k_curr]
+                    decrease = wcss_prev - wcss_curr
+                    decreases.append((k_curr, decrease))
+                
+                # Find point with largest decrease (elbow)
+                optimal_k, max_decrease = max(decreases, key=lambda x: x[1])
+                print(f"\nOptimal k={optimal_k} (elbow method, WCSS decrease: {max_decrease:.2f})")
+            else:
+                optimal_k = k_list[0]
+                print(f"\nOptimal k={optimal_k} (only one k tested)")
+    else:
+        raise ValueError(f"Unknown method: {method}")
+    
+    return optimal_k, scores
+
+
+def value_driven_pca_clustering(pca_test_dir, data_frame, organism_name, n_clusters=10, clustering_method='kmeans', include_lengths=False, plot_3d=False, use_umap=False, umap_n_neighbors=15, umap_min_dist=0.1, include_evolutionary=False, include_targeting=False, include_go_terms=False, scaler_type='robust', use_diffusion=False, diffusion_alpha=1.0, diffusion_n_neighbors=15, exclude_derived_features=False, auto_clusters=False, cluster_estimation_method='silhouette', use_natural_attractor=False):
+    """
+    Perform purely value-driven clustering based on alignment features only.
+    No GO term labels are used - clustering is based solely on alignment feature values.
+    This is for discovering new mimic candidates, not validating known ones.
+    
+    Args:
+        include_lengths: If False, exclude qlen and tlen (absolute lengths) and use only ratio features.
+                         Default False to avoid mixing absolute values with ratios (0-1 scale).
+        plot_3d: If True, create 3D visualization (PC1, PC2, PC3) in addition to 2D.
+    """
+    # Select specific columns for analysis
+    selected_columns = ['score', 'tcov', 'qcov', 'fident', 'algn_fraction']
+    
+    if include_lengths:
+        selected_columns.extend(['qlen', 'tlen'])
+    
+    # Add evolutionary features if requested
+    if include_evolutionary:
+        evo_cols = []
+        if 'symbiont_branch_dnds_avg' in data_frame.columns:
+            evo_cols.append('symbiont_branch_dnds_avg')
+        if 'non_symbiont_branch_dnds_avg' in data_frame.columns:
+            evo_cols.append('non_symbiont_branch_dnds_avg')
+        if 'test_fraction' in data_frame.columns:
+            evo_cols.append('test_fraction')
+        
+        if len(evo_cols) > 0:
+            # Check for missing values
+            print(f"\nEvolutionary features analysis:")
+            for col in evo_cols:
+                missing = data_frame[col].isna().sum() + (data_frame[col] == '').sum()
+                total = len(data_frame)
+                pct_missing = missing / total * 100
+                print(f"  {col}: {missing}/{total} missing ({pct_missing:.1f}%)")
+            
+            # Check how many rows have ALL evorates vs some missing
+            evo_subset = data_frame[evo_cols]
+            all_missing = evo_subset.isna().all(axis=1).sum()
+            some_missing = evo_subset.isna().any(axis=1).sum() - all_missing
+            complete = (~evo_subset.isna().any(axis=1)).sum()
+            
+            print(f"  Rows with all evorates: {complete} ({complete/total*100:.1f}%)")
+            print(f"  Rows with some missing: {some_missing} ({some_missing/total*100:.1f}%)")
+            print(f"  Rows with all missing: {all_missing} ({all_missing/total*100:.1f}%)")
+            
+            if all_missing / total > 0.5:
+                print(f"  WARNING: >50% of rows missing all evorates. Consider not using evolutionary features.")
+            elif complete / total < 0.3:
+                print(f"  WARNING: <30% of rows have complete evorate data. May need imputation or filtering.")
+            
+            selected_columns.extend(evo_cols)
+            print(f"  Added evolutionary features: {evo_cols}")
+    
+    # Add targeting features if requested
+    if include_targeting:
+        target_cols = []
+        # Only include SP probability (not mTP)
+        if 'query_SP_probability' in data_frame.columns:
+            target_cols.append('query_SP_probability')
+        selected_columns.extend(target_cols)
+        if len(target_cols) > 0:
+            print(f"Added targeting features: {target_cols}")
+        elif 'query_SP_probability' not in data_frame.columns:
+            print("Warning: query_SP_probability column not found")
+    
+    # Add derived features
+    test_data_frame = data_frame[selected_columns].copy()
+    
+    # Check for and handle any remaining missing values (shouldn't happen if filtering/imputation worked)
+    missing_before = test_data_frame.isna().sum().sum()
+    if missing_before > 0:
+        print(f"\nWarning: {missing_before} missing values found in feature columns")
+        print("  Missing values per column:")
+        for col in test_data_frame.columns:
+            missing = test_data_frame[col].isna().sum()
+            if missing > 0:
+                print(f"    {col}: {missing} ({missing/len(test_data_frame)*100:.1f}%)")
+        
+        # If we have missing values, we need to handle them
+        # Option 1: Drop rows with any missing (conservative)
+        initial_rows = len(test_data_frame)
+        test_data_frame = test_data_frame.dropna()
+        rows_after = len(test_data_frame)
+        if rows_after < initial_rows:
+            print(f"  Dropped {initial_rows - rows_after} rows with missing values")
+            print(f"  Remaining: {rows_after} rows ({rows_after/initial_rows*100:.1f}%)")
+            # Also need to update data_frame to match
+            data_frame = data_frame.loc[test_data_frame.index].copy()
+        
+        # Update selected_columns to only include columns that exist
+        selected_columns = [col for col in selected_columns if col in test_data_frame.columns]
+    
+    # Create derived features if not excluded and we have the base columns
+    derived_features_added = []
+    if not exclude_derived_features:
+        # score_per_length: normalized score by protein sizes
+        if 'qlen' in data_frame.columns and 'tlen' in data_frame.columns:
+            test_data_frame['score_per_length'] = data_frame['score'] / (data_frame['qlen'] * data_frame['tlen'] + 1e-10)
+            derived_features_added.append('score_per_length')
+        
+        # coverage_balance: asymmetry between query and target coverage
+        if 'tcov' in data_frame.columns and 'qcov' in data_frame.columns:
+            test_data_frame['coverage_balance'] = abs(data_frame['tcov'] - data_frame['qcov'])
+            derived_features_added.append('coverage_balance')
+        
+        # identity_coverage: combined quality metric
+        if 'fident' in data_frame.columns and 'algn_fraction' in data_frame.columns:
+            test_data_frame['identity_coverage'] = data_frame['fident'] * data_frame['algn_fraction']
+            derived_features_added.append('identity_coverage')
+        
+        if derived_features_added:
+            selected_columns.extend(derived_features_added)
+            print(f"Added {len(derived_features_added)} derived features: {', '.join(derived_features_added)}")
+    else:
+        print("Excluding derived features (--exclude_derived_features flag set)")
+    
+    # Handle GO terms if requested (need to encode them)
+    if include_go_terms:
+        go_term_columns = ['target_cellular_components', 'target_molecular_functions', 'target_biological_processes']
+        go_features_added = []
+        
+        for go_col in go_term_columns:
+            if go_col in data_frame.columns:
+                # Parse GO terms if they're strings
+                def parse_go_list(val):
+                    if pd.isna(val) or val == '' or val == '[]':
+                        return []
+                    if isinstance(val, list):
+                        return val
+                    if isinstance(val, str):
+                        try:
+                            import ast
+                            parsed = ast.literal_eval(val)
+                            if isinstance(parsed, list):
+                                return parsed
+                        except:
+                            return []
+                    return []
+                
+                go_terms_list = data_frame[go_col].apply(parse_go_list)
+                
+                # Get most common GO terms (top 20 per category)
+                all_terms = [term for sublist in go_terms_list for term in sublist if term]
+                if all_terms:
+                    from collections import Counter
+                    term_counts = Counter(all_terms)
+                    top_terms = [term for term, count in term_counts.most_common(20)]
+                    
+                    # Create binary indicators for top terms
+                    for term in top_terms:
+                        col_name = f'{go_col}_{term[:30].replace(" ", "_")}'  # Truncate and sanitize
+                        test_data_frame[col_name] = go_terms_list.apply(lambda x: 1 if term in x else 0)
+                        go_features_added.append(col_name)
+        
+        if go_features_added:
+            selected_columns.extend(go_features_added)
+            print(f"Added {len(go_features_added)} GO term binary features")
+        else:
+            print("Warning: No GO terms found to encode")
+    
+    # Filter out any columns that don't exist
+    available_columns = [col for col in selected_columns if col in test_data_frame.columns]
+    test_data_frame = test_data_frame[available_columns].copy()
+    selected_columns = available_columns
+    
+    print(f"Using {len(selected_columns)} features for clustering: {selected_columns}")
+    
+    # Scale the data
+    if scaler_type == 'zscore' or scaler_type == 'standard':
+        scaler = StandardScaler()
+        print("Using StandardScaler (z-score normalization: mean=0, std=1)")
+    elif scaler_type == 'robust':
+        scaler = RobustScaler()
+        print("Using RobustScaler (median/IQR scaling, robust to outliers)")
+    elif scaler_type == 'minmax':
+        from sklearn.preprocessing import MinMaxScaler
+        scaler = MinMaxScaler()
+        print("Using MinMaxScaler (scales to 0-1 range)")
+    else:
+        raise ValueError(f"Unknown scaler type: {scaler_type}. Choose 'robust', 'zscore'/'standard', or 'minmax'")
+    
+    scaled_data = scaler.fit_transform(test_data_frame)
+    
+    # Run dimensionality reduction (unsupervised - no labels)
+    # This is purely data-driven for discovering patterns, not validating known examples
+    if use_diffusion:
+        # Diffusion maps are for trajectory/pseudotime analysis, not clustering
+        # Handle this separately
+        print("Note: Diffusion maps are used for trajectory analysis, not clustering.")
+        print("Computing diffusion map and pseudotime...")
+        
+        diffusion_results = compute_diffusion_map_analysis(
+            scaled_data, 
+            data_frame, 
+            pca_test_dir, 
+            organism_name,
+            diffusion_alpha=diffusion_alpha,
+            diffusion_n_neighbors=diffusion_n_neighbors,
+            plot_3d=plot_3d,
+            use_natural_attractor=use_natural_attractor
+        )
+        return  # Exit early - no clustering for diffusion maps
+    elif use_umap:
+        if not UMAP_AVAILABLE:
+            raise ImportError("UMAP is not available. Install with: pip install umap-learn or conda install -c conda-forge umap-learn")
+        print(f"Using UMAP for dimensionality reduction (n_neighbors={umap_n_neighbors}, min_dist={umap_min_dist})...")
+        # UMAP typically works best with 2-3 dimensions for visualization
+        # For clustering, we'll use more dimensions
+        n_umap_components = min(10, len(selected_columns) - 1)  # Use up to 10 components for clustering
+        
+        # Ensure reproducibility: set numpy random seed before UMAP
+        np.random.seed(42)
+        
+        # Print diagnostic info for reproducibility
+        print(f"  Data shape: {scaled_data.shape}")
+        print(f"  Features used: {len(selected_columns)}")
+        print(f"  Random seed: 42 (for reproducibility)")
+        print(f"  UMAP parameters: n_neighbors={umap_n_neighbors}, min_dist={umap_min_dist}, n_components={n_umap_components}")
+        
+        reducer = umap.UMAP(n_components=n_umap_components, 
+                           n_neighbors=umap_n_neighbors, 
+                           min_dist=umap_min_dist,
+                           random_state=42,
+                           metric='euclidean',
+                           verbose=False)
+        reduced_data = reducer.fit_transform(scaled_data)
+        method_name = 'umap'
+        # For visualization, we'll use the first 3 components
+        pca_data = reduced_data[:, :min(3, n_umap_components)]
+        n_components = n_umap_components
+        print(f"UMAP reduction complete. Using {n_components} components for clustering.")
+    else:
+        # Run PCA (default)
+        pca = PCA()
+        pca.fit(scaled_data)
+        explained_variance_ratio = pca.explained_variance_ratio_
+        cumulative_variance_ratio = np.cumsum(explained_variance_ratio)
+        n_components = np.argmax(cumulative_variance_ratio >= 0.95) + 1
+        
+        print(f"Number of components to retain 95% of the variance: {n_components}")
+        print(f"First 3 components explain {sum(explained_variance_ratio[:3]):.2%} of variance")
+        pca = PCA(n_components=n_components)
+        reduced_data = pca.fit_transform(scaled_data)
+        pca_data = reduced_data  # For clustering
+        method_name = 'pca'
+    
+    # Estimate optimal number of clusters if requested
+    if auto_clusters:
+        optimal_k, cluster_scores = estimate_optimal_clusters(
+            reduced_data, 
+            clustering_method=clustering_method,
+            method=cluster_estimation_method
+        )
+        n_clusters = optimal_k
+        print(f"\nUsing automatically estimated number of clusters: {n_clusters}")
+    else:
+        cluster_scores = None
+    
+    # Perform clustering on PCA-reduced data
+    if clustering_method == 'kmeans':
+        clusterer = KMeans(n_clusters=n_clusters, n_init=20, random_state=42, max_iter=600)
+    elif clustering_method == 'agglomerative':
+        clusterer = AgglomerativeClustering(n_clusters=n_clusters)
+    else:
+        raise ValueError(f"Unknown clustering method: {clustering_method}")
+    
+    cluster_labels = clusterer.fit_predict(reduced_data)
+    
+    # Diagnostic: Check if data has natural cluster structure
+    print(f"\nData Structure Diagnostics:")
+    print(f"  Number of data points: {len(reduced_data)}")
+    print(f"  Dimensionality: {reduced_data.shape[1]}")
+    
+    # Check variance in reduced space
+    if use_umap:
+        variance_per_component = np.var(reduced_data, axis=0)
+        print(f"  Variance per UMAP component: {variance_per_component[:5]}")
+    else:
+        variance_per_component = np.var(reduced_data, axis=0)
+        print(f"  Variance per PC: {variance_per_component[:5]}")
+    
+    # Check if data is too uniform (low variance suggests poor separation)
+    total_variance = np.sum(variance_per_component)
+    if total_variance < 1.0:
+        print(f"  Warning: Low total variance ({total_variance:.4f}). Data may be too uniform for clustering.")
+    print()
+    
+    # Evaluate UMAP quality if using UMAP
+    if use_umap:
+        print("\n" + "="*60)
+        print("UMAP Quality Metrics")
+        print("="*60)
+        
+        # Trustworthiness: measures how well local structure is preserved (0-1, higher is better)
+        # Sample subset if data is too large (trustworthiness is O(n^2))
+        max_samples = min(5000, len(scaled_data))
+        if len(scaled_data) > max_samples:
+            # Use fixed random seed for reproducibility
+            rng = np.random.RandomState(42)
+            sample_indices = rng.choice(len(scaled_data), max_samples, replace=False)
+            sample_original = scaled_data[sample_indices]
+            sample_reduced = reduced_data[sample_indices, :min(10, n_components)]
+            n_neighbors_trust = min(umap_n_neighbors, max_samples - 1)
+        else:
+            sample_original = scaled_data
+            sample_reduced = reduced_data[:, :min(10, n_components)]
+            n_neighbors_trust = umap_n_neighbors
+        
+        try:
+            trust = trustworthiness(sample_original, sample_reduced, n_neighbors=n_neighbors_trust, metric='euclidean')
+            print(f"Trustworthiness (local structure preservation): {trust:.4f} (higher is better, max=1.0)")
+            if trust < 0.7:
+                print("  Warning: Low trustworthiness. Consider increasing n_neighbors or decreasing min_dist.")
+            elif trust > 0.95:
+                print("  Note: Very high trustworthiness. May be overfitting to local structure.")
+        except Exception as e:
+            print(f"  Could not compute trustworthiness: {e}")
+        
+        # Cluster quality metrics
+        try:
+            silhouette = silhouette_score(reduced_data, cluster_labels)
+            print(f"Silhouette Score (cluster separation): {silhouette:.4f} (higher is better, range: -1 to 1)")
+            if silhouette < 0.2:
+                print("  Warning: Poor cluster separation. Consider adjusting n_neighbors or min_dist.")
+        except Exception as e:
+            print(f"  Could not compute silhouette score: {e}")
+        
+        try:
+            db_score = davies_bouldin_score(reduced_data, cluster_labels)
+            print(f"Davies-Bouldin Index (cluster quality): {db_score:.4f} (lower is better)")
+            if db_score > 2.0:
+                print("  Warning: High DB index suggests poor cluster separation.")
+        except Exception as e:
+            print(f"  Could not compute Davies-Bouldin score: {e}")
+        
+        # Parameter recommendations
+        print("\nParameter Tuning Guidelines:")
+        print(f"  Current: n_neighbors={umap_n_neighbors}, min_dist={umap_min_dist}")
+        print("  - If clusters are too tight/overlapping: increase min_dist (try 0.2-0.5)")
+        print("  - If clusters are too spread out: decrease min_dist (try 0.01-0.05)")
+        print("  - If local structure is lost: decrease n_neighbors (try 5-10)")
+        print("  - If global structure is lost: increase n_neighbors (try 30-50)")
+        
+        # Check if number of clusters might be the issue
+        unique_clusters = len(np.unique(cluster_labels))
+        print(f"\nCluster Count Analysis:")
+        print(f"  Requested clusters: {n_clusters}")
+        print(f"  Actual unique clusters: {unique_clusters}")
+        if unique_clusters < n_clusters:
+            print(f"  Warning: Fewer clusters than requested. Data may not support {n_clusters} clusters.")
+            print(f"  Consider trying fewer clusters (e.g., {unique_clusters} or {max(2, unique_clusters-2)})")
+        
+        # Check cluster sizes
+        cluster_sizes = pd.Series(cluster_labels).value_counts().sort_index()
+        print(f"\nCluster Sizes:")
+        for cluster_id, size in cluster_sizes.items():
+            pct = size / len(cluster_labels) * 100
+            print(f"  Cluster {cluster_id}: {size} points ({pct:.1f}%)")
+        
+        # Check for very small clusters
+        small_clusters = cluster_sizes[cluster_sizes < len(cluster_labels) * 0.01]  # < 1% of data
+        if len(small_clusters) > 0:
+            print(f"\n  Warning: {len(small_clusters)} very small cluster(s) detected.")
+            print(f"  This may indicate over-clustering. Consider reducing n_clusters.")
+        
+        print("="*60 + "\n")
+    
+    # Create DataFrame with results
+    if use_diffusion:
+        # Create full reduced data for DataFrame (all components for clustering)
+        pca_columns = [f'Diffusion{i+1}' for i in range(n_components)]
+        pca_df = pd.DataFrame(reduced_data, columns=pca_columns)
+        # For plotting, use first 3 components
+        pca_df_plot = pca_df.iloc[:, :min(3, n_components)].copy()
+    elif use_umap:
+        # Create full reduced data for DataFrame (all components for clustering)
+        pca_columns = [f'UMAP{i+1}' for i in range(n_components)]
+        pca_df = pd.DataFrame(reduced_data, columns=pca_columns)
+        # For plotting, use first 3 components
+        pca_df_plot = pca_df.iloc[:, :min(3, n_components)].copy()
+    else:
+        pca_columns = [f'PC{i+1}' for i in range(n_components)]
+        pca_df = pd.DataFrame(reduced_data, columns=pca_columns)
+        # For plotting, use first 3 components
+        pca_df_plot = pca_df.iloc[:, :min(3, n_components)].copy()
+    
+    pca_df['query'] = data_frame['query'].values
+    pca_df['cluster'] = cluster_labels
+    
+    # Add candidate/mimic labels if they exist
+    # Only label the BEST alignment from each known mimic/candidate (not all alignments)
+    pca_df['label'] = 'cluster_' + pca_df['cluster'].astype(str)
+    
+    # Calculate alignment quality score (rows are in same order as data_frame)
+    alignment_quality = (data_frame['score'].values * 
+                        data_frame['fident'].values * 
+                        data_frame['algn_fraction'].values)
+    
+    # For mimics: only label the best alignment per query
+    mimic_mask = data_frame['query'].isin(validation_list).values
+    if mimic_mask.sum() > 0:
+        # Create temp dataframe to find best per query
+        mimic_df = pd.DataFrame({
+            'query': data_frame['query'].values,
+            'quality': alignment_quality,
+            'row_idx': range(len(data_frame))
+        })
+        mimic_df = mimic_df[mimic_mask]
+        best_mimic_indices = mimic_df.groupby('query')['quality'].idxmax().values
+        # Mark these specific rows in pca_df (rows are in same order)
+        pca_df.loc[best_mimic_indices, 'label'] = 'mimic'
+        print(f"Labeled {len(best_mimic_indices)} best mimic alignments (one per known mimic)")
+    
+    # For candidates: only label the best alignment per query
+    candidate_mask = data_frame['query'].isin(candidate_list).values
+    if candidate_mask.sum() > 0:
+        candidate_df = pd.DataFrame({
+            'query': data_frame['query'].values,
+            'quality': alignment_quality,
+            'row_idx': range(len(data_frame))
+        })
+        candidate_df = candidate_df[candidate_mask]
+        best_candidate_indices = candidate_df.groupby('query')['quality'].idxmax().values
+        pca_df.loc[best_candidate_indices, 'label'] = 'candidate'
+        print(f"Labeled {len(best_candidate_indices)} best candidate alignments (one per known candidate)")
+    
+    # Save results
+    suffix = f'{method_name}_{clustering_method}_{n_clusters}'
+    pca_df.to_csv(pca_test_dir + f'/{organism_name}_value_driven_{suffix}.csv', index=False)
+    
+    # Output mimic information with clusters and GO terms as CSV
+    mimic_points = pca_df[pca_df['label'] == 'mimic'].copy()
+    if len(mimic_points) > 0:
+        # Get corresponding rows from original data_frame (same order)
+        mimic_indices = mimic_points.index
+        mimic_data = []
+        
+        for idx in mimic_indices:
+            query_id = pca_df.loc[idx, 'query']
+            cluster_id = pca_df.loc[idx, 'cluster']
+            
+            # Get original alignment data
+            orig_row = data_frame.iloc[idx]
+            
+            # Format GO terms (handle if they're strings or lists)
+            def format_go_terms(go_val):
+                if pd.isna(go_val) or go_val == '' or go_val == '[]':
+                    return ''
+                if isinstance(go_val, str):
+                    return go_val
+                if isinstance(go_val, list):
+                    return '; '.join(str(x) for x in go_val)
+                return str(go_val)
+            
+            mimic_data.append({
+                'query': query_id,
+                'target': orig_row.get('target', ''),
+                'cluster': cluster_id,
+                'score': orig_row.get('score', ''),
+                'fident': orig_row.get('fident', ''),
+                'algn_fraction': orig_row.get('algn_fraction', ''),
+                'target_cellular_components': format_go_terms(orig_row.get('target_cellular_components', '')),
+                'target_molecular_functions': format_go_terms(orig_row.get('target_molecular_functions', '')),
+                'target_biological_processes': format_go_terms(orig_row.get('target_biological_processes', ''))
+            })
+        
+        # Write to CSV
+        mimic_df = pd.DataFrame(mimic_data)
+        csv_file = pca_test_dir + f'/{organism_name}_mimics_clusters_GO_{suffix}.csv'
+        mimic_df.to_csv(csv_file, index=False)
+        print(f"Mimic cluster and GO term information (CSV) saved to: {csv_file}")
+        
+        # Also write text format
+        txt_file = pca_test_dir + f'/{organism_name}_mimics_clusters_GO_{suffix}.txt'
+        with open(txt_file, 'w') as f:
+            f.write(f"Mimic Alignments: Cluster Assignments and GO Terms\n")
+            f.write(f"{'='*80}\n\n")
+            f.write(f"Total mimic points: {len(mimic_data)}\n")
+            f.write(f"Method: {method_name.upper()}, Clustering: {clustering_method}\n\n")
+            
+            for i, info in enumerate(mimic_data, 1):
+                f.write(f"{'='*80}\n")
+                f.write(f"Mimic {i}\n")
+                f.write(f"{'='*80}\n")
+                f.write(f"Query ID: {info['query']}\n")
+                f.write(f"Target ID: {info['target']}\n")
+                f.write(f"Cluster: {info['cluster']}\n")
+                f.write(f"Alignment Score: {info['score']}\n")
+                f.write(f"Fractional Identity: {info['fident']}\n")
+                f.write(f"Alignment Fraction: {info['algn_fraction']}\n")
+                f.write(f"\nGO Terms:\n")
+                f.write(f"  Cellular Components: {info['target_cellular_components'] or 'None'}\n")
+                f.write(f"  Molecular Functions: {info['target_molecular_functions'] or 'None'}\n")
+                f.write(f"  Biological Processes: {info['target_biological_processes'] or 'None'}\n")
+                f.write(f"\n")
+            
+            # Summary by cluster
+            f.write(f"\n{'='*80}\n")
+            f.write(f"Summary by Cluster\n")
+            f.write(f"{'='*80}\n")
+            # Count mimics per cluster
+            mimic_cluster_counts = {}
+            for info in mimic_data:
+                cluster = info['cluster']
+                mimic_cluster_counts[cluster] = mimic_cluster_counts.get(cluster, 0) + 1
+            
+            # Count total samples per cluster (from full pca_df)
+            total_cluster_counts = pca_df['cluster'].value_counts().to_dict()
+            
+            for cluster in sorted(mimic_cluster_counts.keys()):
+                total_samples = total_cluster_counts.get(cluster, 0)
+                mimic_count = mimic_cluster_counts[cluster]
+                f.write(f"Cluster {cluster}: {total_samples} total sample(s), {mimic_count} mimic(s)\n")
+                cluster_queries = [info['query'] for info in mimic_data if info['cluster'] == cluster]
+                f.write(f"  Mimic Query IDs: {', '.join(cluster_queries)}\n")
+            
+            # Also list clusters with no mimics
+            clusters_with_mimics = set(mimic_cluster_counts.keys())
+            clusters_without_mimics = set(total_cluster_counts.keys()) - clusters_with_mimics
+            if clusters_without_mimics:
+                f.write(f"\nClusters without known mimics:\n")
+                for cluster in sorted(clusters_without_mimics):
+                    total_samples = total_cluster_counts.get(cluster, 0)
+                    f.write(f"  Cluster {cluster}: {total_samples} sample(s)\n")
+        
+        print(f"Mimic cluster and GO term information (text) saved to: {txt_file}")
+    
+    # Create 2D visualization
+    plt.clf()
+    plt.figure(figsize=(12, 8))
+    
+    # Generate colors for clusters
+    unique_clusters = sorted(pca_df['cluster'].unique())
+    cluster_colors = plt.cm.get_cmap('tab20', len(unique_clusters))
+    
+    # Get column names for plotting (use first 2 components)
+    x_col = pca_df_plot.columns[0]
+    y_col = pca_df_plot.columns[1] if len(pca_df_plot.columns) > 1 else pca_df_plot.columns[0]
+    
+    for cluster_id in unique_clusters:
+        cluster_mask = pca_df['cluster'] == cluster_id
+        cluster_data = pca_df_plot[cluster_mask]
+        if cluster_id == -1:  # Noise points (if any)
+            plt.scatter(cluster_data[x_col], cluster_data[y_col], 
+                       c='gray', s=4, alpha=0.5, label=f'Noise')
+        else:
+            plt.scatter(cluster_data[x_col], cluster_data[y_col],
+                       c=[cluster_colors(cluster_id)], s=10, 
+                       label=f'Cluster {cluster_id}', alpha=0.6)
+    
+    # Highlight candidates and mimics
+    candidates = pca_df_plot[pca_df['label'] == 'candidate']
+    mimics = pca_df_plot[pca_df['label'] == 'mimic']
+    
+    if len(candidates) > 0:
+        plt.scatter(candidates[x_col], candidates[y_col], 
+                   c='cyan', edgecolor='k', s=35, zorder=10, label='candidate')
+    if len(mimics) > 0:
+        plt.scatter(mimics[x_col], mimics[y_col],
+                   c='mediumspringgreen', edgecolor='k', s=20, zorder=10, label='mimic')
+    
+    plt.xlabel(x_col)
+    plt.ylabel(y_col)
+    if use_diffusion:
+        method_label = 'Diffusion Map'
+    elif use_umap:
+        method_label = 'UMAP'
+    else:
+        method_label = 'PCA'
+    title = f'Value-Driven {method_label} Clustering ({clustering_method}) - {organism_name.capitalize()}'
+    plt.title(title)
+    plt.legend(bbox_to_anchor=(1.05, 1), loc='upper left', fontsize=8)
+    plt.tight_layout(rect=[0, 0, 0.85, 1])
+    plt.savefig(pca_test_dir + f'/value_driven_{suffix}_2d.png', dpi=300)
+    plt.close()
+    
+    # Create 3D visualization if requested
+    if plot_3d and len(pca_df_plot.columns) >= 3:
+        plt.clf()
+        z_col = pca_df_plot.columns[2]
+        
+        # Define multiple viewing angles: (elevation, azimuth, title_suffix)
+        view_angles = [
+            (30, 45, 'standard'),
+            (0, 0, 'xy_plane'),      # Top-down view (looking down Z-axis)
+            (90, 0, 'xz_plane'),     # Side view (looking along Y-axis)
+            (0, 90, 'yz_plane'),     # Side view (looking along X-axis)
+            (30, 135, 'diagonal1'),
+            (30, 225, 'diagonal2'),
+            (60, 45, 'elevated'),
+        ]
+        
+        for elev, azim, suffix in view_angles:
+            fig = plt.figure(figsize=(14, 10))
+            ax = fig.add_subplot(111, projection='3d')
+            
+            # Generate colors for clusters
+            for cluster_id in unique_clusters:
+                cluster_mask = pca_df['cluster'] == cluster_id
+                cluster_data = pca_df_plot[cluster_mask]
+                if cluster_id == -1:  # Noise points (if any)
+                    ax.scatter(cluster_data[x_col], cluster_data[y_col], cluster_data[z_col],
+                             c='gray', s=4, alpha=0.5, label=f'Noise')
+                else:
+                    ax.scatter(cluster_data[x_col], cluster_data[y_col], cluster_data[z_col],
+                             c=[cluster_colors(cluster_id)], s=10, 
+                             label=f'Cluster {cluster_id}', alpha=0.6)
+            
+            # Highlight candidates and mimics
+            if len(candidates) > 0:
+                ax.scatter(candidates[x_col], candidates[y_col], candidates[z_col],
+                         c='cyan', edgecolor='k', s=35, label='candidate', marker='^')
+            if len(mimics) > 0:
+                ax.scatter(mimics[x_col], mimics[y_col], mimics[z_col],
+                         c='mediumspringgreen', edgecolor='k', s=20, label='mimic', marker='s')
+            
+            ax.set_xlabel(x_col)
+            ax.set_ylabel(y_col)
+            ax.set_zlabel(z_col)
+            if use_diffusion:
+                method_label = 'Diffusion Map'
+            elif use_umap:
+                method_label = 'UMAP'
+            else:
+                method_label = 'PCA'
+            title_3d = f'Value-Driven {method_label} Clustering 3D ({clustering_method}) - {organism_name.capitalize()}\n(View: elev={elev}°, azim={azim}°)'
+            ax.set_title(title_3d)
+            ax.view_init(elev=elev, azim=azim)
+            ax.legend(bbox_to_anchor=(1.05, 1), loc='upper left', fontsize=8)
+            plt.tight_layout(rect=[0, 0, 0.85, 1])
+            plot_file_3d = os.path.join(pca_test_dir, f'value_driven_{method_label.lower().replace(" ", "_")}_{clustering_method}_3d_{suffix}.png')
+            plt.savefig(plot_file_3d, dpi=300)
+            plt.close()
+            print(f"Saved 3D visualization ({suffix}) to {plot_file_3d}")
+    elif plot_3d and n_components < 3:
+        print("Warning: Cannot create 3D plot - only {n_components} components available. Need at least 3.")
+    
+    print(f"Value-driven clustering complete. Found {len(unique_clusters)} clusters.")
+
 def pca_analysis(pca_test_dir, data_frame):
      # Store the categorical value in a separate variable
     data_frame['simplified_labels'] = data_frame['target_cellular_components'].apply(classify_label)
