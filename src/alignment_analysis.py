@@ -19,7 +19,7 @@ from skbio.stats.distance import DistanceMatrix, permanova
 from statistics import mean
 from tqdm import tqdm
 from utilities import parse_hyphy_output, uniprot_api_queries
-from stats_modules import PCA_tests
+from utilities.go_semantic_similarity import analyze_go_vs_diffusion_distance
 
 def calculate_average_pLDDT(pdb_file):
     
@@ -983,8 +983,11 @@ def main():
     parser.add_argument('-mt','--mt_seq_predict', action='store_true', help='predict mitochondrial sequences')
     parser.add_argument('-t','--top_hits', action='store_true', help='only output top hits for each query id')
     parser.add_argument('-ap','--alignment_span_filter', action='store_true', help='filter out alignments where the target has aligned to multiple queries on the save span of target structure')
-    parser.add_argument('-pca','--pca_test_dir', type=str, help='path to directory for running and storing PCA tests')
     parser.add_argument('--all_alignments', action='store_true', help='Output all alignments without deduplication')
+    parser.add_argument('--go-similarity-analysis', action='store_true', help='Perform GO semantic similarity vs diffusion distance analysis')
+    parser.add_argument('--diffusion-results', type=str, help='Path to diffusion map results CSV (required for GO similarity analysis)')
+    parser.add_argument('--go-similarity-output', type=str, help='Output directory for GO similarity analysis results')
+    parser.add_argument('--go-column', type=str, default='target_biological_processes', choices=['target_biological_processes', 'target_molecular_functions', 'target_cellular_components'], help='GO term column for similarity analysis')
     args = parser.parse_args()   
 
     # either generate the control dictionary or load it from previous run 
@@ -1074,11 +1077,6 @@ def main():
         aa_sequences = collect_aa_sequences(output_df, 'query', mt_predictions)
         tmp_aa_seq_fasta = write_aa_sequences_to_fasta(aa_sequences, 'mt_prediciton_tmp.fasta')
         output_df = predict_mt_sequences(output_df, tmp_aa_seq_fasta, mt_predictions, 'query')
-        
-    if args.pca_test_dir:
-        go_term_type = 'target_cellular_components'
-        n_clusters = 10
-        PCA_tests.lda_pca_analysis(args.pca_test_dir,output_df, 'wmel_parafilt_tm', go_term_type, n_clusters)
 
     # save dataframe to csv 
     output_df.to_csv(args.csv_out, index=False)
@@ -1086,6 +1084,42 @@ def main():
     # plot histogram of freeliving fraction values for alignment
     if args.fid_plot:
         plot_freeliving_fraction_distribution(alignment_table, args.fid_plot)
+    
+    # GO semantic similarity vs diffusion distance analysis
+    if args.go_similarity_analysis:
+        if not args.diffusion_results:
+            print("Error: --diffusion-results is required for GO similarity analysis")
+            sys.exit(1)
+        
+        if not args.go_similarity_output:
+            # Default to same directory as CSV output
+            if args.csv_out:
+                args.go_similarity_output = os.path.dirname(args.csv_out) or '.'
+            else:
+                args.go_similarity_output = '.'
+        
+        print("\n" + "="*60)
+        print("Running GO Semantic Similarity Analysis")
+        print("="*60)
+        
+        try:
+            results = analyze_go_vs_diffusion_distance(
+                data_frame=output_df,
+                diffusion_results_file=args.diffusion_results,
+                go_term_column=args.go_column,
+                output_dir=args.go_similarity_output,
+                method='jaccard',  # Can be made configurable later
+                use_euclidean=True,  # Can be made configurable later
+                max_samples=None
+            )
+            
+            if results:
+                print(f"\n✓ GO similarity analysis complete!")
+                print(f"  Results saved to: {args.go_similarity_output}")
+        except Exception as e:
+            print(f"Error in GO similarity analysis: {e}")
+            import traceback
+            traceback.print_exc()
     
     # parse list of validation or general IDs of interest to pull from the results of an alignment
     if args.validation_ids:
