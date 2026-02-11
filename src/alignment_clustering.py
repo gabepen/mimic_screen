@@ -161,6 +161,11 @@ def main():
         help='Include targeting features (mTP probability, SP probability) in clustering'
     )
     parser.add_argument(
+        '--plddt_features',
+        action='store_true',
+        help='Include pLDDT features (plddt_query_region, plddt_target_region) in clustering. These are AlphaFold confidence scores for query and target regions.'
+    )
+    parser.add_argument(
         '--include_go_terms',
         action='store_true',
         help='Include GO terms as features (not yet implemented - use semantic clustering instead)'
@@ -216,6 +221,17 @@ def main():
         type=int,
         default=None,
         help='Maximum number of samples for GO similarity analysis (for speed). Default: all samples.'
+    )
+    parser.add_argument(
+        '--save_cloud_definition',
+        action='store_true',
+        help='Save the mimic cloud definition in feature space to a JSON file. This can be transferred to other datasets.'
+    )
+    parser.add_argument(
+        '--transfer_cloud_from',
+        type=str,
+        default=None,
+        help='Path to JSON file containing mimic cloud definition from another dataset (e.g., legionella). Applies this cloud to the current dataset in feature space.'
     )
     
     args = parser.parse_args()
@@ -320,6 +336,7 @@ def main():
             umap_min_dist=args.umap_min_dist,
             include_evolutionary=args.include_evolutionary,
             include_targeting=args.include_targeting,
+            include_plddt=args.plddt_features,
             include_go_terms=args.include_go_terms,
             scaler_type=args.scaler,
             use_diffusion=args.use_diffusion,
@@ -328,7 +345,9 @@ def main():
             exclude_derived_features=args.exclude_derived_features,
             auto_clusters=args.auto_clusters,
             cluster_estimation_method=args.cluster_estimation_method,
-            use_natural_attractor=args.natural_attractor
+            use_natural_attractor=args.natural_attractor,
+            save_cloud_definition=args.save_cloud_definition,
+            transfer_cloud_from=args.transfer_cloud_from
         )
         
         # Run GO similarity analysis if requested and diffusion map was used
