@@ -9,7 +9,7 @@ import ast
 import os
 import pandas as pd
 import sys
-from stats_modules import PCA_tests
+from stats_modules import dimensionality_reduction_tools
 from utilities.go_semantic_similarity import analyze_go_vs_diffusion_distance
 
 
@@ -323,7 +323,7 @@ def main():
             print("Note: Diffusion maps perform trajectory/pseudotime analysis, not clustering.")
             print("Ignoring --n_clusters and --clustering_method for diffusion map analysis.")
         
-        PCA_tests.value_driven_pca_clustering(
+        dimensionality_reduction_tools.value_driven_pca_clustering(
             args.output_dir,
             df,
             args.organism_name,
@@ -394,13 +394,13 @@ def main():
         print("Parsing GO term column: target_cellular_components...")
         df = parse_go_term_columns(df, ['target_cellular_components'])
         print("Running t-SNE analysis...")
-        PCA_tests.tsne_analysis(args.output_dir, df)
+        dimensionality_reduction_tools.tsne_analysis(args.output_dir, df)
     elif args.use_pca_tsne:
         # Parse GO terms for PCA-t-SNE
         print("Parsing GO term column: target_cellular_components...")
         df = parse_go_term_columns(df, ['target_cellular_components'])
         print("Running PCA-t-SNE analysis...")
-        PCA_tests.pca_tsne_analysis(args.output_dir, df)
+        dimensionality_reduction_tools.pca_tsne_analysis(args.output_dir, df)
     else:
         # LDA-PCA methods (supervised, require labels)
         if args.use_semantic_clustering:
@@ -413,7 +413,7 @@ def main():
             df = parse_go_term_columns(df, ['target_cellular_components'])
             args.go_term_type = 'target_cellular_components'  # Still needed for function signature
         
-        PCA_tests.lda_pca_analysis(
+        dimensionality_reduction_tools.lda_pca_analysis(
             args.output_dir,
             df,
             args.organism_name,
