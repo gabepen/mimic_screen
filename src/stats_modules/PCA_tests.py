@@ -487,10 +487,288 @@ def compute_robust_axis_limits(data, percentile_low=1.0, percentile_high=99.0, p
     return (low - padding, high + padding)
 
 
-def compute_diffusion_map_analysis(scaled_data, data_frame, pca_test_dir, organism_name, diffusion_alpha=1.0, diffusion_n_neighbors=15, plot_3d=False, use_natural_attractor=False):
+def define_mimic_cloud_in_feature_space(scaled_data, data_frame, mimic_queries, output_file=None):
+    """
+    Define mimic cloud in feature space (before diffusion mapping).
+    This cloud definition can be transferred to other datasets.
+    
+    Parameters:
+    -----------
+    scaled_data : array-like
+        Scaled feature matrix (n_samples, n_features)
+    data_frame : DataFrame
+        DataFrame with 'query' column to identify mimics
+    mimic_queries : list
+        List of query IDs that are known mimics
+    output_file : str, optional
+        Path to save cloud definition (JSON format)
+    
+    Returns:
+    --------
+    cloud_definition : dict
+        Dictionary containing:
+        - 'core_mimic_features': array of core mimic feature vectors
+        - 'core_mimic_queries': list of query IDs for core mimics
+        - 'threshold_within': distance threshold for "within cloud"
+        - 'threshold_around': distance threshold for "around cloud"
+        - 'all_mimic_features': array of all mimic feature vectors (for reference)
+        - 'all_mimic_queries': list of all mimic query IDs
+    """
+    import json
+    from scipy.spatial.distance import cdist
+    from scipy.sparse import csgraph
+    
+    # Find mimic indices
+    mimic_mask = data_frame['query'].isin(mimic_queries).values
+    mimic_indices = np.where(mimic_mask)[0]
+    
+    if len(mimic_indices) == 0:
+        print("Warning: No mimics found in dataset")
+        return None
+    
+    print(f"\nDefining mimic cloud in feature space...")
+    print(f"  Found {len(mimic_indices)} mimic alignments")
+    
+    # Get mimic features
+    mimic_features = scaled_data[mimic_indices]
+    mimic_queries_found = data_frame.iloc[mimic_indices]['query'].values
+    
+    # Compute pairwise distances between mimics in feature space
+    mimic_pairwise_distances = cdist(mimic_features, mimic_features, metric='euclidean')
+    upper_triangle = np.triu(mimic_pairwise_distances, k=1)
+    mimic_pairwise_flat = upper_triangle[upper_triangle > 0]
+    
+    if len(mimic_pairwise_flat) == 0:
+        # Only one unique mimic
+        print("  Only one unique mimic position, using all mimics")
+        core_mimic_indices = list(range(len(mimic_indices)))
+        cluster_threshold = 0.0
+    else:
+        # Calculate distance statistics
+        q25_pairwise_dist = np.percentile(mimic_pairwise_flat, 25)
+        q50_pairwise_dist = np.median(mimic_pairwise_flat)
+        q75_pairwise_dist = np.percentile(mimic_pairwise_flat, 75)
+        max_pairwise_dist = np.max(mimic_pairwise_flat)
+        
+        print(f"  Mimic pairwise distance statistics:")
+        print(f"    25th percentile: {q25_pairwise_dist:.6f}")
+        print(f"    Median: {q50_pairwise_dist:.6f}")
+        print(f"    75th percentile: {q75_pairwise_dist:.6f}")
+        print(f"    Max: {max_pairwise_dist:.6f}")
+        
+        # Try progressively tighter thresholds to find main cluster
+        thresholds_to_try = [
+            q25_pairwise_dist * 0.75,  # Tightest
+            q25_pairwise_dist,        # 25th percentile
+            q50_pairwise_dist,        # Median
+        ]
+        
+        best_cluster = None
+        best_threshold = None
+        min_cluster_size = max(2, len(mimic_indices) // 3)
+        
+        for cluster_threshold in thresholds_to_try:
+            # Build adjacency graph
+            adjacency = (mimic_pairwise_distances <= cluster_threshold).astype(int)
+            np.fill_diagonal(adjacency, 0)
+            
+            # Find connected components
+            n_components, labels = csgraph.connected_components(
+                csgraph=adjacency, directed=False, return_labels=True
+            )
+            
+            if n_components > 0:
+                component_sizes = [np.sum(labels == i) for i in range(n_components)]
+                component_sizes_sorted = sorted(component_sizes, reverse=True)
+                largest_component_size = component_sizes_sorted[0]
+                largest_component_idx = np.argmax(component_sizes)
+                largest_component = np.where(labels == largest_component_idx)[0]
+                
+                # Check if this is a good cluster
+                is_good_cluster = (
+                    largest_component_size >= min_cluster_size and
+                    largest_component_size < len(mimic_indices)  # Excludes at least one
+                )
+                
+                if len(component_sizes_sorted) > 1:
+                    second_largest = component_sizes_sorted[1]
+                    is_dominant = largest_component_size >= second_largest * 2
+                    is_good_cluster = is_good_cluster and is_dominant
+                
+                if is_good_cluster:
+                    best_cluster = largest_component
+                    best_threshold = cluster_threshold
+                    print(f"  Using threshold: {cluster_threshold:.6f}")
+                    print(f"  Found main cluster with {len(best_cluster)} mimics (excludes {len(mimic_indices) - len(best_cluster)} outlier(s))")
+                    break
+        
+        # Use best cluster or fallback
+        if best_cluster is not None:
+            core_mimic_indices = best_cluster.tolist()
+            cluster_threshold = best_threshold
+        else:
+            # Fallback: use tight threshold
+            cluster_threshold = q25_pairwise_dist * 0.5
+            print(f"  No ideal cluster found, using tight threshold ({cluster_threshold:.6f})")
+            
+            adjacency = (mimic_pairwise_distances <= cluster_threshold).astype(int)
+            np.fill_diagonal(adjacency, 0)
+            n_components, labels = csgraph.connected_components(
+                csgraph=adjacency, directed=False, return_labels=True
+            )
+            
+            if n_components > 0:
+                component_sizes = [np.sum(labels == i) for i in range(n_components)]
+                largest_component_idx = np.argmax(component_sizes)
+                core_mimic_indices = np.where(labels == largest_component_idx)[0].tolist()
+            else:
+                # Last resort: use all mimics
+                core_mimic_indices = list(range(len(mimic_indices)))
+    
+    # Get core mimic features
+    core_mimic_features = mimic_features[core_mimic_indices]
+    core_mimic_queries = mimic_queries_found[core_mimic_indices].tolist()
+    
+    # Calculate thresholds for cloud definition
+    if len(core_mimic_indices) > 1:
+        core_pairwise_distances = cdist(core_mimic_features, core_mimic_features, metric='euclidean')
+        upper_triangle_core = np.triu(core_pairwise_distances, k=1)
+        core_pairwise_flat = upper_triangle_core[upper_triangle_core > 0]
+        
+        if len(core_pairwise_flat) > 0:
+            q75_core = np.percentile(core_pairwise_flat, 75)
+            q90_core = np.percentile(core_pairwise_flat, 90)
+            threshold_within = q75_core
+            threshold_around = q90_core * 1.25  # 90th percentile + 25% buffer
+        else:
+            threshold_within = 0.0
+            threshold_around = 0.0
+    else:
+        threshold_within = 0.0
+        threshold_around = 0.0
+    
+    print(f"  Cloud thresholds:")
+    print(f"    Within cloud: {threshold_within:.6f}")
+    print(f"    Around cloud: {threshold_around:.6f}")
+    
+    # Create cloud definition (keep as numpy arrays for immediate use)
+    cloud_definition = {
+        'core_mimic_features': core_mimic_features,  # Keep as numpy array
+        'core_mimic_queries': core_mimic_queries,
+        'all_mimic_features': mimic_features,  # Keep as numpy array
+        'all_mimic_queries': mimic_queries_found.tolist(),
+        'threshold_within': float(threshold_within),
+        'threshold_around': float(threshold_around),
+        'n_core_mimics': len(core_mimic_indices),
+        'n_total_mimics': len(mimic_indices)
+    }
+    
+    # Save to file if specified (convert to lists for JSON)
+    if output_file:
+        cloud_definition_for_json = cloud_definition.copy()
+        cloud_definition_for_json['core_mimic_features'] = core_mimic_features.tolist()
+        cloud_definition_for_json['all_mimic_features'] = mimic_features.tolist()
+        with open(output_file, 'w') as f:
+            json.dump(cloud_definition_for_json, f, indent=2)
+        print(f"  Saved cloud definition to: {output_file}")
+    
+    return cloud_definition
+
+
+def load_mimic_cloud_definition(cloud_file):
+    """
+    Load a saved mimic cloud definition from JSON file.
+    
+    Parameters:
+    -----------
+    cloud_file : str
+        Path to JSON file containing cloud definition
+    
+    Returns:
+    --------
+    cloud_definition : dict
+        Cloud definition dictionary
+    """
+    import json
+    
+    with open(cloud_file, 'r') as f:
+        cloud_definition = json.load(f)
+    
+    # Convert lists back to numpy arrays
+    cloud_definition['core_mimic_features'] = np.array(cloud_definition['core_mimic_features'])
+    cloud_definition['all_mimic_features'] = np.array(cloud_definition['all_mimic_features'])
+    
+    return cloud_definition
+
+
+def apply_mimic_cloud_to_dataset(scaled_data, cloud_definition):
+    """
+    Apply a mimic cloud definition (from another dataset) to a new dataset.
+    
+    Parameters:
+    -----------
+    scaled_data : array-like
+        Scaled feature matrix for new dataset (n_samples, n_features)
+    cloud_definition : dict
+        Cloud definition from define_mimic_cloud_in_feature_space or load_mimic_cloud_definition
+    
+    Returns:
+    --------
+    results : dict
+        Dictionary containing:
+        - 'within_cloud': boolean array indicating samples within cloud
+        - 'around_cloud': boolean array indicating samples around cloud
+        - 'min_distances': array of minimum distances to core mimics
+        - 'distances_to_center': array of distances to cloud center
+    """
+    from scipy.spatial.distance import cdist
+    
+    core_mimic_features = cloud_definition['core_mimic_features']
+    threshold_within = cloud_definition['threshold_within']
+    threshold_around = cloud_definition['threshold_around']
+    
+    # Check feature dimensions match
+    if scaled_data.shape[1] != core_mimic_features.shape[1]:
+        raise ValueError(
+            f"Feature dimension mismatch: new data has {scaled_data.shape[1]} features, "
+            f"cloud definition expects {core_mimic_features.shape[1]} features"
+        )
+    
+    # Compute distances from all samples to core mimics
+    distances_to_mimics = cdist(scaled_data, core_mimic_features, metric='euclidean')
+    min_distances = np.min(distances_to_mimics, axis=1)
+    
+    # Apply thresholds
+    within_cloud = min_distances <= threshold_within
+    around_cloud = min_distances <= threshold_around
+    
+    # Compute distance to cloud center
+    cloud_center = np.mean(core_mimic_features, axis=0)
+    distances_to_center = np.sqrt(np.sum((scaled_data - cloud_center)**2, axis=1))
+    
+    results = {
+        'within_cloud': within_cloud,
+        'around_cloud': around_cloud,
+        'min_distances': min_distances,
+        'distances_to_center': distances_to_center,
+        'cloud_center': cloud_center
+    }
+    
+    return results
+
+
+def compute_diffusion_map_analysis(scaled_data, data_frame, pca_test_dir, organism_name, diffusion_alpha=1.0, diffusion_n_neighbors=15, plot_3d=False, use_natural_attractor=False, transfer_cloud_from=None, save_cloud_definition=False):
     """
     Compute diffusion map and diffusion pseudotime analysis.
     This is for trajectory analysis, not clustering.
+    
+    Parameters:
+    -----------
+    transfer_cloud_from : str, optional
+        Path to JSON file containing mimic cloud definition from another dataset.
+        If provided, this cloud will be applied in feature space and visualized.
+    save_cloud_definition : bool, optional
+        If True, save the mimic cloud definition to a JSON file for transfer to other datasets.
     """
     from sklearn.neighbors import kneighbors_graph
     from scipy.sparse import csr_matrix, diags
@@ -498,7 +776,18 @@ def compute_diffusion_map_analysis(scaled_data, data_frame, pca_test_dir, organi
     from scipy.sparse.csgraph import shortest_path
     import os
     
-    print(f"Using Diffusion Map for trajectory analysis (alpha={diffusion_alpha}, n_neighbors={diffusion_n_neighbors})...")
+    # Check for multi-system mode (joint diffusion embedding)
+    is_multi_system = 'system' in data_frame.columns
+    if is_multi_system:
+        systems = data_frame['system'].unique()
+        print(f"\n{'='*60}")
+        print(f"Multi-system mode detected: {len(systems)} systems found")
+        print(f"Systems: {', '.join(sorted(systems))}")
+        print(f"{'='*60}")
+        print(f"Using JOINT diffusion embedding across all systems...")
+        print(f"  This creates a unified manifold where mimic cloud regions are comparable across systems.")
+    else:
+        print(f"Using Diffusion Map for trajectory analysis (alpha={diffusion_alpha}, n_neighbors={diffusion_n_neighbors})...")
     
     # Create k-nearest neighbors graph with distances
     knn_graph = kneighbors_graph(scaled_data, n_neighbors=diffusion_n_neighbors, mode='distance', metric='euclidean', include_self=True)
@@ -765,6 +1054,51 @@ def compute_diffusion_map_analysis(scaled_data, data_frame, pca_test_dir, organi
     else:
         results_df['trajectory_order'] = np.argsort(dc1_pseudotime)
     
+    # Feature-space cloud definition and transfer
+    transferred_cloud_results = None
+    local_cloud_definition = None
+    
+    # Define and save cloud in feature space if requested
+    if save_cloud_definition:
+        print("\n" + "="*60)
+        print("Defining mimic cloud in feature space (for transfer to other datasets)")
+        print("="*60)
+        cloud_output_file = os.path.join(pca_test_dir, f'{organism_name}_mimic_cloud_definition.json')
+        local_cloud_definition = define_mimic_cloud_in_feature_space(
+            scaled_data, data_frame, validation_list, output_file=cloud_output_file
+        )
+        if local_cloud_definition:
+            # Apply to current dataset and add to results
+            local_cloud_results = apply_mimic_cloud_to_dataset(scaled_data, local_cloud_definition)
+            results_df['feature_space_within_cloud'] = local_cloud_results['within_cloud']
+            results_df['feature_space_around_cloud'] = local_cloud_results['around_cloud']
+            results_df['feature_space_min_dist_to_mimic'] = local_cloud_results['min_distances']
+            results_df['feature_space_dist_to_cloud_center'] = local_cloud_results['distances_to_center']
+            print(f"  Applied feature-space cloud to current dataset:")
+            print(f"    Within cloud: {local_cloud_results['within_cloud'].sum()} samples")
+            print(f"    Around cloud: {local_cloud_results['around_cloud'].sum()} samples")
+    
+    # Load and apply transferred cloud if provided
+    if transfer_cloud_from:
+        print("\n" + "="*60)
+        print(f"Applying transferred mimic cloud from: {transfer_cloud_from}")
+        print("="*60)
+        try:
+            transferred_cloud_definition = load_mimic_cloud_definition(transfer_cloud_from)
+            transferred_cloud_results = apply_mimic_cloud_to_dataset(scaled_data, transferred_cloud_definition)
+            results_df['transferred_within_cloud'] = transferred_cloud_results['within_cloud']
+            results_df['transferred_around_cloud'] = transferred_cloud_results['around_cloud']
+            results_df['transferred_min_dist_to_mimic'] = transferred_cloud_results['min_distances']
+            results_df['transferred_dist_to_cloud_center'] = transferred_cloud_results['distances_to_center']
+            print(f"  Transferred cloud applied successfully:")
+            print(f"    Within cloud: {transferred_cloud_results['within_cloud'].sum()} samples")
+            print(f"    Around cloud: {transferred_cloud_results['around_cloud'].sum()} samples")
+            print(f"    Cloud from: {len(transferred_cloud_definition['core_mimic_queries'])} core mimics")
+        except Exception as e:
+            print(f"  Error loading/applying transferred cloud: {e}")
+            import traceback
+            traceback.print_exc()
+    
     # Identify best alignments for known mimics and candidates
     alignment_quality = (data_frame['score'].values * 
                         data_frame['fident'].values * 
@@ -802,6 +1136,9 @@ def compute_diffusion_map_analysis(scaled_data, data_frame, pca_test_dir, organi
     # Include query column and GO term columns if available for downstream analysis
     if 'query' in data_frame.columns:
         results_df['query'] = data_frame['query'].values
+    # Include system column if present (for multi-system mode)
+    if 'system' in data_frame.columns:
+        results_df['system'] = data_frame['system'].values
     # Include GO term columns if they exist
     go_term_cols = ['target_biological_processes', 'target_molecular_functions', 'target_cellular_components']
     for col in go_term_cols:
@@ -2284,8 +2621,14 @@ def compute_diffusion_map_analysis(scaled_data, data_frame, pca_test_dir, organi
     
     # Generate diffusion map summary: samples within 3D distance of top 10 closest known mimics
     print("\n" + "="*60)
-    print("Generating Diffusion Map Summary: Samples near Top 10 Closest Known Mimics")
-    print("="*60)
+    if is_multi_system:
+        print("Generating Joint Diffusion Map Summary: Mimic Cloud in Unified Manifold")
+        print("="*60)
+        print("  Cloud defined in JOINT DIFFUSION SPACE (not feature space)")
+        print("  This allows direct comparison of mimic regions across systems")
+    else:
+        print("Generating Diffusion Map Summary: Samples near Top 10 Closest Known Mimics")
+        print("="*60)
     
     # Find known mimics in results
     if 'query' in results_df.columns:
@@ -2299,15 +2642,13 @@ def compute_diffusion_map_analysis(scaled_data, data_frame, pca_test_dir, organi
                 mimic_coords_3d = results_df.iloc[mimic_indices][dc_cols[:3]].values
                 all_coords_3d = results_df[dc_cols[:3]].values
                 
-                # Find mimics that are close neighbors to each other in diffusion space
-                # Goal: Include at least 10 mimics (or all available if less than 10)
-                # Strategy: Start with a reasonable threshold and expand if needed
+                # Find mimics that form the main cluster in diffusion space
+                # Goal: Exclude outlier mimics that are far from the main cluster
+                # Strategy: Use a fixed threshold based on percentile distances to identify core cluster
                 # Compute pairwise distances between all mimics in 3D space
                 mimic_coords_all = all_coords_3d[mimic_indices]
                 from scipy.spatial.distance import cdist
                 mimic_pairwise_distances_all = cdist(mimic_coords_all, mimic_coords_all, metric='euclidean')
-                
-                target_num_mimics = min(10, len(mimic_indices))  # Want at least 10, or all if less
                 
                 if len(mimic_indices) > 1:
                     upper_triangle = np.triu(mimic_pairwise_distances_all, k=1)
@@ -2328,50 +2669,120 @@ def compute_diffusion_map_analysis(scaled_data, data_frame, pca_test_dir, organi
                         print(f"    75th percentile: {q75_pairwise_dist:.6f}")
                         print(f"    Max: {max_pairwise_dist:.6f}")
                         
-                        # Start with median distance as threshold (less conservative than 25th percentile)
-                        # Try progressively larger thresholds until we get enough mimics
+                        # Use a tighter threshold to identify the main cluster
+                        # Try progressively tighter thresholds, preferring ones that exclude outliers
+                        # Goal: Find the tightest threshold that still gives a substantial cluster
                         thresholds_to_try = [
-                            q50_pairwise_dist,  # Start with median
-                            q75_pairwise_dist,  # Then 75th percentile
-                            max_pairwise_dist * 0.8,  # Then 80% of max
-                            max_pairwise_dist,  # Then max
-                            max_pairwise_dist * 1.5  # Finally, 1.5x max (includes all)
+                            q25_pairwise_dist * 0.75,  # Tightest: 75% of 25th percentile
+                            q25_pairwise_dist,  # 25th percentile
+                            q50_pairwise_dist,  # Median (looser)
                         ]
                         
-                        core_mimic_indices = None
-                        final_threshold = None
+                        best_cluster = None
+                        best_threshold = None
+                        min_cluster_size = max(2, len(mimic_indices) // 3)  # Want at least 1/3 of mimics, or 2 minimum
                         
-                        for threshold in thresholds_to_try:
-                            # Count neighbors for each mimic at this threshold
-                            neighbor_counts = []
-                            for i in range(len(mimic_indices)):
-                                neighbors = np.sum((mimic_pairwise_distances_all[i, :] <= threshold) & 
-                                                  (mimic_pairwise_distances_all[i, :] > 0))
-                                neighbor_counts.append(neighbors)
+                        for cluster_threshold in thresholds_to_try:
+                            # Build adjacency graph: mimics are connected if within threshold
+                            # Find connected components (clusters)
+                            from scipy.sparse import csgraph
+                            adjacency = (mimic_pairwise_distances_all <= cluster_threshold).astype(int)
+                            # Remove diagonal (self-connections)
+                            np.fill_diagonal(adjacency, 0)
                             
-                            # Start with the mimic that has the most neighbors
-                            core_mimic_idx = np.argmax(neighbor_counts)
-                            candidate_indices = [core_mimic_idx]
+                            # Find connected components
+                            n_components, labels = csgraph.connected_components(
+                                csgraph=adjacency, directed=False, return_labels=True
+                            )
                             
-                            # Add all mimics that are neighbors of the core mimic
-                            for i in range(len(mimic_indices)):
-                                if i != core_mimic_idx:
-                                    if mimic_pairwise_distances_all[core_mimic_idx, i] <= threshold:
-                                        candidate_indices.append(i)
-                            
-                            # If we have enough mimics, use this threshold
-                            if len(candidate_indices) >= target_num_mimics:
-                                core_mimic_indices = candidate_indices
-                                final_threshold = threshold
-                                print(f"  Using threshold: {final_threshold:.6f}")
-                                print(f"  Found {len(core_mimic_indices)} mimics (target: {target_num_mimics})")
-                                break
+                            # Find the largest component
+                            if n_components > 0:
+                                component_sizes = [np.sum(labels == i) for i in range(n_components)]
+                                component_sizes_sorted = sorted(component_sizes, reverse=True)
+                                largest_component_size = component_sizes_sorted[0]
+                                largest_component_idx = np.argmax(component_sizes)
+                                largest_component = np.where(labels == largest_component_idx)[0]
+                                
+                                # Prefer this threshold if:
+                                # 1. It gives a cluster of reasonable size (at least min_cluster_size)
+                                # 2. It excludes at least one mimic (not all mimics)
+                                # 3. The largest cluster is clearly dominant (at least 2x the second largest, if exists)
+                                is_good_cluster = (
+                                    largest_component_size >= min_cluster_size and
+                                    largest_component_size < len(mimic_indices)  # Excludes at least one
+                                )
+                                
+                                if len(component_sizes_sorted) > 1:
+                                    second_largest = component_sizes_sorted[1]
+                                    is_dominant = largest_component_size >= second_largest * 2
+                                    is_good_cluster = is_good_cluster and is_dominant
+                                
+                                if is_good_cluster:
+                                    best_cluster = largest_component
+                                    best_threshold = cluster_threshold
+                                    print(f"  Using threshold: {cluster_threshold:.6f}")
+                                    print(f"  Found main cluster with {len(best_cluster)} mimics (excludes {len(mimic_indices) - len(best_cluster)} outlier(s))")
+                                    break
                         
-                        # If we still don't have enough, use all mimics
-                        if core_mimic_indices is None or len(core_mimic_indices) < target_num_mimics:
-                            core_mimic_indices = list(range(len(mimic_indices)))
-                            final_threshold = max_pairwise_dist * 2  # Effectively includes all
-                            print(f"  Warning: Could not find {target_num_mimics} clustered mimics, using all {len(mimic_indices)} mimics")
+                        # Use the best cluster found, or fall back if no good cluster found
+                        if best_cluster is not None:
+                            core_mimic_indices = best_cluster.tolist()
+                            cluster_threshold = best_threshold
+                        else:
+                            # Fallback: use a very tight threshold (25th percentile * 0.5) to force exclusion
+                            cluster_threshold = q25_pairwise_dist * 0.5
+                            print(f"  No ideal cluster found, using tight threshold ({cluster_threshold:.6f})")
+                            
+                            # Build adjacency and find largest component
+                            from scipy.sparse import csgraph
+                            adjacency = (mimic_pairwise_distances_all <= cluster_threshold).astype(int)
+                            np.fill_diagonal(adjacency, 0)
+                            n_components, labels = csgraph.connected_components(
+                                csgraph=adjacency, directed=False, return_labels=True
+                            )
+                            
+                            if n_components > 0:
+                                component_sizes = [np.sum(labels == i) for i in range(n_components)]
+                                largest_component_idx = np.argmax(component_sizes)
+                                core_mimic_indices = np.where(labels == largest_component_idx)[0].tolist()
+                                print(f"  Found cluster with {len(core_mimic_indices)} mimics using tight threshold")
+                            else:
+                                # Last resort: use median with core-based approach
+                                cluster_threshold = q50_pairwise_dist
+                                print(f"  Using median threshold ({cluster_threshold:.6f}) as last resort")
+                                
+                                # Find the mimic with the most neighbors
+                                neighbor_counts = []
+                                for i in range(len(mimic_indices)):
+                                    neighbors = np.sum((mimic_pairwise_distances_all[i, :] <= cluster_threshold) & 
+                                                      (mimic_pairwise_distances_all[i, :] > 0))
+                                    neighbor_counts.append(neighbors)
+                                
+                                core_mimic_idx = np.argmax(neighbor_counts)
+                                core_mimic_indices = [core_mimic_idx]
+                                
+                                # Add all mimics within threshold of core
+                                for i in range(len(mimic_indices)):
+                                    if i != core_mimic_idx:
+                                        if mimic_pairwise_distances_all[core_mimic_idx, i] <= cluster_threshold:
+                                            core_mimic_indices.append(i)
+                                print(f"  Found cluster with {len(core_mimic_indices)} mimics")
+                        
+                        # Report which mimics were included/excluded
+                        excluded_indices = [i for i in range(len(mimic_indices)) if i not in core_mimic_indices]
+                        print(f"  Core cluster: {len(core_mimic_indices)} mimics included")
+                        if len(excluded_indices) > 0:
+                            excluded_queries = results_df.iloc[mimic_indices[excluded_indices]]['query'].values
+                            print(f"  Excluded {len(excluded_indices)} outlier mimic(s): {', '.join(excluded_queries)}")
+                            # Show distances of excluded mimics to nearest core mimic
+                            core_coords = mimic_coords_all[core_mimic_indices]
+                            for excl_idx in excluded_indices:
+                                excl_coord = mimic_coords_all[excl_idx:excl_idx+1]
+                                dists_to_core = cdist(excl_coord, core_coords, metric='euclidean')[0]
+                                min_dist_to_core = np.min(dists_to_core)
+                                print(f"    - {results_df.iloc[mimic_indices[excl_idx]]['query']}: min distance to core = {min_dist_to_core:.6f} (threshold = {cluster_threshold:.6f})")
+                        else:
+                            print(f"  Warning: All mimics included - consider using a tighter threshold")
                         
                         top_10_mimic_indices = mimic_indices[core_mimic_indices]
                     else:
@@ -2411,13 +2822,19 @@ def compute_diffusion_map_analysis(scaled_data, data_frame, pca_test_dir, organi
                 if len(mimic_pairwise_distances_flat) > 0:
                     median_mimic_distance = np.median(mimic_pairwise_distances_flat)
                     max_mimic_distance = np.max(mimic_pairwise_distances_flat)
+                    # Use robust percentiles to exclude outliers
+                    q90_mimic_distance = np.percentile(mimic_pairwise_distances_flat, 90)
+                    q95_mimic_distance = np.percentile(mimic_pairwise_distances_flat, 95)
                 else:
                     median_mimic_distance = avg_spread
                     max_mimic_distance = avg_spread
+                    q90_mimic_distance = avg_spread
+                    q95_mimic_distance = avg_spread
                 
-                # Define thresholds (more conservative):
+                # Define thresholds (more conservative, robust to outliers):
                 # 1. "Within cloud": distance <= 75th percentile of mimic pairwise distances (tighter than median)
-                # 2. "Just around cloud": distance <= max distance between mimics + smaller buffer (more conservative)
+                # 2. "Just around cloud": distance <= 90th percentile (excludes extreme outliers) + buffer
+                #    This prevents outlier mimics from inflating the cloud size
                 if len(mimic_pairwise_distances_flat) > 0:
                     q75_mimic_distance = np.percentile(mimic_pairwise_distances_flat, 75)
                     # Use 75th percentile instead of median for tighter "within cloud"
@@ -2425,9 +2842,16 @@ def compute_diffusion_map_analysis(scaled_data, data_frame, pca_test_dir, organi
                 else:
                     threshold_within = median_mimic_distance
                 
-                # Use smaller buffer (25% instead of 50%) for more conservative "around cloud"
-                buffer_factor = 0.25  # Add 25% buffer beyond max mimic distance (more conservative)
-                threshold_around = max_mimic_distance * (1 + buffer_factor)
+                # Use 90th percentile instead of max to exclude outlier mimics from cloud definition
+                # This ensures the cloud is defined by the main cluster, not distant outliers
+                # Add a small buffer (25%) for "around cloud" threshold
+                buffer_factor = 0.25  # Add 25% buffer beyond 90th percentile distance
+                threshold_around = q90_mimic_distance * (1 + buffer_factor)
+                
+                # Log the difference between max and 90th percentile to show if outliers were excluded
+                if len(mimic_pairwise_distances_flat) > 0 and max_mimic_distance > q90_mimic_distance * 1.1:
+                    print(f"  Note: Using 90th percentile ({q90_mimic_distance:.6f}) instead of max ({max_mimic_distance:.6f})")
+                    print(f"    This excludes outlier mimics that are far from the main cluster")
                 
                 # Count samples
                 samples_within_cloud = np.sum(min_dist_to_any_mimic <= threshold_within)
@@ -2446,6 +2870,7 @@ def compute_diffusion_map_analysis(scaled_data, data_frame, pca_test_dir, organi
                     'mimic_spread': mimic_spread,
                     'median_mimic_distance': median_mimic_distance,
                     'max_mimic_distance': max_mimic_distance,
+                    'q90_mimic_distance': q90_mimic_distance if len(mimic_pairwise_distances_flat) > 0 else avg_spread,
                     'threshold_within': threshold_within,
                     'threshold_around': threshold_around,
                     'samples_within_cloud': samples_within_cloud,
@@ -2457,18 +2882,49 @@ def compute_diffusion_map_analysis(scaled_data, data_frame, pca_test_dir, organi
                 }
                 
                 # Write summary to file
-                summary_file = os.path.join(pca_test_dir, f'{organism_name}_diffusion_map_mimic_proximity_summary.txt')
+                if is_multi_system:
+                    summary_file = os.path.join(pca_test_dir, 'joint_diffusion_map_mimic_proximity_summary.txt')
+                else:
+                    summary_file = os.path.join(pca_test_dir, f'{organism_name}_diffusion_map_mimic_proximity_summary.txt')
                 with open(summary_file, 'w') as f:
-                    f.write("Diffusion Map Summary: Samples within Mimic Cloud Region\n")
-                    f.write("="*80 + "\n\n")
+                    if is_multi_system:
+                        f.write("Joint Diffusion Map Summary: Mimic Cloud in Unified Manifold\n")
+                        f.write("="*80 + "\n\n")
+                        f.write("MULTI-SYSTEM MODE: Cloud defined in JOINT DIFFUSION SPACE\n")
+                        f.write("  This allows direct comparison of mimic regions across systems\n")
+                        f.write("  All systems share the same diffusion manifold coordinates\n\n")
+                    else:
+                        f.write("Diffusion Map Summary: Samples within Mimic Cloud Region\n")
+                        f.write("="*80 + "\n\n")
                     f.write(f"Total samples in analysis: {len(results_df)}\n")
+                    if is_multi_system:
+                        systems = results_df['system'].unique()
+                        f.write(f"Systems: {', '.join(sorted(systems))}\n")
+                        for system in sorted(systems):
+                            system_mask = results_df['system'] == system
+                            f.write(f"  {system}: {system_mask.sum()} samples\n")
                     f.write(f"Total known mimics found: {len(mimic_indices)}\n")
-                    f.write(f"Analyzing top {len(top_10_mimic_indices)} closest mimics\n\n")
+                    if is_multi_system:
+                        # Show mimic breakdown by system
+                        for system in sorted(systems):
+                            system_mask = results_df['system'] == system
+                            system_mimic_mask = system_mask & mimic_mask
+                            if system_mimic_mask.sum() > 0:
+                                f.write(f"  {system}: {system_mimic_mask.sum()} mimics\n")
+                    f.write(f"Mimics used for cloud definition: {len(top_10_mimic_indices)} (core cluster only)\n")
+                    if len(top_10_mimic_indices) < len(mimic_indices):
+                        f.write(f"  Note: {len(mimic_indices) - len(top_10_mimic_indices)} outlier mimic(s) excluded from cloud definition\n\n")
+                    else:
+                        f.write("\n")
                     
                     f.write("Mimic Cloud Definition:\n")
-                    f.write("  - We define a 'cloud' region around all known mimics\n")
-                    f.write("  - 'Within cloud': samples within median distance between mimics\n")
-                    f.write("  - 'Around cloud': samples within max distance + 50% buffer\n\n")
+                    if is_multi_system:
+                        f.write("  - Cloud defined in JOINT DIFFUSION SPACE (not feature space)\n")
+                        f.write("  - Uses diffusion coordinates from unified manifold across all systems\n")
+                    f.write("  - We define a 'cloud' region around the CORE CLUSTER of known mimics\n")
+                    f.write("  - Outlier mimics (far from main cluster) are excluded from cloud definition\n")
+                    f.write("  - 'Within cloud': samples within 75th percentile of core mimic pairwise distances\n")
+                    f.write("  - 'Around cloud': samples within 90th percentile + 25% buffer\n\n")
                     
                     f.write("-"*80 + "\n")
                     f.write("Mimic Cloud Statistics\n")
@@ -2484,11 +2940,17 @@ def compute_diffusion_map_analysis(scaled_data, data_frame, pca_test_dir, organi
                     
                     f.write(f"Distances between mimics:\n")
                     f.write(f"  Median pairwise distance: {summary_data['median_mimic_distance']:.6f}\n")
-                    f.write(f"  Maximum pairwise distance: {summary_data['max_mimic_distance']:.6f}\n\n")
+                    f.write(f"  Maximum pairwise distance: {summary_data['max_mimic_distance']:.6f}\n")
+                    f.write(f"  90th percentile distance: {summary_data['q90_mimic_distance']:.6f}\n")
+                    if summary_data['max_mimic_distance'] > summary_data['q90_mimic_distance'] * 1.1:
+                        ratio = summary_data['max_mimic_distance'] / summary_data['q90_mimic_distance']
+                        f.write(f"  Note: Max distance is {ratio:.2f}x larger than 90th percentile\n")
+                        f.write(f"    → Outlier mimics detected, using 90th percentile for cloud definition\n")
+                    f.write("\n")
                     
                     f.write(f"Cloud boundaries:\n")
-                    f.write(f"  'Within cloud' threshold: {summary_data['threshold_within']:.6f} (median mimic distance)\n")
-                    f.write(f"  'Around cloud' threshold: {summary_data['threshold_around']:.6f} (max distance + 50% buffer)\n\n")
+                    f.write(f"  'Within cloud' threshold: {summary_data['threshold_within']:.6f} (75th percentile of mimic distances)\n")
+                    f.write(f"  'Around cloud' threshold: {summary_data['threshold_around']:.6f} (90th percentile + 25% buffer)\n\n")
                     
                     f.write("-"*80 + "\n")
                     f.write("Sample Counts\n")
@@ -2496,6 +2958,25 @@ def compute_diffusion_map_analysis(scaled_data, data_frame, pca_test_dir, organi
                     f.write(f"Samples within cloud: {summary_data['samples_within_cloud']} / {summary_data['total_samples']} ({100.0*summary_data['samples_within_cloud']/summary_data['total_samples']:.2f}%)\n")
                     f.write(f"Samples around cloud (including within): {summary_data['samples_around_cloud']} / {summary_data['total_samples']} ({100.0*summary_data['samples_around_cloud']/summary_data['total_samples']:.2f}%)\n")
                     f.write(f"Samples outside cloud: {summary_data['samples_outside_cloud']} / {summary_data['total_samples']} ({100.0*summary_data['samples_outside_cloud']/summary_data['total_samples']:.2f}%)\n\n")
+                    
+                    if is_multi_system:
+                        f.write("-"*80 + "\n")
+                        f.write("Per-System Breakdown\n")
+                        f.write("-"*80 + "\n")
+                        systems = results_df['system'].unique()
+                        within_mask = summary_data['min_dist_to_any_mimic'] <= summary_data['threshold_within']
+                        around_mask = summary_data['min_dist_to_any_mimic'] <= summary_data['threshold_around']
+                        outside_mask = ~around_mask
+                        for system in sorted(systems):
+                            system_mask = results_df['system'] == system
+                            sys_within = (system_mask & within_mask).sum()
+                            sys_around = (system_mask & around_mask).sum()
+                            sys_outside = (system_mask & outside_mask).sum()
+                            sys_total = system_mask.sum()
+                            f.write(f"{system}:\n")
+                            f.write(f"  Within cloud: {sys_within} / {sys_total} ({100.0*sys_within/sys_total:.2f}%)\n")
+                            f.write(f"  Around cloud: {sys_around} / {sys_total} ({100.0*sys_around/sys_total:.2f}%)\n")
+                            f.write(f"  Outside cloud: {sys_outside} / {sys_total} ({100.0*sys_outside/sys_total:.2f}%)\n\n")
                     
                     # Distance statistics
                     f.write("-"*80 + "\n")
@@ -2533,30 +3014,65 @@ def compute_diffusion_map_analysis(scaled_data, data_frame, pca_test_dir, organi
                 ]
                 
                 for view in viewing_angles:
-                    fig = plt.figure(figsize=(14, 10))
+                    fig = plt.figure(figsize=(16, 12) if is_multi_system else (14, 10))
                     ax = fig.add_subplot(111, projection='3d')
                     
-                    # Plot samples outside cloud (gray, low alpha)
-                    if outside_mask.sum() > 0:
-                        ax.scatter(all_coords_3d[outside_mask, 0], 
-                                 all_coords_3d[outside_mask, 1], 
-                                 all_coords_3d[outside_mask, 2],
-                                 c='lightgray', s=5, alpha=0.2, label=f'Outside cloud ({outside_mask.sum()})', zorder=1)
+                    # In multi-system mode, color by system; otherwise use cloud membership
+                    if is_multi_system:
+                        # Color all points by system first
+                        systems = results_df['system'].unique()
+                        system_colors = plt.cm.tab10(np.linspace(0, 1, len(systems)))
+                        system_color_map = dict(zip(systems, system_colors))
+                        
+                        for system in systems:
+                            system_mask = results_df['system'] == system
+                            system_coords = all_coords_3d[system_mask]
+                            ax.scatter(system_coords[:, 0], 
+                                     system_coords[:, 1], 
+                                     system_coords[:, 2],
+                                     c=[system_color_map[system]], s=8, alpha=0.4, 
+                                     label=f'{system} (n={system_mask.sum()})', zorder=1)
+                        
+                        # Then overlay cloud regions with higher zorder
+                        # Plot samples around cloud but not within (yellow/orange, higher alpha)
+                        around_not_within = around_mask & ~within_mask
+                        if around_not_within.sum() > 0:
+                            ax.scatter(all_coords_3d[around_not_within, 0], 
+                                     all_coords_3d[around_not_within, 1], 
+                                     all_coords_3d[around_not_within, 2],
+                                     c='orange', s=12, alpha=0.6, edgecolors='black', linewidths=0.5,
+                                     label=f'Around cloud ({around_not_within.sum()})', zorder=3)
+                        
+                        # Plot samples within cloud (blue, higher alpha)
+                        if within_mask.sum() > 0:
+                            ax.scatter(all_coords_3d[within_mask, 0], 
+                                     all_coords_3d[within_mask, 1], 
+                                     all_coords_3d[within_mask, 2],
+                                     c='blue', s=15, alpha=0.8, edgecolors='black', linewidths=1,
+                                     label=f'Within cloud ({within_mask.sum()})', zorder=4)
+                    else:
+                        # Single-system mode: color by cloud membership
+                        # Plot samples outside cloud (gray, low alpha)
+                        if outside_mask.sum() > 0:
+                            ax.scatter(all_coords_3d[outside_mask, 0], 
+                                     all_coords_3d[outside_mask, 1], 
+                                     all_coords_3d[outside_mask, 2],
+                                     c='lightgray', s=5, alpha=0.2, label=f'Outside cloud ({outside_mask.sum()})', zorder=1)
                     
-                    # Plot samples around cloud but not within (yellow/orange)
-                    around_not_within = around_mask & ~within_mask
-                    if around_not_within.sum() > 0:
-                        ax.scatter(all_coords_3d[around_not_within, 0], 
-                                 all_coords_3d[around_not_within, 1], 
-                                 all_coords_3d[around_not_within, 2],
-                                 c='orange', s=8, alpha=0.4, label=f'Around cloud ({around_not_within.sum()})', zorder=2)
-                    
-                    # Plot samples within cloud (blue)
-                    if within_mask.sum() > 0:
-                        ax.scatter(all_coords_3d[within_mask, 0], 
-                                 all_coords_3d[within_mask, 1], 
-                                 all_coords_3d[within_mask, 2],
-                                 c='blue', s=10, alpha=0.6, label=f'Within cloud ({within_mask.sum()})', zorder=3)
+                        # Plot samples around cloud but not within (yellow/orange)
+                        around_not_within = around_mask & ~within_mask
+                        if around_not_within.sum() > 0:
+                            ax.scatter(all_coords_3d[around_not_within, 0], 
+                                     all_coords_3d[around_not_within, 1], 
+                                     all_coords_3d[around_not_within, 2],
+                                     c='orange', s=8, alpha=0.4, label=f'Around cloud ({around_not_within.sum()})', zorder=2)
+                        
+                        # Plot samples within cloud (blue)
+                        if within_mask.sum() > 0:
+                            ax.scatter(all_coords_3d[within_mask, 0], 
+                                     all_coords_3d[within_mask, 1], 
+                                     all_coords_3d[within_mask, 2],
+                                     c='blue', s=10, alpha=0.6, label=f'Within cloud ({within_mask.sum()})', zorder=3)
                     
                     # Plot mimics (red, large, high zorder)
                     ax.scatter(summary_data['mimic_coords'][:, 0], 
@@ -2591,9 +3107,23 @@ def compute_diffusion_map_analysis(scaled_data, data_frame, pca_test_dir, organi
                     ax.set_xlabel('DC1', fontsize=12)
                     ax.set_ylabel('DC2', fontsize=12)
                     ax.set_zlabel('DC3', fontsize=12)
-                    ax.set_title(f'Mimic Cloud in 3D Diffusion Space\n(View: elev={view["elev"]}°, azim={view["azim"]}°)\n' +
-                               f'Within: {within_mask.sum()} | Around: {around_not_within.sum()} | Outside: {outside_mask.sum()}', 
-                               fontsize=11)
+                    
+                    if is_multi_system:
+                        # Add system breakdown to title
+                        title = f'Joint Diffusion Map: Mimic Cloud Across Systems\n(View: elev={view["elev"]}°, azim={view["azim"]}°)\n'
+                        title += f'Total - Within: {within_mask.sum()} | Around: {around_not_within.sum()} | Outside: {outside_mask.sum()}\n'
+                        # Add per-system breakdown
+                        for system in systems:
+                            system_mask = results_df['system'] == system
+                            sys_within = (system_mask & within_mask).sum()
+                            sys_around = (system_mask & around_not_within).sum()
+                            sys_outside = (system_mask & outside_mask).sum()
+                            title += f'{system}: W={sys_within} A={sys_around} O={sys_outside} | '
+                        ax.set_title(title, fontsize=10)
+                    else:
+                        ax.set_title(f'Mimic Cloud in 3D Diffusion Space\n(View: elev={view["elev"]}°, azim={view["azim"]}°)\n' +
+                                   f'Within: {within_mask.sum()} | Around: {around_not_within.sum()} | Outside: {outside_mask.sum()}', 
+                                   fontsize=11)
                     
                     # Set viewing angle
                     ax.view_init(elev=view['elev'], azim=view['azim'])
@@ -2634,6 +3164,179 @@ def compute_diffusion_map_analysis(scaled_data, data_frame, pca_test_dir, organi
             print("  (Skipping: No known mimics found in results)")
     else:
         print("  (Skipping: 'query' column not found in results)")
+    
+    # Visualize transferred cloud (works even without local mimics)
+    if transferred_cloud_results is not None:
+        print("\n" + "="*60)
+        print("Creating visualization of transferred mimic cloud")
+        print("="*60)
+        
+        # Get diffusion coordinates
+        dc_cols = [col for col in results_df.columns if col.startswith('Diffusion')]
+        if len(dc_cols) >= 3:
+            all_coords_3d = results_df[dc_cols[:3]].values
+            transferred_within = transferred_cloud_results['within_cloud']
+            transferred_around = transferred_cloud_results['around_cloud']
+            transferred_outside = ~transferred_around
+            
+            # Check if we have local mimics for comparison
+            has_local_mimics = 'query' in results_df.columns and len(results_df[results_df['query'].isin(validation_list)]) > 0
+            if has_local_mimics and 'feature_space_within_cloud' in results_df.columns:
+                local_within = results_df['feature_space_within_cloud'].values
+            else:
+                local_within = None
+            
+            viewing_angles = [
+                {'elev': 20, 'azim': 45, 'suffix': 'standard'},
+                {'elev': 20, 'azim': 135, 'suffix': 'rotated'},
+                {'elev': 90, 'azim': 0, 'suffix': 'top_down'},
+                {'elev': 0, 'azim': 0, 'suffix': 'side_view'}
+            ]
+            
+            for view in viewing_angles:
+                fig = plt.figure(figsize=(16, 12))
+                ax = fig.add_subplot(111, projection='3d')
+                
+                # Plot samples outside transferred cloud (gray)
+                if transferred_outside.sum() > 0:
+                    ax.scatter(all_coords_3d[transferred_outside, 0], 
+                             all_coords_3d[transferred_outside, 1], 
+                             all_coords_3d[transferred_outside, 2],
+                             c='lightgray', s=3, alpha=0.15, label=f'Outside transferred cloud ({transferred_outside.sum()})', zorder=1)
+                
+                # Plot samples around transferred cloud but not within (orange)
+                transferred_around_not_within = transferred_around & ~transferred_within
+                if transferred_around_not_within.sum() > 0:
+                    ax.scatter(all_coords_3d[transferred_around_not_within, 0], 
+                             all_coords_3d[transferred_around_not_within, 1], 
+                             all_coords_3d[transferred_around_not_within, 2],
+                             c='orange', s=6, alpha=0.4, label=f'Around transferred cloud ({transferred_around_not_within.sum()})', zorder=2)
+                
+                # Plot samples within transferred cloud (purple/blue)
+                if transferred_within.sum() > 0:
+                    color = 'purple' if local_within is None else 'purple'
+                    label = f'Within transferred cloud ({transferred_within.sum()})'
+                    if local_within is not None:
+                        # Show comparison
+                        local_only = local_within & ~transferred_within
+                        transferred_only = transferred_within & ~local_within
+                        in_both = local_within & transferred_within
+                        
+                        if local_only.sum() > 0:
+                            ax.scatter(all_coords_3d[local_only, 0], 
+                                     all_coords_3d[local_only, 1], 
+                                     all_coords_3d[local_only, 2],
+                                     c='blue', s=8, alpha=0.5, label=f'Local cloud only ({local_only.sum()})', zorder=3)
+                        
+                        if transferred_only.sum() > 0:
+                            ax.scatter(all_coords_3d[transferred_only, 0], 
+                                     all_coords_3d[transferred_only, 1], 
+                                     all_coords_3d[transferred_only, 2],
+                                     c='purple', s=8, alpha=0.5, label=f'Transferred cloud only ({transferred_only.sum()})', zorder=4)
+                        
+                        if in_both.sum() > 0:
+                            ax.scatter(all_coords_3d[in_both, 0], 
+                                     all_coords_3d[in_both, 1], 
+                                     all_coords_3d[in_both, 2],
+                                     c='cyan', s=12, alpha=0.7, label=f'In both clouds ({in_both.sum()})', zorder=5)
+                    else:
+                        # No local cloud, just show transferred
+                        ax.scatter(all_coords_3d[transferred_within, 0], 
+                                 all_coords_3d[transferred_within, 1], 
+                                 all_coords_3d[transferred_within, 2],
+                                 c='purple', s=10, alpha=0.6, label=label, zorder=3)
+                
+                # Label candidate samples by query ID, colored by cloud membership (within/around/outside)
+                if 'query' in results_df.columns:
+                    candidate_mask = results_df['query'].isin(candidate_list).values
+                    if candidate_mask.sum() > 0:
+                        candidates_within = candidate_mask & transferred_within
+                        candidates_around_only = candidate_mask & transferred_around & ~transferred_within
+                        candidates_outside = candidate_mask & transferred_outside
+
+                        def _plot_and_annotate_candidates(mask, color, label_prefix):
+                            idxs = np.where(mask)[0]
+                            if len(idxs) == 0:
+                                return
+                            # Scatter all candidate points in this category
+                            ax.scatter(all_coords_3d[idxs, 0],
+                                       all_coords_3d[idxs, 1],
+                                       all_coords_3d[idxs, 2],
+                                       c=color, s=50, alpha=0.9,
+                                       edgecolors='black', linewidths=1.0,
+                                       label=f'{label_prefix} candidates ({len(idxs)})',
+                                       zorder=8)
+                            # Add text labels with query IDs
+                            for idx in idxs:
+                                x, y, z = all_coords_3d[idx]
+                                qid = str(results_df.iloc[idx]['query'])
+                                ax.text(x, y, z, qid,
+                                        fontsize=7,
+                                        color='black',
+                                        ha='center', va='center',
+                                        bbox=dict(boxstyle='round,pad=0.2',
+                                                  facecolor=color,
+                                                  alpha=0.85,
+                                                  edgecolor='black'),
+                                        zorder=9)
+
+                        _plot_and_annotate_candidates(candidates_within, 'deepskyblue', 'Within transferred cloud')
+                        _plot_and_annotate_candidates(candidates_around_only, 'gold', 'Around transferred cloud')
+                        _plot_and_annotate_candidates(candidates_outside, 'darkgray', 'Outside transferred cloud')
+                
+                # Plot known mimics if they exist
+                if 'query' in results_df.columns:
+                    mimic_mask = results_df['query'].isin(validation_list).values
+                    if mimic_mask.sum() > 0:
+                        mimic_coords_3d = all_coords_3d[mimic_mask]
+                        ax.scatter(mimic_coords_3d[:, 0], 
+                                 mimic_coords_3d[:, 1], 
+                                 mimic_coords_3d[:, 2],
+                                 c='red', s=150, alpha=1.0, edgecolors='black', linewidths=2, 
+                                 label=f'Known mimics ({mimic_mask.sum()})', zorder=10)
+                
+                ax.set_xlabel('DC1', fontsize=12)
+                ax.set_ylabel('DC2', fontsize=12)
+                ax.set_zlabel('DC3', fontsize=12)
+                
+                if local_within is not None:
+                    title = f'Transferred vs Local Mimic Cloud Comparison\n(View: elev={view["elev"]}°, azim={view["azim"]}°)\n'
+                    if 'in_both' in locals():
+                        title += f'Transferred: {transferred_within.sum()} | Local: {local_within.sum()} | Both: {in_both.sum()}'
+                    else:
+                        title += f'Transferred: {transferred_within.sum()} | Local: {local_within.sum()}'
+                else:
+                    title = f'Transferred Mimic Cloud\n(View: elev={view["elev"]}°, azim={view["azim"]}°)\n'
+                    title += f'Within: {transferred_within.sum()} | Around: {transferred_around_not_within.sum()} | Outside: {transferred_outside.sum()}'
+                
+                ax.set_title(title, fontsize=11)
+                ax.view_init(elev=view['elev'], azim=view['azim'])
+                
+                # Set robust axis limits
+                xlim_low, xlim_high = compute_robust_axis_limits(all_coords_3d[:, 0], percentile_low=1.0, percentile_high=99.0)
+                ylim_low, ylim_high = compute_robust_axis_limits(all_coords_3d[:, 1], percentile_low=1.0, percentile_high=99.0)
+                zlim_low, zlim_high = compute_robust_axis_limits(all_coords_3d[:, 2], percentile_low=1.0, percentile_high=99.0)
+                ax.set_xlim(xlim_low, xlim_high)
+                ax.set_ylim(ylim_low, ylim_high)
+                ax.set_zlim(zlim_low, zlim_high)
+                
+                ax.legend(loc='upper left', fontsize=9, bbox_to_anchor=(0, 1))
+                ax.grid(True, alpha=0.3)
+                
+                # Save plot
+                if local_within is not None:
+                    comparison_plot_file = os.path.join(pca_test_dir, f'diffusion_map_{organism_name}_transferred_cloud_comparison_3d_{view["suffix"]}.png')
+                else:
+                    comparison_plot_file = os.path.join(pca_test_dir, f'diffusion_map_{organism_name}_transferred_cloud_3d_{view["suffix"]}.png')
+                plt.savefig(comparison_plot_file, dpi=300, bbox_inches='tight')
+                plt.close()
+                print(f"  ✓ Saved: {comparison_plot_file}")
+            
+            print("✓ Transferred cloud visualizations complete")
+        else:
+            print("  (Skipping: Need at least 3 diffusion components for 3D visualization)")
+    else:
+        print("  (Skipping: Need at least 3 diffusion components for 3D analysis)")
     
     print("\n" + "="*60)
     
@@ -2742,7 +3445,7 @@ def estimate_optimal_clusters(reduced_data, clustering_method='kmeans', k_range=
     return optimal_k, scores
 
 
-def value_driven_pca_clustering(pca_test_dir, data_frame, organism_name, n_clusters=10, clustering_method='kmeans', include_lengths=False, plot_3d=False, use_umap=False, umap_n_neighbors=15, umap_min_dist=0.1, include_evolutionary=False, include_targeting=False, include_go_terms=False, scaler_type='robust', use_diffusion=False, diffusion_alpha=1.0, diffusion_n_neighbors=15, exclude_derived_features=False, auto_clusters=False, cluster_estimation_method='silhouette', use_natural_attractor=False):
+def value_driven_pca_clustering(pca_test_dir, data_frame, organism_name, n_clusters=10, clustering_method='kmeans', include_lengths=False, plot_3d=False, use_umap=False, umap_n_neighbors=15, umap_min_dist=0.1, include_evolutionary=False, include_targeting=False, include_plddt=False, include_go_terms=False, scaler_type='robust', use_diffusion=False, diffusion_alpha=1.0, diffusion_n_neighbors=15, exclude_derived_features=False, auto_clusters=False, cluster_estimation_method='silhouette', use_natural_attractor=False, save_cloud_definition=False, transfer_cloud_from=None):
     """
     Perform purely value-driven clustering based on alignment features only.
     No GO term labels are used - clustering is based solely on alignment feature values.
@@ -2807,6 +3510,28 @@ def value_driven_pca_clustering(pca_test_dir, data_frame, organism_name, n_clust
             print(f"Added targeting features: {target_cols}")
         elif 'query_SP_probability' not in data_frame.columns:
             print("Warning: query_SP_probability column not found")
+    
+    # Add pLDDT features if requested
+    if include_plddt:
+        plddt_cols = []
+        if 'plddt_query_region' in data_frame.columns:
+            plddt_cols.append('plddt_query_region')
+        if 'plddt_target_region' in data_frame.columns:
+            plddt_cols.append('plddt_target_region')
+        
+        if len(plddt_cols) > 0:
+            # Check for missing values
+            print(f"\npLDDT features analysis:")
+            for col in plddt_cols:
+                missing = data_frame[col].isna().sum() + (data_frame[col] == '').sum()
+                total = len(data_frame)
+                pct_missing = missing / total * 100
+                print(f"  {col}: {missing}/{total} missing ({pct_missing:.1f}%)")
+            
+            selected_columns.extend(plddt_cols)
+            print(f"  Added pLDDT features: {plddt_cols}")
+        else:
+            print("Warning: pLDDT columns (plddt_query_region, plddt_target_region) not found")
     
     # Add derived features
     test_data_frame = data_frame[selected_columns].copy()
@@ -2942,7 +3667,9 @@ def value_driven_pca_clustering(pca_test_dir, data_frame, organism_name, n_clust
             diffusion_alpha=diffusion_alpha,
             diffusion_n_neighbors=diffusion_n_neighbors,
             plot_3d=plot_3d,
-            use_natural_attractor=use_natural_attractor
+            use_natural_attractor=use_natural_attractor,
+            save_cloud_definition=save_cloud_definition,
+            transfer_cloud_from=transfer_cloud_from
         )
         return  # Exit early - no clustering for diffusion maps
     elif use_umap:
