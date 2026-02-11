@@ -1,4 +1,5 @@
 import argparse
+import gzip
 import json
 import matplotlib.pyplot as plt
 import numpy as np
@@ -9,6 +10,7 @@ import re
 import seaborn as sns
 import subprocess
 import sys
+import tarfile
 from Bio.PDB import PDBParser
 from glob import glob
 from matplotlib.ticker import PercentFormatter, StrMethodFormatter
@@ -19,20 +21,28 @@ from skbio.stats.distance import DistanceMatrix, permanova
 from statistics import mean
 from tqdm import tqdm
 from utilities import parse_hyphy_output, uniprot_api_queries
-from utilities.go_semantic_similarity import analyze_go_vs_diffusion_distance
 
-def calculate_average_pLDDT(pdb_file):
+def calculate_average_pLDDT(pdb_file_or_handle):
     
-    '''Calculates the average pLDDT score from a pdb file 
+    '''Calculates the average pLDDT score from a pdb file or file handle
        pLDDT is located in the b-factor feild of an atom entry
        in a standard format pdb
+       
+       Args:
+           pdb_file_or_handle: Either a file path (string) or file handle (from tar archive)
     '''
 
     # open and read the pdb file
     try:
-        with open(pdb_file) as pf:
-            lines = pf.readlines()
-    except FileNotFoundError:
+        if isinstance(pdb_file_or_handle, str):
+            # It's a file path
+            with open(pdb_file_or_handle) as pf:
+                lines = pf.readlines()
+        else:
+            # It's a file handle (from tar archive)
+            pdb_file_or_handle.seek(0)  # Reset to beginning
+            lines = pdb_file_or_handle.readlines()
+    except (FileNotFoundError, AttributeError):
         return 'NA'
     
     # parse
@@ -41,19 +51,349 @@ def calculate_average_pLDDT(pdb_file):
         flds = l.strip().split()
 
         # verify line in file represents an atom
-        if flds[0] == 'ATOM':
+        if len(flds) > 0 and flds[0] == 'ATOM':
 
             # append to pLDDT list catching issues with formatting of line
             try:
                 pLDDTs.append(float(flds[-2]))
-            except IndexError:
+            except (IndexError, ValueError):
                 print('pLDDT ERROR')
-                print(pdb_file)
+                print(pdb_file_or_handle if isinstance(pdb_file_or_handle, str) else 'file handle')
                 return 'ERR' 
+    
+    if len(pLDDTs) == 0:
+        return 'NA'
             
     # return average pDDT for structure
     return mean(pLDDTs)
     
+def find_pdb_file(uniprot_id, pdb_source):
+    '''
+    Finds a PDB file matching the pattern AF-{uniprot_id}-F1-model_v{number}.pdb or .pdb.gz
+    Supports version patterns v{number} (e.g., v4, v5)
+    
+    Args:
+        uniprot_id: UniProt ID to search for
+        pdb_source: Path to directory or tar archive containing PDB files
+        
+    Returns:
+        Tuple of (file_handle_or_path, is_tar_handle) or (None, None) if not found
+    '''
+    # Try both .pdb and .pdb.gz patterns
+    pattern_pdb = re.compile(rf'AF-{re.escape(uniprot_id)}-F1-model_v(\d+)\.pdb$')
+    pattern_pdb_gz = re.compile(rf'AF-{re.escape(uniprot_id)}-F1-model_v(\d+)\.pdb\.gz$')
+    
+    # Check if source is a tar archive
+    if os.path.isfile(pdb_source) and (pdb_source.endswith('.tar') or pdb_source.endswith('.tar.gz')):
+        try:
+            tar = tarfile.open(pdb_source, 'r:*')
+            members = tar.getmembers()
+            
+            # Find matching files and get highest version (prefer .pdb over .pdb.gz)
+            matches = []
+            for member in members:
+                match_pdb = pattern_pdb.search(member.name)
+                match_pdb_gz = pattern_pdb_gz.search(member.name)
+                if match_pdb:
+                    version = int(match_pdb.group(1))
+                    matches.append((version, member, False))  # False = not compressed
+                elif match_pdb_gz:
+                    version = int(match_pdb_gz.group(1))
+                    matches.append((version, member, True))  # True = compressed
+            
+            if matches:
+                # Sort by version and get highest
+                matches.sort(key=lambda x: x[0], reverse=True)
+                best_match = matches[0][1]
+                is_compressed = matches[0][2]
+                
+                file_handle = tar.extractfile(best_match)
+                # If compressed, wrap in gzip decompressor
+                if is_compressed:
+                    import io
+                    file_handle = io.TextIOWrapper(gzip.GzipFile(fileobj=file_handle, mode='rb'))
+                
+                # Store tar reference in file handle for later closing if needed
+                file_handle._tar_ref = tar
+                return (file_handle, True)
+            tar.close()
+        except Exception as e:
+            print(f'Error reading tar archive {pdb_source}: {e}')
+            return (None, None)
+    
+    # Otherwise treat as directory
+    elif os.path.isdir(pdb_source):
+        # Search for matching files
+        matches = []
+        for filename in os.listdir(pdb_source):
+            match_pdb = pattern_pdb.search(filename)
+            match_pdb_gz = pattern_pdb_gz.search(filename)
+            if match_pdb:
+                version = int(match_pdb.group(1))
+                matches.append((version, os.path.join(pdb_source, filename), False))
+            elif match_pdb_gz:
+                version = int(match_pdb_gz.group(1))
+                matches.append((version, os.path.join(pdb_source, filename), True))
+        
+        if matches:
+            # Sort by version and get highest
+            matches.sort(key=lambda x: x[0], reverse=True)
+            return (matches[0][1], False)
+    
+    return (None, None)
+
+def calculate_region_pLDDT(pdb_file_or_handle, start_pos, end_pos):
+    '''
+    Calculates average pLDDT for a specific residue range in a PDB file
+    Uses residue-based approach: identifies residues in range, then averages all atoms
+    
+    Args:
+        pdb_file_or_handle: Either a file path (string) or file handle
+        start_pos: Start residue position (1-indexed)
+        end_pos: End residue position (1-indexed, inclusive)
+        
+    Returns:
+        Average pLDDT for the region or 'NA' if error
+    '''
+    try:
+        if isinstance(pdb_file_or_handle, str):
+            # It's a file path
+            with open(pdb_file_or_handle) as pf:
+                lines = pf.readlines()
+        else:
+            # It's a file handle (from tar archive)
+            pdb_file_or_handle.seek(0)  # Reset to beginning
+            lines = pdb_file_or_handle.readlines()
+    except (FileNotFoundError, AttributeError):
+        return 'NA'
+    
+    # Parse PDB file and collect pLDDT values for residues in range
+    # Residue number is in columns 23-26 (1-indexed) of ATOM line
+    pLDDTs = []
+    for l in lines:
+        if len(l) < 26:
+            continue
+            
+        if l.startswith('ATOM'):
+            try:
+                # Extract residue number (columns 23-26, 0-indexed: 22-25)
+                residue_num_str = l[22:26].strip()
+                if residue_num_str:
+                    residue_num = int(residue_num_str)
+                    
+                    # Check if residue is in range
+                    if start_pos <= residue_num <= end_pos:
+                        # Extract pLDDT from b-factor field (second to last field)
+                        flds = l.strip().split()
+                        if len(flds) >= 2:
+                            pLDDTs.append(float(flds[-2]))
+            except (ValueError, IndexError):
+                continue
+    
+    if len(pLDDTs) == 0:
+        return 'NA'
+    
+    return mean(pLDDTs)
+
+def add_plddt_columns(data_frame, query_pdb_source=None, target_pdb_source=None):
+    '''
+    Adds four pLDDT columns to the dataframe:
+    - plddt_query_avg: Average pLDDT for entire query structure
+    - plddt_target_avg: Average pLDDT for entire target structure
+    - plddt_query_region: Average pLDDT for query alignment region (qstart to qend)
+    - plddt_target_region: Average pLDDT for target alignment region (tstart to tend)
+    
+    Args:
+        data_frame: DataFrame with columns 'query', 'target', 'qstart', 'qend', 'tstart', 'tend'
+        query_pdb_source: Path to directory or tar archive containing query PDB files
+        target_pdb_source: Path to directory or tar archive containing target PDB files
+        
+    Returns:
+        DataFrame with four new pLDDT columns added
+    '''
+    # Initialize columns
+    data_frame['plddt_query_avg'] = None
+    data_frame['plddt_target_avg'] = None
+    data_frame['plddt_query_region'] = None
+    data_frame['plddt_target_region'] = None
+    
+    # Pre-load all unique query and target IDs to find PDB files upfront
+    unique_query_ids = set(data_frame['query'].unique()) if query_pdb_source else set()
+    unique_target_ids = set(data_frame['target'].unique()) if target_pdb_source else set()
+    
+    print(f"Pre-loading PDB files: {len(unique_query_ids)} unique queries, {len(unique_target_ids)} unique targets...")
+    
+    # Cache for PDB file handles and calculated values
+    query_pdb_cache = {}
+    target_pdb_cache = {}
+    query_avg_cache = {}
+    target_avg_cache = {}
+    query_pdb_lines_cache = {}  # Cache file contents to avoid re-reading
+    target_pdb_lines_cache = {}
+    
+    # Track open tar files to close them later (use set to avoid duplicates)
+    open_tar_files = set()
+    
+    # Pre-load query PDB files
+    if query_pdb_source:
+        for query_id in tqdm(unique_query_ids, desc='Loading query PDB files'):
+            pdb_file, is_tar = find_pdb_file(query_id, query_pdb_source)
+            if pdb_file:
+                query_pdb_cache[query_id] = (pdb_file, is_tar)
+                if is_tar and hasattr(pdb_file, '_tar_ref'):
+                    open_tar_files.add(pdb_file._tar_ref)
+                # Read file contents once and cache
+                try:
+                    if isinstance(pdb_file, str):
+                        # Check if it's a .gz file
+                        if pdb_file.endswith('.gz'):
+                            with gzip.open(pdb_file, 'rt') as pf:
+                                query_pdb_lines_cache[query_id] = pf.readlines()
+                        else:
+                            with open(pdb_file) as pf:
+                                query_pdb_lines_cache[query_id] = pf.readlines()
+                    else:
+                        pdb_file.seek(0)
+                        query_pdb_lines_cache[query_id] = pdb_file.readlines()
+                    # Calculate average pLDDT from cached lines
+                    query_avg_cache[query_id] = calculate_average_pLDDT_from_lines(query_pdb_lines_cache[query_id])
+                except Exception as e:
+                    query_avg_cache[query_id] = 'NA'
+            else:
+                query_avg_cache[query_id] = 'NA'
+    
+    # Pre-load target PDB files
+    if target_pdb_source:
+        found_count = 0
+        not_found_ids = []
+        for target_id in tqdm(unique_target_ids, desc='Loading target PDB files'):
+            pdb_file, is_tar = find_pdb_file(target_id, target_pdb_source)
+            if pdb_file:
+                found_count += 1
+                target_pdb_cache[target_id] = (pdb_file, is_tar)
+                if is_tar and hasattr(pdb_file, '_tar_ref'):
+                    open_tar_files.add(pdb_file._tar_ref)
+                # Read file contents once and cache
+                try:
+                    if isinstance(pdb_file, str):
+                        # Check if it's a .gz file
+                        if pdb_file.endswith('.gz'):
+                            with gzip.open(pdb_file, 'rt') as pf:
+                                target_pdb_lines_cache[target_id] = pf.readlines()
+                        else:
+                            with open(pdb_file) as pf:
+                                target_pdb_lines_cache[target_id] = pf.readlines()
+                    else:
+                        pdb_file.seek(0)
+                        target_pdb_lines_cache[target_id] = pdb_file.readlines()
+                    # Calculate average pLDDT from cached lines
+                    target_avg_cache[target_id] = calculate_average_pLDDT_from_lines(target_pdb_lines_cache[target_id])
+                except Exception as e:
+                    print(f"Error reading target PDB for {target_id}: {e}")
+                    target_avg_cache[target_id] = 'NA'
+            else:
+                not_found_ids.append(target_id)
+                target_avg_cache[target_id] = 'NA'
+        
+        print(f"Target PDB files: {found_count} found, {len(not_found_ids)} not found")
+        if len(not_found_ids) > 0 and len(not_found_ids) <= 10:
+            print(f"  Not found target IDs (first 10): {not_found_ids}")
+        elif len(not_found_ids) > 10:
+            print(f"  Not found target IDs (first 10): {not_found_ids[:10]}... ({len(not_found_ids)} total)")
+    
+    print(f"Calculating pLDDT values for {len(data_frame)} alignments...")
+    
+    # Now calculate pLDDT values using cached data
+    for index, row in tqdm(data_frame.iterrows(), total=len(data_frame), desc='Calculating pLDDT'):
+        query_id = row['query']
+        target_id = row['target']
+        
+        # Calculate query pLDDT if source provided
+        if query_pdb_source:
+            data_frame.at[index, 'plddt_query_avg'] = query_avg_cache.get(query_id, 'NA')
+            
+            # Calculate query region pLDDT using cached lines
+            if query_id in query_pdb_lines_cache and query_avg_cache.get(query_id, 'NA') != 'NA':
+                try:
+                    qstart = int(float(row['qstart']))
+                    qend = int(float(row['qend']))
+                    region_plddt = calculate_region_pLDDT_from_lines(query_pdb_lines_cache[query_id], qstart, qend)
+                    data_frame.at[index, 'plddt_query_region'] = region_plddt
+                except (ValueError, TypeError):
+                    data_frame.at[index, 'plddt_query_region'] = 'NA'
+            else:
+                data_frame.at[index, 'plddt_query_region'] = 'NA'
+        
+        # Calculate target pLDDT if source provided
+        if target_pdb_source:
+            data_frame.at[index, 'plddt_target_avg'] = target_avg_cache.get(target_id, 'NA')
+            
+            # Calculate target region pLDDT using cached lines
+            if target_id in target_pdb_lines_cache and target_avg_cache.get(target_id, 'NA') != 'NA':
+                try:
+                    tstart = int(float(row['tstart']))
+                    tend = int(float(row['tend']))
+                    region_plddt = calculate_region_pLDDT_from_lines(target_pdb_lines_cache[target_id], tstart, tend)
+                    data_frame.at[index, 'plddt_target_region'] = region_plddt
+                except (ValueError, TypeError):
+                    data_frame.at[index, 'plddt_target_region'] = 'NA'
+            else:
+                data_frame.at[index, 'plddt_target_region'] = 'NA'
+    
+    # Close any open tar files
+    for tar_ref in open_tar_files:
+        if tar_ref:
+            try:
+                tar_ref.close()
+            except:
+                pass
+    
+    return data_frame
+
+def calculate_average_pLDDT_from_lines(lines):
+    '''Calculate average pLDDT from pre-read lines (for performance)'''
+    pLDDTs = []
+    for l in lines:
+        flds = l.strip().split()
+        if len(flds) > 0 and flds[0] == 'ATOM':
+            try:
+                pLDDTs.append(float(flds[-2]))
+            except (IndexError, ValueError):
+                continue
+    
+    if len(pLDDTs) == 0:
+        return 'NA'
+    
+    return mean(pLDDTs)
+
+def calculate_region_pLDDT_from_lines(lines, start_pos, end_pos):
+    '''Calculate region pLDDT from pre-read lines (for performance)'''
+    pLDDTs = []
+    for l in lines:
+        if len(l) < 26:
+            continue
+            
+        if l.startswith('ATOM'):
+            try:
+                # Extract residue number (columns 23-26, 0-indexed: 22-25)
+                residue_num_str = l[22:26].strip()
+                if residue_num_str:
+                    residue_num = int(residue_num_str)
+                    
+                    # Check if residue is in range
+                    if start_pos <= residue_num <= end_pos:
+                        # Extract pLDDT from b-factor field (second to last field)
+                        flds = l.strip().split()
+                        if len(flds) >= 2:
+                            pLDDTs.append(float(flds[-2]))
+            except (ValueError, IndexError):
+                continue
+    
+    if len(pLDDTs) == 0:
+        return 'NA'
+    
+    return mean(pLDDTs)
+
 def generate_control_dictionary(control_dir):
 
     '''Generates and returns control dictionary which contains statistics for each query protein
@@ -178,16 +518,38 @@ def validation(df, ids_of_interest, structure_db=None):
 
     # find validation IDs in results
     average_pLDDTs = {}
+    open_tar_files = []
     for index, row in df.iterrows():
         for uni_id in ids_of_interest:
             if uni_id in row['query']:
   
                 # calculate structure prediction confidence
                 if uni_id not in average_pLDDTs and structure_db != None:
-                    average_pLDDTs[uni_id] = calculate_average_pLDDT(structure_db + '/AF-' + uni_id + '-F1-model_v4.pdb')
+                    pdb_file, is_tar = find_pdb_file(uni_id, structure_db)
+                    if pdb_file:
+                        if is_tar:
+                            open_tar_files.append(pdb_file._tar_ref if hasattr(pdb_file, '_tar_ref') else None)
+                        average_pLDDTs[uni_id] = calculate_average_pLDDT(pdb_file)
+                    else:
+                        average_pLDDTs[uni_id] = 'NA'
 
-                row_string = row[['query', 'target', 'score', 'tcov', 'qcov', 'fident', 'algn_fraction', 'symbiont_branch_dnds_avg', 'non_symbiont_branch_dnds_avg']].astype(str).str.cat(sep=',') + ',' + str(average_pLDDTs[uni_id])
+                # Get columns that exist in the dataframe
+                available_cols = ['query', 'target', 'score', 'tcov', 'qcov', 'fident', 'algn_fraction']
+                if 'symbiont_branch_dnds_avg' in df.columns:
+                    available_cols.append('symbiont_branch_dnds_avg')
+                if 'non_symbiont_branch_dnds_avg' in df.columns:
+                    available_cols.append('non_symbiont_branch_dnds_avg')
+                
+                row_string = row[available_cols].astype(str).str.cat(sep=',') + ',' + str(average_pLDDTs[uni_id])
                 print(row_string) 
+    
+    # Close any open tar files
+    for tar_ref in open_tar_files:
+        if tar_ref:
+            try:
+                tar_ref.close()
+            except:
+                pass 
                 
 def calculate_alignment_overlap(aln_span1, aln_span2):  
     
@@ -774,103 +1136,149 @@ def relative_rate_comparison(data_frame1, data_frame2, output_path):
     results = permanova(distance_matrix, combined_data['Group'].astype(str), permutations=999)
     print(results)
     
-def add_protein_description(data_frame, field_name):
+def add_protein_description(data_frame, field_name, json_path='prot_descriptions.json'):
     
     '''
     Adds a new column 'description' to the data frame by querying the UniProt API for each query ID.
+    
+    Args:
+        data_frame: DataFrame to add descriptions to
+        field_name: Column name containing UniProt IDs
+        json_path: Path to JSON file for caching/loading descriptions
     '''
     
     # Check for id dict for previous runs 
-    if not os.path.exists('prot_descriptions.json'):
+    if not os.path.exists(json_path):
         id_descriptions = {}
+        print(f"Warning: JSON file not found at {json_path}, will create new cache")
     else:
-        with open('prot_descriptions.json', 'r') as json_f:
+        print(f"Loading cached descriptions from {json_path}...")
+        with open(json_path, 'r') as json_f:
             id_descriptions = json.load(json_f)
-                    
-    descriptions = []
-    for query_id in data_frame[field_name]:
-        if query_id in id_descriptions:
-            descriptions.append(id_descriptions[query_id])
-            continue
-        entry = uniprot_api_queries.fetch_uniprot_entry(query_id)
-        try:
-            description = entry['proteinDescription']['recommendedName']['fullName']['value']
-        except KeyError:
-            try:
-                description = entry['proteinDescription']['submissionNames'][0]['fullName']['value']
-            except KeyError:
-                description = 'NA'
-        descriptions.append(description)
-        id_descriptions[query_id] = description
+        print(f"Loaded {len(id_descriptions)} cached entries")
     
+    # Get unique IDs that need to be queried
+    unique_ids = data_frame[field_name].unique()
+    ids_to_query = [uid for uid in unique_ids if uid not in id_descriptions]
+    ids_cached = len(unique_ids) - len(ids_to_query)
+    
+    if ids_cached > 0:
+        print(f"Found {ids_cached} IDs in cache, {len(ids_to_query)} need to be queried")
+    
+    # Query UniProt API for missing IDs with progress bar
+    if len(ids_to_query) > 0:
+        print(f"Fetching {len(ids_to_query)} protein descriptions from UniProt API...")
+        for query_id in tqdm(ids_to_query, desc=f'Fetching {field_name} descriptions'):
+            try:
+                entry = uniprot_api_queries.fetch_uniprot_entry(query_id)
+                try:
+                    description = entry['proteinDescription']['recommendedName']['fullName']['value']
+                except KeyError:
+                    try:
+                        description = entry['proteinDescription']['submissionNames'][0]['fullName']['value']
+                    except KeyError:
+                        description = 'NA'
+                id_descriptions[query_id] = description
+            except Exception as e:
+                print(f"Error fetching description for {query_id}: {e}")
+                id_descriptions[query_id] = 'NA'
+    
+    # Map descriptions to dataframe
+    descriptions = [id_descriptions.get(query_id, 'NA') for query_id in data_frame[field_name]]
     output_field = field_name + '_description'
     data_frame[output_field] = descriptions
     
     # save id descriptions to json
-    with open('prot_descriptions.json', 'w') as json_f:
+    with open(json_path, 'w') as json_f:
         json.dump(id_descriptions, json_f, indent=2)
         
     return data_frame
 
-def add_go_terms(data_frame, field_name):  
+def add_go_terms(data_frame, field_name, json_path='prot_descriptions.json'):  
+    
+    '''
+    Adds GO term columns to the data frame by querying the UniProt API.
+    
+    Args:
+        data_frame: DataFrame to add GO terms to
+        field_name: Column name containing UniProt IDs
+        json_path: Path to JSON file for caching/loading GO terms
+    '''
     
     # Check for id dict for previous runs 
-    if not os.path.exists('prot_descriptions.json'):
+    if not os.path.exists(json_path):
         id_descriptions = {}
     else:
-        with open('prot_descriptions.json', 'r') as json_f:
+        print(f"Loading cached GO terms from {json_path}...")
+        with open(json_path, 'r') as json_f:
             id_descriptions = json.load(json_f)
+        # Count GO term entries (those ending in '_GO')
+        go_entries = sum(1 for k in id_descriptions.keys() if k.endswith('_GO'))
+        print(f"Loaded {go_entries} cached GO term entries")
     
-    # storing GO terms in lists for adding as columns to data frame
+    # Get unique IDs that need to be queried
+    unique_ids = data_frame[field_name].unique()
+    ids_to_query = []
+    for search_id in unique_ids:
+        query_id_key = search_id + '_GO'
+        if query_id_key not in id_descriptions:
+            ids_to_query.append(search_id)
+    
+    ids_cached = len(unique_ids) - len(ids_to_query)
+    if ids_cached > 0:
+        print(f"Found {ids_cached} IDs in cache, {len(ids_to_query)} need to be queried")
+    
+    # Query UniProt API for missing IDs with progress bar
+    if len(ids_to_query) > 0:
+        print(f"Fetching {len(ids_to_query)} GO term annotations from UniProt API...")
+        for search_id in tqdm(ids_to_query, desc=f'Fetching {field_name} GO terms'):
+            query_id_key = search_id + '_GO'
+            try:
+                # fetch entry from UniProt API
+                entry = uniprot_api_queries.fetch_uniprot_entry(search_id)
+                try:
+                    refs = entry['uniProtKBCrossReferences']
+                except KeyError:
+                    refs = []
+                    
+                # parse external references for GO terms
+                term_dict = {'C': [], 'F': [], 'P': []}
+                for ref in refs:
+                    # find GO entries 
+                    if ref['database'] == 'GO':
+                        # parse GO term and type
+                        go_id = ref['id']
+                        go_type = ref['properties'][0]['value'].split(':')[0]
+                        go_term = ref['properties'][0]['value'].split(':')[1]  
+                    
+                        # add GO term to appropriate list
+                        if go_type in term_dict:
+                            term_dict[go_type].append(go_term)
+                        else:
+                            term_dict[go_type] = [go_term]
+                
+                # store terms for look up 
+                id_descriptions[query_id_key] = term_dict
+            except Exception as e:
+                print(f"Error fetching GO terms for {search_id}: {e}")
+                id_descriptions[query_id_key] = {'C': [], 'F': [], 'P': []}
+    
+    # Map GO terms to dataframe
     cell_comps = []
     mol_func = []
     bio_proc = []
     
-    # iterate through query ids and fetch GO terms from UniProt API
-    for query_id in data_frame[field_name]:
-        search_id = query_id
-        query_id = query_id + '_GO'
-        
-        # check if query id has been queried before
-        if query_id in id_descriptions:
-            cell_comps.append(id_descriptions[query_id]['C'])
-            mol_func.append(id_descriptions[query_id]['F'])
-            bio_proc.append(id_descriptions[query_id]['P'])
-            continue
-        
-        # fetch entry from UniProt API
-        entry = uniprot_api_queries.fetch_uniprot_entry(search_id)
-        try:
-            refs = entry['uniProtKBCrossReferences']
-        except KeyError:
-            print(entry)  
-            print(entry.keys()) 
-            
-        # parse extrernal references for GO terms
-        term_dict = {'C': [], 'F': [], 'P': []}
-        for ref in refs:
-            
-            # find GO entries 
-            if ref['database'] == 'GO':
-                
-                # parse GO term and type
-                go_id = ref['id']
-                go_type = ref['properties'][0]['value'].split(':')[0]
-                go_term = ref['properties'][0]['value'].split(':')[1]  
-            
-                # add GO term to appropriate list
-                if go_type in term_dict:
-                    term_dict[go_type].append(go_term)
-                else:
-                    term_dict[go_type] = [go_term]
-                    
-        # add GO terms to lists for columns 
-        cell_comps.append(term_dict['C'])
-        mol_func.append(term_dict['F'])
-        bio_proc.append(term_dict['P'])
-        
-        # store terms for look up 
-        id_descriptions[query_id] = term_dict
+    for search_id in data_frame[field_name]:
+        query_id_key = search_id + '_GO'
+        if query_id_key in id_descriptions:
+            term_dict = id_descriptions[query_id_key]
+            cell_comps.append(term_dict.get('C', []))
+            mol_func.append(term_dict.get('F', []))
+            bio_proc.append(term_dict.get('P', []))
+        else:
+            cell_comps.append([])
+            mol_func.append([])
+            bio_proc.append([])
     
     output_field = field_name + '_cellular_components'
     data_frame[output_field] = cell_comps
@@ -880,7 +1288,7 @@ def add_go_terms(data_frame, field_name):
     data_frame[output_field] = bio_proc
     
      # save id GO terms to json
-    with open('prot_descriptions.json', 'w') as json_f:
+    with open(json_path, 'w') as json_f:
         json.dump(id_descriptions, json_f, indent=2)
         
     return data_frame
@@ -971,7 +1379,8 @@ def main():
     parser.add_argument('-f','--fid_plot', type=str, help='output path for png of fraction of identical residues histogram')
     parser.add_argument('-j','--json_file', type=str, help='path to a pre-generated json of control alignment stats')
     parser.add_argument('-o','--csv_out',  type=str, help='output csv table of results to provided path')
-    parser.add_argument('-d','--pdb_database', type=str, help='path to database of pdb files used in alignment')
+    parser.add_argument('-qd','--pdb_database_query', type=str, help='path to directory or tar archive containing query PDB files')
+    parser.add_argument('-td','--pdb_database_target', type=str, help='path to directory or tar archive containing target PDB files')
     parser.add_argument('-v','--validation_ids', type=str, help='path to a txt file of structure IDs to pull from results')
     parser.add_argument('-e','--evorate_analysis', type=str, help='path to evorateworkflow results directory')
     parser.add_argument('-e2','--evorate_analysis2', type=str, help='path to second evorate results directory for distrubtion comparison')
@@ -984,10 +1393,8 @@ def main():
     parser.add_argument('-t','--top_hits', action='store_true', help='only output top hits for each query id')
     parser.add_argument('-ap','--alignment_span_filter', action='store_true', help='filter out alignments where the target has aligned to multiple queries on the save span of target structure')
     parser.add_argument('--all_alignments', action='store_true', help='Output all alignments without deduplication')
-    parser.add_argument('--go-similarity-analysis', action='store_true', help='Perform GO semantic similarity vs diffusion distance analysis')
-    parser.add_argument('--diffusion-results', type=str, help='Path to diffusion map results CSV (required for GO similarity analysis)')
-    parser.add_argument('--go-similarity-output', type=str, help='Output directory for GO similarity analysis results')
-    parser.add_argument('--go-column', type=str, default='target_biological_processes', choices=['target_biological_processes', 'target_molecular_functions', 'target_cellular_components'], help='GO term column for similarity analysis')
+    parser.add_argument('--skip_uniprot_metadata', action='store_true', help='Skip UniProt API calls for protein descriptions and GO terms (faster, but output will not include these columns)')
+    parser.add_argument('--uniprot_metadata_json', type=str, default='prot_descriptions.json', help='Path to JSON file for caching/loading UniProt metadata (default: prot_descriptions.json)')
     args = parser.parse_args()   
 
     # either generate the control dictionary or load it from previous run 
@@ -1059,10 +1466,15 @@ def main():
         output_evorate_alignment_df = evorate_alignment_df.drop(columns=columns_to_drop)
         output_df = output_evorate_alignment_df.copy()
        
-    # add protein descriptions to the output dataframe
-    output_df = add_protein_description(output_df, 'query')  
-    output_df = add_protein_description(output_df, 'target')
-    output_df = add_go_terms(output_df, 'target')
+    # add pLDDT columns if PDB databases are provided (do this BEFORE UniProt API calls for faster feedback)
+    if args.pdb_database_query or args.pdb_database_target:
+        output_df = add_plddt_columns(output_df, args.pdb_database_query, args.pdb_database_target)
+    
+    # add protein descriptions and GO terms to the output dataframe (optional, can be slow)
+    if not args.skip_uniprot_metadata:
+        output_df = add_protein_description(output_df, 'query', args.uniprot_metadata_json)  
+        output_df = add_protein_description(output_df, 'target', args.uniprot_metadata_json)
+        output_df = add_go_terms(output_df, 'target', args.uniprot_metadata_json)
     
     # add mitochondrial sequence prediction to the output dataframe
     if args.mt_seq_predict:
@@ -1085,42 +1497,6 @@ def main():
     if args.fid_plot:
         plot_freeliving_fraction_distribution(alignment_table, args.fid_plot)
     
-    # GO semantic similarity vs diffusion distance analysis
-    if args.go_similarity_analysis:
-        if not args.diffusion_results:
-            print("Error: --diffusion-results is required for GO similarity analysis")
-            sys.exit(1)
-        
-        if not args.go_similarity_output:
-            # Default to same directory as CSV output
-            if args.csv_out:
-                args.go_similarity_output = os.path.dirname(args.csv_out) or '.'
-            else:
-                args.go_similarity_output = '.'
-        
-        print("\n" + "="*60)
-        print("Running GO Semantic Similarity Analysis")
-        print("="*60)
-        
-        try:
-            results = analyze_go_vs_diffusion_distance(
-                data_frame=output_df,
-                diffusion_results_file=args.diffusion_results,
-                go_term_column=args.go_column,
-                output_dir=args.go_similarity_output,
-                method='jaccard',  # Can be made configurable later
-                use_euclidean=True,  # Can be made configurable later
-                max_samples=None
-            )
-            
-            if results:
-                print(f"\n✓ GO similarity analysis complete!")
-                print(f"  Results saved to: {args.go_similarity_output}")
-        except Exception as e:
-            print(f"Error in GO similarity analysis: {e}")
-            import traceback
-            traceback.print_exc()
-    
     # parse list of validation or general IDs of interest to pull from the results of an alignment
     if args.validation_ids:
         ids_of_interest = set()
@@ -1131,7 +1507,12 @@ def main():
                 ids_of_interest.add(struct_id.strip())
 
         # find ids and print to std_out in csv format
-        validation(evorate_alignment_df, ids_of_interest, args.pdb_database)
+        # Use query database for validation (legacy behavior)
+        validation_db = args.pdb_database_query if args.pdb_database_query else args.pdb_database_target
+        if 'evorate_alignment_df' in locals():
+            validation(evorate_alignment_df, ids_of_interest, validation_db)
+        else:
+            validation(output_df, ids_of_interest, validation_db)
 
 if __name__ == '__main__':
     main()
