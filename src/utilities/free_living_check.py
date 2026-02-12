@@ -104,15 +104,21 @@ def validate_globi_results(taxid: str, rows: list):
     if len(rows) == 0:
         return False
 
+    # Initialize citation logger
+    logger_citations = logger.bind(task="citations")
+    
     # interactions found, check citations 
     found_interactions = set()
     for r in rows:
         
         # only save citations for unique interactions
         if (r[3],r[4]) not in found_interactions:
-            ref_citation = r[5]
-            source_citation = r[6]
+            ref_citation = r[5] if len(r) > 5 else ''
+            source_citation = r[6] if len(r) > 6 else ''
             found_interactions.add((r[3], r[4]))
+            
+            # Log the citation information
+            logger_citations.info(f"Taxid {taxid} | Interaction: {r[3]} -> {r[4]} | Citation: {ref_citation} | DOI: {source_citation}")
     
     return True 
 
