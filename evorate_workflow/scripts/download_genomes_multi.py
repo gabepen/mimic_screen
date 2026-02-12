@@ -86,8 +86,11 @@ def get_scientific_name(taxid: str, retries: int) -> str:
         except:
             logger.warning(f"Symbiosis check for {taxid} error, {result}")
             retries -= 1
+    
+    # All retries failed, return None
+    return None
      
-def dataset_download(dl_command, taxid, fl_id_list, taxon_genome_map,
+def dataset_download(dl_command, taxid, original_id_list, taxon_genome_map,
                      success_queue, fg_genomes_selected, 
                      bg_genomes_selected, max_genome_count, 
                      max_genome_event, globi_db_path):
@@ -165,6 +168,7 @@ def dataset_download(dl_command, taxid, fl_id_list, taxon_genome_map,
     dl_command = ' '.join(dl_command)
     
     logger.info(f"Attempting download for taxid {taxid}")
+    
     # Run the download command and capture the output
     dl_output = subprocess.run(dl_command, shell=True, capture_output=True)
     
@@ -181,61 +185,60 @@ def dataset_download(dl_command, taxid, fl_id_list, taxon_genome_map,
             
         # Check for biological interactions using GloBI database 
         
-        # GloBI does not seem to include 'X endosymbiont of Y' or 'Candidatus X' in their taxa names
-        # so we will check the taxid name for these terms which indicate expiremental confidence of symbiosis 
-        fl_exclusive_opt = False
-        if taxid in fl_id_list:
-            fl_exclusive_opt = True
-            logger.info(f"Taxid {taxid} is in free-living taxon list")
-        else:
-            logger.info(f"Taxid {taxid} is NOT in free-living taxon list")
-            
+        # Get scientific name for classification
         sci_name = get_scientific_name(taxid, 3)
         logger.info(f"Taxid {taxid} scientific name is {sci_name}")
-        if free_living_check.check_sciname_for_symbiosis(sci_name):
-            logger.info(f"Taxid {taxid} is a symbiont based on scientific name")
-            
-            # add to the foreground genomes if possible
-            # If taxid is in free-living list and classified as symbiont, delete it (contradiction)
-            if not add_taxa_to_selected_group(taxid, fg_genomes_selected, 'foreground') or fl_exclusive_opt:
-                if fl_exclusive_opt:
-                    logger.info(f"Taxid {taxid} rejected: in free-living list but classified as symbiont - DELETING")
-                else:
-                    logger.info(f"Taxid {taxid} rejected: max foreground genomes reached ({len(fg_genomes_selected)}/{int(max_genome_count/2)})")
-                # if the max fg genomes have been reached delete the archive and return
-                os.remove(o_file)
-                return
-            else:
-                logger.info(f"Taxid {taxid} successfully added to foreground genomes (total: {len(fg_genomes_selected)})")
         
-        else:
-            # If the scientific name does not indicate symbiosis, check GloBI database for interactions
-            query = {
-                'sourceTaxonName': sci_name, 
+        # Check if this taxid came from the main taxon_ids list (original_id_list)
+        # Symbionts can only be kept if they came from the main taxon_ids list
+        is_from_main_list = taxid in original_id_list
+        
+        # If we couldn't get the scientific name, skip scientific name check but still try GloBI by taxid
+        # and proceed to biosample isolation source check if needed
+        if sci_name is None:
+            logger.info(f"Taxid {taxid} scientific name unavailable (datasets tool failure) - skipping scientific name check, trying GloBI query by taxid")
+            # Try GloBI query using taxid instead of scientific name
+            # Query both sourceTaxonId (singular) and sourceTaxonIds (plural) since the database has both columns
+            # GloBI format is "NCBI:{taxid}" not "NCBI:txid{taxid}"
+            taxid_query = f'NCBI:{taxid}'
+            query1 = {
+                'sourceTaxonId': taxid_query, 
                 'interactionTypeName': ['parasiteOf','hasHost','pathogenOf']
             }
-            results = globi_db_queries.multi_column_search('interactions', query, globi_db_path)
+            query2 = {
+                'sourceTaxonIds': taxid_query, 
+                'interactionTypeName': ['parasiteOf','hasHost','pathogenOf']
+            }
+            results1 = globi_db_queries.multi_column_search('interactions', query1, globi_db_path)
+            results2 = globi_db_queries.multi_column_search('interactions', query2, globi_db_path)
+            # Combine results and remove duplicates (using tuple of row contents as key)
+            results = list({tuple(r): r for r in results1 + results2}.values())
+            # check if query returned any results
+            if len(results) == 0:
+                logger.info(f"Taxid {taxid} no GloBI entry found for queries: {query1}, {query2}")
+                os.remove(o_file)
+                return
+            
             if free_living_check.validate_globi_results(taxid, results):
-                logger.info(f"Taxid {taxid} is a symbiont/pathogen based on GloBI results")
+                logger.info(f"Taxid {taxid} is a symbiont/pathogen based on GloBI results (queried by taxid)")
+                
+                # If symbiont did NOT come from main taxon_ids list, delete it
+                if not is_from_main_list:
+                    logger.info(f"Taxid {taxid} rejected: symbiont from free-living taxon list (not in main taxon_ids) - DELETING")
+                    os.remove(o_file)
+                    return
                 
                 # add to the foreground genomes if possible
-                # If taxid is in free-living list and classified as symbiont, delete it (contradiction)
-                if not add_taxa_to_selected_group(taxid, fg_genomes_selected, 'foreground') or fl_exclusive_opt:
-                    if fl_exclusive_opt:
-                        logger.info(f"Taxid {taxid} rejected: in free-living list but classified as symbiont - DELETING")
-                    else:
-                        logger.info(f"Taxid {taxid} rejected: max foreground genomes reached ({len(fg_genomes_selected)}/{int(max_genome_count/2)})")
-                    
+                if not add_taxa_to_selected_group(taxid, fg_genomes_selected, 'foreground'):
+                    logger.info(f"Taxid {taxid} rejected: max foreground genomes reached ({len(fg_genomes_selected)}/{int(max_genome_count/2)})")
                     # if the max fg genomes have been reached delete the archive and return
                     os.remove(o_file)
                     return
                 else:
                     logger.info(f"Taxid {taxid} successfully added to foreground genomes (total: {len(fg_genomes_selected)})")
-    
             else:
-                # Taxa has passed the GloBI check, check the isolation source through NCBI biosample metadata
-                logger.info(f"Taxid {taxid} passed GloBI check (not a symbiont) - checking biosample isolation sources")
-                # First collect biosample_uids for the taxid
+                # No GloBI interactions found, proceed to biosample isolation source check
+                logger.info(f"Taxid {taxid} passed GloBI check (not a symbiont, queried by taxid) - checking biosample isolation sources")
                 biosample_uids = free_living_check.ncbi_taxid_to_biosample_uids(taxid)
                 logger.info(f"Taxid {taxid} Biosample UIDs: {biosample_uids}")
                 if free_living_check.check_biosample_isolation_source(biosample_uids):
@@ -250,9 +253,75 @@ def dataset_download(dl_command, taxid, fl_id_list, taxon_genome_map,
                         logger.info(f"Taxid {taxid} successfully added to background genomes (total: {len(bg_genomes_selected)})")
                 else:  
                     # Taxid cannot be confidently classified as symbiont or free-living 
-                    logger.info(f"Taxid {taxid} cannot be confidently classified as symbiont or free-living - DELETING")
+                    logger.info(f"Taxid {taxid} cannot be confidently classified as symbiont or free-living (no sci_name, GloBI negative, biosample check failed) - DELETING")
                     os.remove(o_file)
                     return
+        else:
+            # We have a scientific name, proceed with normal classification flow
+            if free_living_check.check_sciname_for_symbiosis(sci_name):
+                logger.info(f"Taxid {taxid} is a symbiont based on scientific name")
+                
+                # If symbiont did NOT come from main taxon_ids list, delete it
+                if not is_from_main_list:
+                    logger.info(f"Taxid {taxid} rejected: symbiont from free-living taxon list (not in main taxon_ids) - DELETING")
+                    os.remove(o_file)
+                    return
+                
+                # add to the foreground genomes if possible
+                if not add_taxa_to_selected_group(taxid, fg_genomes_selected, 'foreground'):
+                    logger.info(f"Taxid {taxid} rejected: max foreground genomes reached ({len(fg_genomes_selected)}/{int(max_genome_count/2)})")
+                    # if the max fg genomes have been reached delete the archive and return
+                    os.remove(o_file)
+                    return
+                else:
+                    logger.info(f"Taxid {taxid} successfully added to foreground genomes (total: {len(fg_genomes_selected)})")
+            
+            else:
+                # If the scientific name does not indicate symbiosis, check GloBI database for interactions
+                query = {
+                    'sourceTaxonName': sci_name, 
+                    'interactionTypeName': ['parasiteOf','hasHost','pathogenOf']
+                }
+                results = globi_db_queries.multi_column_search('interactions', query, globi_db_path)
+                if free_living_check.validate_globi_results(taxid, results):
+                    logger.info(f"Taxid {taxid} is a symbiont/pathogen based on GloBI results")
+                    
+                    # If symbiont did NOT come from main taxon_ids list, delete it
+                    if not is_from_main_list:
+                        logger.info(f"Taxid {taxid} rejected: symbiont from free-living taxon list (not in main taxon_ids) - DELETING")
+                        os.remove(o_file)
+                        return
+                    
+                    # add to the foreground genomes if possible
+                    if not add_taxa_to_selected_group(taxid, fg_genomes_selected, 'foreground'):
+                        logger.info(f"Taxid {taxid} rejected: max foreground genomes reached ({len(fg_genomes_selected)}/{int(max_genome_count/2)})")
+                        # if the max fg genomes have been reached delete the archive and return
+                        os.remove(o_file)
+                        return
+                    else:
+                        logger.info(f"Taxid {taxid} successfully added to foreground genomes (total: {len(fg_genomes_selected)})")
+        
+                else:
+                    # Taxa has passed the GloBI check, check the isolation source through NCBI biosample metadata
+                    logger.info(f"Taxid {taxid} passed GloBI check (not a symbiont) - checking biosample isolation sources")
+                    # First collect biosample_uids for the taxid
+                    biosample_uids = free_living_check.ncbi_taxid_to_biosample_uids(taxid)
+                    logger.info(f"Taxid {taxid} Biosample UIDs: {biosample_uids}")
+                    if free_living_check.check_biosample_isolation_source(biosample_uids):
+                        logger.info(f"Taxid {taxid} is freeliving based on biosample isolation sources - adding to background")
+                        
+                        if not add_taxa_to_selected_group(taxid, bg_genomes_selected, 'background'):
+                            # if the max bg genomes have been reached delete the archive and return
+                            logger.info(f"Taxid {taxid} rejected: max background genomes reached ({len(bg_genomes_selected)}/{int(max_genome_count/2)})")
+                            os.remove(o_file)
+                            return
+                        else:
+                            logger.info(f"Taxid {taxid} successfully added to background genomes (total: {len(bg_genomes_selected)})")
+                    else:  
+                        # Taxid cannot be confidently classified as symbiont or free-living 
+                        logger.info(f"Taxid {taxid} cannot be confidently classified as symbiont or free-living - DELETING")
+                        os.remove(o_file)
+                        return
             
         # taxid was succesfully added to a selected list, add to the taxon_genome_map
         logger.info(f"Taxid {taxid} successfully classified and added - mapping genome accession")
@@ -340,10 +409,14 @@ def download_genomes(id_list: list,fl_id_list: list, max_genome_count: int, work
                         # Default to foreground if we can't determine
                         existing_fg_genomes.append(taxid)
             logger.info(f"Found {len(existing_fg_genomes)} existing foreground and {len(existing_bg_genomes)} existing background genomes")
-    
+ 
     # generate all potential download commands and store in list 
     download_commands = []
     taxids_used = []
+    
+    # Preserve the original id_list before combining (needed to check if symbionts came from main taxon_ids)
+    original_id_list = id_list.copy()
+    
     combined_list = id_list + fl_id_list
     logger.info(f"Preparing downloads for {len(combined_list)} total taxids ({len(id_list)} from main list, {len(fl_id_list)} from free-living list)")
     id_list = combined_list
@@ -363,7 +436,7 @@ def download_genomes(id_list: list,fl_id_list: list, max_genome_count: int, work
             "--filename", f"{workdir}/genomes/{taxid}_dataset.zip",
             "--include", "seq-report,protein,gff3", "--annotated",
             "--assembly-source", "RefSeq", "--assembly-level", "complete",
-            "--assembly-version", "latest", "--released-after", "01/01/2016",
+            "--assembly-version", "latest", "--released-after", "01/01/2012",
             "--reference"
         ]
         
@@ -381,7 +454,7 @@ def download_genomes(id_list: list,fl_id_list: list, max_genome_count: int, work
          # for tracking downloads 
         max_genome_event = manager.Event()
         log_queue = manager.Queue()
-        terminate_event = manager.Event()
+        terminate_event = manager.Event()  
         
         # Add existing genomes to selected lists and count them
         for taxid in existing_fg_genomes:
@@ -420,7 +493,7 @@ def download_genomes(id_list: list,fl_id_list: list, max_genome_count: int, work
             monitor_process.start()
             
             # multi-threaded download ansyn 
-            results = [pool.apply_async(dataset_download, args=(download_command, taxid, fl_id_list, taxid_genome_map, 
+            results = [pool.apply_async(dataset_download, args=(download_command, taxid, original_id_list, taxid_genome_map, 
                                                                 success_queue, fg_genomes_selected, bg_genomes_selected, 
                                                                 max_genome_count, max_genome_event, globi_db_path)) 
                        for download_command, taxid in zip(download_commands, taxids_used)]
