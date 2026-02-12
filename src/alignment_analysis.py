@@ -394,6 +394,25 @@ def calculate_region_pLDDT_from_lines(lines, start_pos, end_pos):
     
     return mean(pLDDTs)
 
+def _normalize_query_id(raw_id):
+    """
+    Normalize a query ID so that control dictionaries and alignment files
+    use a consistent key format.
+    
+    Current issue:
+    - Control dictionaries were built with keys like 'AF-Q5ZRZ3-F1-model_v4.pdb'
+    - Alignment files use 'AF-Q5ZRZ3-F1-model_v4' (no extension)
+    
+    We strip any trailing '.pdb' or '.pdb.gz' so both sides can match on the
+    extension-free ID.
+    """
+    if raw_id.endswith('.pdb'):
+        return raw_id[:-4]
+    if raw_id.endswith('.pdb.gz'):
+        return raw_id[:-7]
+    return raw_id
+
+
 def generate_control_dictionary(control_dir):
 
     '''Generates and returns control dictionary which contains statistics for each query protein
@@ -417,7 +436,8 @@ def generate_control_dictionary(control_dir):
                 lp = l.strip().split()
 
                 # collect foldseek output values
-                query = lp[0]
+                # use a normalized query ID so keys are extension-independent
+                query = _normalize_query_id(lp[0])
                 target= lp[1]
                 evalue = float(lp[2])
                 score = float(lp[3])
@@ -479,7 +499,9 @@ def alignment_stats(alignment, control_dict):
             lp = l.strip().split()
 
             # foldseek alignment values 
-            query = lp[0]
+            # Normalize query ID to match control_dict keys (which are stored
+            # without .pdb / .pdb.gz extensions by generate_control_dictionary)
+            query = _normalize_query_id(lp[0])
             target = lp[1] 
             evalue = float(lp[2])
             fident = float(lp[12])
