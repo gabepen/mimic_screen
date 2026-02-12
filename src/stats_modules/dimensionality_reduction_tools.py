@@ -783,6 +783,8 @@ def compute_diffusion_map_analysis(scaled_data, data_frame, pca_test_dir, organi
         print(f"\n{'='*60}")
         print(f"Multi-system mode detected: {len(systems)} systems found")
         print(f"Systems: {', '.join(sorted(systems))}")
+        print(f"System value counts:")
+        print(data_frame['system'].value_counts())
         print(f"{'='*60}")
         print(f"Using JOINT diffusion embedding across all systems...")
         print(f"  This creates a unified manifold where mimic cloud regions are comparable across systems.")
@@ -1038,8 +1040,8 @@ def compute_diffusion_map_analysis(scaled_data, data_frame, pca_test_dir, organi
             else:
                 print(f"\nUsing DC1-based pseudotime (sufficient resolution)")
     
-    # Create results DataFrame
-    results_df = data_frame.copy()
+    # Create results DataFrame - reset index to ensure alignment with diffusion_coords
+    results_df = data_frame.reset_index(drop=True).copy()
     # Save up to DC4 (or as many as available)
     for i in range(min(4, n_diffusion_components)):
         results_df[f'Diffusion{i+1}'] = diffusion_coords[:, i]
@@ -1115,7 +1117,8 @@ def compute_diffusion_map_analysis(scaled_data, data_frame, pca_test_dir, organi
         })
         mimic_df = mimic_df[mimic_mask]
         best_mimic_indices = mimic_df.groupby('query')['quality'].idxmax().values
-        mimic_indices = best_mimic_indices.tolist()
+        # Map back to original DataFrame indices using row_idx
+        mimic_indices = mimic_df.loc[best_mimic_indices, 'row_idx'].values.tolist()
         print(f"Found {len(mimic_indices)} best mimic alignments to highlight")
     
     # Find best candidate alignments (one per query)
@@ -1129,15 +1132,17 @@ def compute_diffusion_map_analysis(scaled_data, data_frame, pca_test_dir, organi
         })
         candidate_df = candidate_df[candidate_mask]
         best_candidate_indices = candidate_df.groupby('query')['quality'].idxmax().values
-        candidate_indices = best_candidate_indices.tolist()
+        # Map back to original DataFrame indices using row_idx
+        candidate_indices = candidate_df.loc[best_candidate_indices, 'row_idx'].values.tolist()
         print(f"Found {len(candidate_indices)} best candidate alignments to highlight")
     
     # Save results
+    # results_df already has all columns from data_frame.copy() above (with reset index)
     # Include query column and GO term columns if available for downstream analysis
-    if 'query' in data_frame.columns:
+    if 'query' in data_frame.columns and 'query' not in results_df.columns:
         results_df['query'] = data_frame['query'].values
     # Include system column if present (for multi-system mode)
-    if 'system' in data_frame.columns:
+    if 'system' in data_frame.columns and 'system' not in results_df.columns:
         results_df['system'] = data_frame['system'].values
     # Include GO term columns if they exist
     go_term_cols = ['target_biological_processes', 'target_molecular_functions', 'target_cellular_components']
@@ -3445,7 +3450,7 @@ def estimate_optimal_clusters(reduced_data, clustering_method='kmeans', k_range=
     return optimal_k, scores
 
 
-def value_driven_pca_clustering(pca_test_dir, data_frame, organism_name, n_clusters=10, clustering_method='kmeans', include_lengths=False, plot_3d=False, use_umap=False, umap_n_neighbors=15, umap_min_dist=0.1, include_evolutionary=False, include_targeting=False, include_plddt=False, include_go_terms=False, scaler_type='robust', use_diffusion=False, diffusion_alpha=1.0, diffusion_n_neighbors=15, exclude_derived_features=False, auto_clusters=False, cluster_estimation_method='silhouette', use_natural_attractor=False, save_cloud_definition=False, transfer_cloud_from=None):
+def value_driven_pca_clustering(pca_test_dir, data_frame, organism_name, n_clusters=10, clustering_method='kmeans', include_lengths=False, plot_3d=False, use_umap=False, umap_n_neighbors=15, umap_min_dist=0.1, include_evolutionary=False, include_targeting=False, include_plddt=False, include_go_terms=False, scaler_type='robust', use_diffusion=False, diffusion_alpha=1.0, diffusion_n_neighbors=15, exclude_derived_features=False, auto_clusters=False, cluster_estimation_method='silhouette', use_natural_attractor=False, save_cloud_definition=False, transfer_cloud_from=None, adjust_tm_score=False):
     """
     Perform purely value-driven clustering based on alignment features only.
     No GO term labels are used - clustering is based solely on alignment feature values.
@@ -3533,6 +3538,34 @@ def value_driven_pca_clustering(pca_test_dir, data_frame, organism_name, n_clust
         else:
             print("Warning: pLDDT columns (plddt_query_region, plddt_target_region) not found")
     
+    # Adjust TM-score by pLDDT if requested
+    if adjust_tm_score:
+        if 'plddt_query_region' in data_frame.columns and 'plddt_target_region' in data_frame.columns and 'score' in data_frame.columns:
+            print("\nAdjusting TM-score by pLDDT confidence...")
+            # Convert pLDDT to numeric, handling 'NA' strings and missing values
+            plddt_query = pd.to_numeric(data_frame['plddt_query_region'], errors='coerce')
+            plddt_target = pd.to_numeric(data_frame['plddt_target_region'], errors='coerce')
+            
+            # Use minimum confidence (most conservative - penalizes if either structure is uncertain)
+            min_plddt = pd.concat([plddt_query, plddt_target], axis=1).min(axis=1)
+            
+            # Normalize pLDDT to 0-1 scale (pLDDT is typically 0-100)
+            plddt_normalized = min_plddt / 100.0
+            
+            # Weight TM-score by confidence: higher confidence = higher weight
+            # Store in dataframe for later use
+            data_frame['score_weighted_by_plddt'] = data_frame['score'] * plddt_normalized
+            
+            # Replace 'score' with 'score_weighted_by_plddt' in selected columns
+            if 'score' in selected_columns:
+                selected_columns.remove('score')
+                selected_columns.append('score_weighted_by_plddt')
+                print("  Replaced 'score' with 'score_weighted_by_plddt' in feature set")
+                print("  This downweights alignments with low structure confidence in diffusion mapping")
+        else:
+            print("Warning: --adjust_tm_score requires 'score', 'plddt_query_region', and 'plddt_target_region' columns")
+            print("  Falling back to standard 'score' feature")
+    
     # Add derived features
     test_data_frame = data_frame[selected_columns].copy()
     
@@ -3554,8 +3587,9 @@ def value_driven_pca_clustering(pca_test_dir, data_frame, organism_name, n_clust
         if rows_after < initial_rows:
             print(f"  Dropped {initial_rows - rows_after} rows with missing values")
             print(f"  Remaining: {rows_after} rows ({rows_after/initial_rows*100:.1f}%)")
-            # Also need to update data_frame to match
-            data_frame = data_frame.loc[test_data_frame.index].copy()
+            # Also need to update data_frame to match - reset index to ensure alignment
+            data_frame = data_frame.loc[test_data_frame.index].copy().reset_index(drop=True)
+            test_data_frame = test_data_frame.reset_index(drop=True)
         
         # Update selected_columns to only include columns that exist
         selected_columns = [col for col in selected_columns if col in test_data_frame.columns]
@@ -3564,8 +3598,10 @@ def value_driven_pca_clustering(pca_test_dir, data_frame, organism_name, n_clust
     derived_features_added = []
     if not exclude_derived_features:
         # score_per_length: normalized score by protein sizes
-        if 'qlen' in data_frame.columns and 'tlen' in data_frame.columns:
-            test_data_frame['score_per_length'] = data_frame['score'] / (data_frame['qlen'] * data_frame['tlen'] + 1e-10)
+        # Use the active score column (either 'score' or 'score_weighted_by_plddt' if adjusted)
+        score_col = 'score_weighted_by_plddt' if adjust_tm_score and 'score_weighted_by_plddt' in data_frame.columns else 'score'
+        if 'qlen' in data_frame.columns and 'tlen' in data_frame.columns and score_col in data_frame.columns:
+            test_data_frame['score_per_length'] = data_frame[score_col] / (data_frame['qlen'] * data_frame['tlen'] + 1e-10)
             derived_features_added.append('score_per_length')
         
         # coverage_balance: asymmetry between query and target coverage
@@ -3879,9 +3915,11 @@ def value_driven_pca_clustering(pca_test_dir, data_frame, organism_name, n_clust
         })
         mimic_df = mimic_df[mimic_mask]
         best_mimic_indices = mimic_df.groupby('query')['quality'].idxmax().values
-        # Mark these specific rows in pca_df (rows are in same order)
-        pca_df.loc[best_mimic_indices, 'label'] = 'mimic'
-        print(f"Labeled {len(best_mimic_indices)} best mimic alignments (one per known mimic)")
+        # Map back to original DataFrame indices using row_idx, then use those for pca_df
+        # pca_df has same row order as data_frame (both filtered the same way)
+        original_mimic_indices = mimic_df.loc[best_mimic_indices, 'row_idx'].values
+        pca_df.loc[original_mimic_indices, 'label'] = 'mimic'
+        print(f"Labeled {len(original_mimic_indices)} best mimic alignments (one per known mimic)")
     
     # For candidates: only label the best alignment per query
     candidate_mask = data_frame['query'].isin(candidate_list).values
@@ -3893,8 +3931,10 @@ def value_driven_pca_clustering(pca_test_dir, data_frame, organism_name, n_clust
         })
         candidate_df = candidate_df[candidate_mask]
         best_candidate_indices = candidate_df.groupby('query')['quality'].idxmax().values
-        pca_df.loc[best_candidate_indices, 'label'] = 'candidate'
-        print(f"Labeled {len(best_candidate_indices)} best candidate alignments (one per known candidate)")
+        # Map back to original DataFrame indices using row_idx, then use those for pca_df
+        original_candidate_indices = candidate_df.loc[best_candidate_indices, 'row_idx'].values
+        pca_df.loc[original_candidate_indices, 'label'] = 'candidate'
+        print(f"Labeled {len(original_candidate_indices)} best candidate alignments (one per known candidate)")
     
     # Save results
     suffix = f'{method_name}_{clustering_method}_{n_clusters}'
@@ -4177,6 +4217,283 @@ def pca_analysis(pca_test_dir, data_frame):
     plt.title('PCA Visualization')
     plt.savefig(pca_test_dir + '/pca_visualization_rbs2.png')
     plt.close()
+    
+def analyze_system_manifold_overlap(diffusion_results_file, output_dir, n_neighbors=15, use_dc123=True):
+    """
+    Analyze and visualize manifold overlap between different systems.
+    
+    Parameters:
+    -----------
+    diffusion_results_file : str
+        Path to CSV file with diffusion map results (must have 'system' column)
+    output_dir : str
+        Directory to save output visualizations and statistics
+    n_neighbors : int
+        Number of neighbors for density estimation
+    use_dc123 : bool
+        If True, use DC1, DC2, DC3 for analysis; else use DC1, DC2
+    """
+    from scipy.spatial.distance import cdist
+    from scipy.stats import gaussian_kde
+    from sklearn.neighbors import NearestNeighbors
+    import seaborn as sns
+    
+    print("\n" + "="*60)
+    print("System Manifold Overlap Analysis")
+    print("="*60)
+    
+    # Load diffusion map results
+    results_df = pd.read_csv(diffusion_results_file)
+    
+    if 'system' not in results_df.columns:
+        print("Error: 'system' column not found in results file")
+        return
+    
+    systems = sorted(results_df['system'].unique())
+    n_systems = len(systems)
+    
+    print(f"Found {n_systems} systems: {', '.join(systems)}")
+    
+    # Get diffusion coordinates
+    if use_dc123:
+        dc_cols = ['Diffusion1', 'Diffusion2', 'Diffusion3']
+        n_dims = 3
+    else:
+        dc_cols = ['Diffusion1', 'Diffusion2']
+        n_dims = 2
+    
+    missing_cols = [col for col in dc_cols if col not in results_df.columns]
+    if missing_cols:
+        print(f"Error: Missing diffusion coordinate columns: {missing_cols}")
+        return
+    
+    coords = results_df[dc_cols].values
+    
+    os.makedirs(output_dir, exist_ok=True)
+    
+    # 1. Compute pairwise system overlap statistics
+    print("\nComputing pairwise system overlap statistics...")
+    overlap_stats = []
+    
+    for i, sys1 in enumerate(systems):
+        for j, sys2 in enumerate(systems):
+            if i >= j:
+                continue
+            
+            mask1 = results_df['system'] == sys1
+            mask2 = results_df['system'] == sys2
+            
+            coords1 = coords[mask1]
+            coords2 = coords[mask2]
+            
+            # Compute convex hull or density-based overlap
+            # Method 1: Nearest neighbor overlap (samples from sys1 near sys2 and vice versa)
+            nn = NearestNeighbors(n_neighbors=n_neighbors, metric='euclidean')
+            nn.fit(coords2)
+            distances1_to_2, _ = nn.kneighbors(coords1)
+            # Samples from sys1 that are close to sys2
+            close1_to_2 = (distances1_to_2[:, 0] < np.percentile(distances1_to_2, 25)).sum()
+            
+            nn.fit(coords1)
+            distances2_to_1, _ = nn.kneighbors(coords2)
+            close2_to_1 = (distances2_to_1[:, 0] < np.percentile(distances2_to_1, 25)).sum()
+            
+            # Overlap percentage
+            overlap_pct_1 = close1_to_2 / len(coords1) * 100
+            overlap_pct_2 = close2_to_1 / len(coords2) * 100
+            avg_overlap = (overlap_pct_1 + overlap_pct_2) / 2
+            
+            # Jaccard-like similarity: intersection / union in k-nearest neighbor space
+            # For each sample, find its k nearest neighbors across all systems
+            nn_all = NearestNeighbors(n_neighbors=n_neighbors, metric='euclidean')
+            nn_all.fit(coords)
+            
+            # Count how many neighbors from each system
+            neighbors1_in_1 = 0
+            neighbors1_in_2 = 0
+            neighbors2_in_1 = 0
+            neighbors2_in_2 = 0
+            
+            for idx in np.where(mask1)[0]:
+                _, neighbor_indices = nn_all.kneighbors([coords[idx]])
+                neighbor_systems = results_df.iloc[neighbor_indices[0][1:]]['system']  # Exclude self
+                neighbors1_in_1 += (neighbor_systems == sys1).sum()
+                neighbors1_in_2 += (neighbor_systems == sys2).sum()
+            
+            for idx in np.where(mask2)[0]:
+                _, neighbor_indices = nn_all.kneighbors([coords[idx]])
+                neighbor_systems = results_df.iloc[neighbor_indices[0][1:]]['system']
+                neighbors2_in_1 += (neighbor_systems == sys1).sum()
+                neighbors2_in_2 += (neighbor_systems == sys2).sum()
+            
+            # Jaccard similarity: shared neighbors / total unique neighbors
+            shared_neighbors = neighbors1_in_2 + neighbors2_in_1
+            total_neighbors = neighbors1_in_1 + neighbors1_in_2 + neighbors2_in_1 + neighbors2_in_2
+            jaccard_similarity = shared_neighbors / total_neighbors if total_neighbors > 0 else 0
+            
+            overlap_stats.append({
+                'system1': sys1,
+                'system2': sys2,
+                'overlap_pct_sys1': overlap_pct_1,
+                'overlap_pct_sys2': overlap_pct_2,
+                'avg_overlap_pct': avg_overlap,
+                'jaccard_similarity': jaccard_similarity,
+                'n_samples_sys1': len(coords1),
+                'n_samples_sys2': len(coords2)
+            })
+    
+    overlap_df = pd.DataFrame(overlap_stats)
+    
+    if len(overlap_df) == 0:
+        print("Warning: No system pairs found for overlap analysis (need at least 2 systems)")
+        return
+    
+    overlap_df.to_csv(os.path.join(output_dir, 'system_manifold_overlap_stats.csv'), index=False)
+    print(f"Saved overlap statistics to: {os.path.join(output_dir, 'system_manifold_overlap_stats.csv')}")
+    
+    # 2. Create overlap heatmap
+    print("Creating overlap heatmap...")
+    overlap_matrix = np.zeros((n_systems, n_systems))
+    jaccard_matrix = np.zeros((n_systems, n_systems))
+    
+    for _, row in overlap_df.iterrows():
+        i = systems.index(row['system1'])
+        j = systems.index(row['system2'])
+        overlap_matrix[i, j] = row['avg_overlap_pct']
+        overlap_matrix[j, i] = row['avg_overlap_pct']
+        jaccard_matrix[i, j] = row['jaccard_similarity']
+        jaccard_matrix[j, i] = row['jaccard_similarity']
+    
+    # Set diagonal to 100% (self-overlap)
+    np.fill_diagonal(overlap_matrix, 100.0)
+    np.fill_diagonal(jaccard_matrix, 1.0)
+    
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(16, 6))
+    
+    # Overlap percentage heatmap
+    sns.heatmap(overlap_matrix, annot=True, fmt='.1f', cmap='YlOrRd', 
+                xticklabels=systems, yticklabels=systems, ax=ax1, cbar_kws={'label': 'Overlap %'})
+    ax1.set_title('System Manifold Overlap Percentage')
+    ax1.set_xlabel('System')
+    ax1.set_ylabel('System')
+    
+    # Jaccard similarity heatmap
+    sns.heatmap(jaccard_matrix, annot=True, fmt='.3f', cmap='Blues',
+                xticklabels=systems, yticklabels=systems, ax=ax2, cbar_kws={'label': 'Jaccard Similarity'})
+    ax2.set_title('System Manifold Jaccard Similarity')
+    ax2.set_xlabel('System')
+    ax2.set_ylabel('System')
+    
+    plt.tight_layout()
+    heatmap_file = os.path.join(output_dir, 'system_manifold_overlap_heatmap.png')
+    plt.savefig(heatmap_file, dpi=300, bbox_inches='tight')
+    plt.close()
+    print(f"Saved heatmap to: {heatmap_file}")
+    
+    # 3. Create pairwise comparison plots
+    print("Creating pairwise system comparison plots...")
+    n_pairs = len(overlap_df)
+    
+    if n_dims == 2:
+        fig, axes = plt.subplots(1, n_pairs, figsize=(6*n_pairs, 6))
+        if n_pairs == 1:
+            axes = [axes]
+    else:
+        # For 3D, create separate figures
+        axes = None
+    
+    for idx, (_, row) in enumerate(overlap_df.iterrows()):
+        sys1 = row['system1']
+        sys2 = row['system2']
+        
+        mask1 = results_df['system'] == sys1
+        mask2 = results_df['system'] == sys2
+        
+        coords1 = coords[mask1]
+        coords2 = coords[mask2]
+        
+        if n_dims == 2:
+            ax = axes[idx]
+            ax.scatter(coords1[:, 0], coords1[:, 1], alpha=0.5, s=10, label=sys1, c='blue')
+            ax.scatter(coords2[:, 0], coords2[:, 1], alpha=0.5, s=10, label=sys2, c='red')
+            ax.set_xlabel('DC1')
+            ax.set_ylabel('DC2')
+            ax.set_title(f'{sys1} vs {sys2}\nOverlap: {row["avg_overlap_pct"]:.1f}%')
+            ax.legend()
+        else:
+            # 3D plot
+            fig = plt.figure(figsize=(10, 8))
+            ax = fig.add_subplot(111, projection='3d')
+            ax.scatter(coords1[:, 0], coords1[:, 1], coords1[:, 2], 
+                      alpha=0.5, s=10, label=sys1, c='blue')
+            ax.scatter(coords2[:, 0], coords2[:, 1], coords2[:, 2],
+                      alpha=0.5, s=10, label=sys2, c='red')
+            ax.set_xlabel('DC1')
+            ax.set_ylabel('DC2')
+            ax.set_zlabel('DC3')
+            ax.set_title(f'{sys1} vs {sys2}\nOverlap: {row["avg_overlap_pct"]:.1f}%')
+            ax.legend()
+            
+            pair_file = os.path.join(output_dir, f'system_pairwise_{sys1}_vs_{sys2}.png')
+            plt.savefig(pair_file, dpi=300, bbox_inches='tight')
+            plt.close()
+    
+    if n_dims == 2:
+        plt.tight_layout()
+        pairwise_file = os.path.join(output_dir, 'system_pairwise_comparisons.png')
+        plt.savefig(pairwise_file, dpi=300, bbox_inches='tight')
+        plt.close()
+        print(f"Saved pairwise comparisons to: {pairwise_file}")
+    
+    # 4. Create density plots for each system
+    print("Creating system density plots...")
+    if n_dims == 2:
+        fig, axes = plt.subplots(1, n_systems, figsize=(6*n_systems, 6))
+        if n_systems == 1:
+            axes = [axes]
+        
+        for idx, system in enumerate(systems):
+            mask = results_df['system'] == system
+            system_coords = coords[mask]
+            
+            # Create 2D density plot
+            ax = axes[idx]
+            ax.hexbin(system_coords[:, 0], system_coords[:, 1], gridsize=30, cmap='viridis', mincnt=1)
+            ax.set_xlabel('DC1')
+            ax.set_ylabel('DC2')
+            ax.set_title(f'{system}\n(n={len(system_coords)})')
+        
+        plt.tight_layout()
+        density_file = os.path.join(output_dir, 'system_manifold_densities.png')
+        plt.savefig(density_file, dpi=300, bbox_inches='tight')
+        plt.close()
+        print(f"Saved density plots to: {density_file}")
+    
+    # 5. Summary statistics
+    print("\n" + "="*60)
+    print("Manifold Overlap Summary")
+    print("="*60)
+    
+    if len(overlap_df) > 0 and 'jaccard_similarity' in overlap_df.columns:
+        print(f"\nMost similar systems (by Jaccard similarity):")
+        n_show = min(3, len(overlap_df))
+        top_similar = overlap_df.nlargest(n_show, 'jaccard_similarity')
+        for _, row in top_similar.iterrows():
+            print(f"  {row['system1']} <-> {row['system2']}: {row['jaccard_similarity']:.3f}")
+    else:
+        print("\nWarning: Could not compute Jaccard similarity statistics")
+    
+    if len(overlap_df) > 0 and 'avg_overlap_pct' in overlap_df.columns:
+        print(f"\nMost overlapping systems (by average overlap %):")
+        n_show = min(3, len(overlap_df))
+        top_overlap = overlap_df.nlargest(n_show, 'avg_overlap_pct')
+        for _, row in top_overlap.iterrows():
+            print(f"  {row['system1']} <-> {row['system2']}: {row['avg_overlap_pct']:.1f}%")
+    else:
+        print("\nWarning: Could not compute overlap percentage statistics")
+    
+    print(f"\nAll results saved to: {output_dir}")
+    print("="*60 + "\n")
     
 def main():
     parser = argparse.ArgumentParser()

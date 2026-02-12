@@ -166,6 +166,11 @@ def main():
         help='Include pLDDT features (plddt_query_region, plddt_target_region) in clustering. These are AlphaFold confidence scores for query and target regions.'
     )
     parser.add_argument(
+        '--adjust_tm_score',
+        action='store_true',
+        help='Replace TM-score with pLDDT-weighted TM-score (score * min_plddt/100). Downweights alignments with low structure confidence. Requires pLDDT columns.'
+    )
+    parser.add_argument(
         '--include_go_terms',
         action='store_true',
         help='Include GO terms as features (not yet implemented - use semantic clustering instead)'
@@ -221,6 +226,11 @@ def main():
         type=int,
         default=None,
         help='Maximum number of samples for GO similarity analysis (for speed). Default: all samples.'
+    )
+    parser.add_argument(
+        '--system_overlap_analysis',
+        action='store_true',
+        help='Analyze and visualize manifold overlap between systems. Requires --use_diffusion and multi-system data (system column).'
     )
     parser.add_argument(
         '--save_cloud_definition',
@@ -337,6 +347,7 @@ def main():
             include_evolutionary=args.include_evolutionary,
             include_targeting=args.include_targeting,
             include_plddt=args.plddt_features,
+            adjust_tm_score=args.adjust_tm_score,
             include_go_terms=args.include_go_terms,
             scaler_type=args.scaler,
             use_diffusion=args.use_diffusion,
@@ -387,6 +398,36 @@ def main():
                             print(f"  Interpretation: {results['interpretation']}")
                     except Exception as e:
                         print(f"Error in GO similarity analysis: {e}")
+                        import traceback
+                        traceback.print_exc()
+        
+        # Run system manifold overlap analysis if requested
+        if args.system_overlap_analysis:
+            if not args.use_diffusion:
+                print("Warning: --system_overlap_analysis requires --use_diffusion. Skipping overlap analysis.")
+            elif 'system' not in df.columns:
+                print("Warning: 'system' column not found. System overlap analysis requires multi-system data.")
+            else:
+                # Construct path to diffusion results file
+                diffusion_results_file = os.path.join(
+                    args.output_dir,
+                    f'{args.organism_name}_diffusion_map_results.csv'
+                )
+                
+                if not os.path.exists(diffusion_results_file):
+                    print(f"Warning: Diffusion results file not found: {diffusion_results_file}")
+                    print("  System overlap analysis requires diffusion map results. Skipping.")
+                else:
+                    print(f"\nRunning system manifold overlap analysis...")
+                    try:
+                        dimensionality_reduction_tools.analyze_system_manifold_overlap(
+                            diffusion_results_file=diffusion_results_file,
+                            output_dir=args.output_dir,
+                            n_neighbors=15,
+                            use_dc123=True
+                        )
+                    except Exception as e:
+                        print(f"Error in system overlap analysis: {e}")
                         import traceback
                         traceback.print_exc()
     elif args.use_tsne:
