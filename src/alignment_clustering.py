@@ -202,7 +202,12 @@ def main():
         '--diffusion_n_neighbors',
         type=int,
         default=15,
-        help='Diffusion map n_neighbors parameter (default: 15). Number of neighbors for affinity graph construction.'
+        help='Diffusion map n_neighbors parameter (default: 15). Number of neighbors for affinity graph construction. Use --auto_n_neighbors to automatically determine optimal value.'
+    )
+    parser.add_argument(
+        '--auto_n_neighbors',
+        action='store_true',
+        help='Automatically determine optimal n_neighbors for diffusion map using heuristics and graph connectivity analysis. Overrides --diffusion_n_neighbors if set.'
     )
     parser.add_argument(
         '--natural_attractor',
@@ -242,6 +247,40 @@ def main():
         type=str,
         default=None,
         help='Path to JSON file containing mimic cloud definition from another dataset (e.g., legionella). Applies this cloud to the current dataset in feature space.'
+    )
+    parser.add_argument(
+        '--adaptive_epsilon',
+        action='store_true',
+        help='Use adaptive (local) epsilon/kernel width for diffusion map. Each point uses its own bandwidth based on k-nearest neighbors, improving handling of varying densities.'
+    )
+    parser.add_argument(
+        '--adaptive_k_neighbors',
+        type=int,
+        default=7,
+        help='Number of neighbors for adaptive epsilon estimation (default: 7). Only used with --adaptive_epsilon.'
+    )
+    parser.add_argument(
+        '--epsilon_scale',
+        type=float,
+        default=1.0,
+        help='Scaling factor for adaptive epsilon (default: 1.0). Values < 1.0 reduce epsilon for tighter clustering, > 1.0 increase for better connectivity. Only used with --adaptive_epsilon.'
+    )
+    parser.add_argument(
+        '--spectral_cloud',
+        action='store_true',
+        help='Define mimic cloud using spectral clustering in addition to distance-based method. Runs alongside distance-based cloud for comparison.'
+    )
+    parser.add_argument(
+        '--spectral_n_clusters',
+        type=int,
+        default=None,
+        help='Number of clusters for spectral clustering. If not specified, will be automatically determined using eigengap heuristic (recommended).'
+    )
+    parser.add_argument(
+        '--spectral_gamma',
+        type=float,
+        default=None,
+        help='RBF kernel parameter (gamma) for spectral clustering. If not specified, will be estimated from median pairwise distance (default: 1/(2*median_dist^2)).'
     )
     
     args = parser.parse_args()
@@ -358,7 +397,14 @@ def main():
             cluster_estimation_method=args.cluster_estimation_method,
             use_natural_attractor=args.natural_attractor,
             save_cloud_definition=args.save_cloud_definition,
-            transfer_cloud_from=args.transfer_cloud_from
+            transfer_cloud_from=args.transfer_cloud_from,
+            use_adaptive_epsilon=args.adaptive_epsilon,
+            adaptive_k_neighbors=args.adaptive_k_neighbors,
+            auto_n_neighbors=args.auto_n_neighbors,
+            use_spectral_cloud=args.spectral_cloud,
+            spectral_n_clusters=args.spectral_n_clusters,
+            spectral_gamma=args.spectral_gamma,
+            epsilon_scale=args.epsilon_scale
         )
         
         # Run GO similarity analysis if requested and diffusion map was used

@@ -21,8 +21,7 @@ try:
 except ImportError:
     DIFFUSION_AVAILABLE = False
 from sklearn.feature_extraction.text import TfidfVectorizer
-from sklearn.cluster import KMeans
-from sklearn.cluster import AgglomerativeClustering
+from sklearn.cluster import KMeans, AgglomerativeClustering, SpectralClustering
 from sklearn.metrics import silhouette_score, davies_bouldin_score
 from sklearn.manifold import trustworthiness
 from gensim.models import Word2Vec
@@ -487,31 +486,39 @@ def compute_robust_axis_limits(data, percentile_low=1.0, percentile_high=99.0, p
     return (low - padding, high + padding)
 
 
-def define_mimic_cloud_in_feature_space(scaled_data, data_frame, mimic_queries, output_file=None):
+def define_mimic_cloud_in_feature_space(scaled_data, data_frame, mimic_queries, output_file=None, feature_columns=None):
     """
     Define mimic cloud in feature space (before diffusion mapping).
     This cloud definition can be transferred to other datasets.
+    
+    With adaptive epsilon, different systems may have different scalers. This function
+    saves both scaled and raw feature values to enable proper transfer across systems.
     
     Parameters:
     -----------
     scaled_data : array-like
         Scaled feature matrix (n_samples, n_features)
     data_frame : DataFrame
-        DataFrame with 'query' column to identify mimics
+        DataFrame with 'query' column and feature columns (for raw values)
     mimic_queries : list
         List of query IDs that are known mimics
     output_file : str, optional
         Path to save cloud definition (JSON format)
+    feature_columns : list, optional
+        List of feature column names used. If None, will try to infer from data_frame.
+        This is needed to extract raw feature values for transfer.
     
     Returns:
     --------
     cloud_definition : dict
         Dictionary containing:
-        - 'core_mimic_features': array of core mimic feature vectors
+        - 'core_mimic_features': array of core mimic feature vectors (scaled)
+        - 'core_mimic_features_raw': array of core mimic feature vectors (raw, unscaled)
         - 'core_mimic_queries': list of query IDs for core mimics
-        - 'threshold_within': distance threshold for "within cloud"
-        - 'threshold_around': distance threshold for "around cloud"
-        - 'all_mimic_features': array of all mimic feature vectors (for reference)
+        - 'threshold_within': distance threshold for "within cloud" (in scaled space)
+        - 'threshold_around': distance threshold for "around cloud" (in scaled space)
+        - 'feature_columns': list of feature column names
+        - 'all_mimic_features': array of all mimic feature vectors (scaled, for reference)
         - 'all_mimic_queries': list of all mimic query IDs
     """
     import json
@@ -529,9 +536,31 @@ def define_mimic_cloud_in_feature_space(scaled_data, data_frame, mimic_queries, 
     print(f"\nDefining mimic cloud in feature space...")
     print(f"  Found {len(mimic_indices)} mimic alignments")
     
-    # Get mimic features
+    # Get mimic features (scaled)
     mimic_features = scaled_data[mimic_indices]
     mimic_queries_found = data_frame.iloc[mimic_indices]['query'].values
+    
+    # Get raw (unscaled) feature values for transfer across systems
+    # This allows proper scaling with target system's scaler
+    if feature_columns is None:
+        # Try to infer feature columns from data_frame
+        # Exclude non-feature columns
+        exclude_cols = ['query', 'target', 'system', 'label', 'cluster', 'go_term']
+        feature_columns = [col for col in data_frame.columns 
+                         if col not in exclude_cols and 
+                         data_frame[col].dtype in [np.float64, np.float32, np.int64, np.int32]]
+        if len(feature_columns) != scaled_data.shape[1]:
+            print(f"  Warning: Could not infer feature columns. Found {len(feature_columns)} columns but scaled_data has {scaled_data.shape[1]} features.")
+            print(f"  Using scaled features only (may not transfer well across systems with different scalers).")
+            feature_columns = None
+    
+    if feature_columns is not None and len(feature_columns) == scaled_data.shape[1]:
+        mimic_features_raw = data_frame.iloc[mimic_indices][feature_columns].values
+        print(f"  Saving raw feature values for cross-system transfer (columns: {feature_columns[:5]}...)")
+    else:
+        mimic_features_raw = None
+        feature_columns = None
+        print(f"  Warning: Raw features not available. Cloud transfer may not work correctly across systems with different scalers.")
     
     # Compute pairwise distances between mimics in feature space
     mimic_pairwise_distances = cdist(mimic_features, mimic_features, metric='euclidean')
@@ -625,9 +654,15 @@ def define_mimic_cloud_in_feature_space(scaled_data, data_frame, mimic_queries, 
                 # Last resort: use all mimics
                 core_mimic_indices = list(range(len(mimic_indices)))
     
-    # Get core mimic features
+    # Get core mimic features (scaled)
     core_mimic_features = mimic_features[core_mimic_indices]
     core_mimic_queries = mimic_queries_found[core_mimic_indices].tolist()
+    
+    # Get core mimic features (raw, if available)
+    if mimic_features_raw is not None:
+        core_mimic_features_raw = mimic_features_raw[core_mimic_indices]
+    else:
+        core_mimic_features_raw = None
     
     # Calculate thresholds for cloud definition
     if len(core_mimic_indices) > 1:
@@ -653,14 +688,16 @@ def define_mimic_cloud_in_feature_space(scaled_data, data_frame, mimic_queries, 
     
     # Create cloud definition (keep as numpy arrays for immediate use)
     cloud_definition = {
-        'core_mimic_features': core_mimic_features,  # Keep as numpy array
+        'core_mimic_features': core_mimic_features,  # Scaled features (for immediate use)
         'core_mimic_queries': core_mimic_queries,
-        'all_mimic_features': mimic_features,  # Keep as numpy array
+        'all_mimic_features': mimic_features,  # Scaled features (for reference)
         'all_mimic_queries': mimic_queries_found.tolist(),
         'threshold_within': float(threshold_within),
         'threshold_around': float(threshold_around),
         'n_core_mimics': len(core_mimic_indices),
-        'n_total_mimics': len(mimic_indices)
+        'n_total_mimics': len(mimic_indices),
+        'feature_columns': feature_columns,  # Column names for raw features
+        'core_mimic_features_raw': core_mimic_features_raw,  # Raw features (for cross-system transfer)
     }
     
     # Save to file if specified (convert to lists for JSON)
@@ -668,9 +705,15 @@ def define_mimic_cloud_in_feature_space(scaled_data, data_frame, mimic_queries, 
         cloud_definition_for_json = cloud_definition.copy()
         cloud_definition_for_json['core_mimic_features'] = core_mimic_features.tolist()
         cloud_definition_for_json['all_mimic_features'] = mimic_features.tolist()
+        if core_mimic_features_raw is not None:
+            cloud_definition_for_json['core_mimic_features_raw'] = core_mimic_features_raw.tolist()
+        else:
+            cloud_definition_for_json['core_mimic_features_raw'] = None
         with open(output_file, 'w') as f:
             json.dump(cloud_definition_for_json, f, indent=2)
         print(f"  Saved cloud definition to: {output_file}")
+        if feature_columns is not None:
+            print(f"  Includes raw features for cross-system transfer")
     
     return cloud_definition
 
@@ -698,12 +741,234 @@ def load_mimic_cloud_definition(cloud_file):
     cloud_definition['core_mimic_features'] = np.array(cloud_definition['core_mimic_features'])
     cloud_definition['all_mimic_features'] = np.array(cloud_definition['all_mimic_features'])
     
+    # Convert raw features if present
+    if 'core_mimic_features_raw' in cloud_definition and cloud_definition['core_mimic_features_raw'] is not None:
+        cloud_definition['core_mimic_features_raw'] = np.array(cloud_definition['core_mimic_features_raw'])
+    else:
+        cloud_definition['core_mimic_features_raw'] = None
+    
     return cloud_definition
 
 
-def apply_mimic_cloud_to_dataset(scaled_data, cloud_definition):
+def report_cloud_feature_statistics(data_frame, cloud_results, cloud_name="cloud", output_file=None):
+    """
+    Report feature statistics (mean, min, max) for alignments within, around, and outside the cloud.
+    
+    Parameters:
+    -----------
+    data_frame : DataFrame
+        DataFrame with feature columns
+    cloud_results : dict
+        Dictionary with 'within_cloud' and 'around_cloud' boolean arrays
+    cloud_name : str
+        Name of the cloud for reporting (e.g., "transferred cloud", "local cloud")
+    output_file : str, optional
+        Path to file to save statistics. If None, only prints to console.
+    """
+    within_cloud = cloud_results['within_cloud']
+    around_cloud = cloud_results['around_cloud']
+    outside_cloud = ~around_cloud
+    
+    # Get feature columns (exclude non-feature columns)
+    exclude_cols = ['query', 'target', 'system', 'label', 'cluster', 'go_term', 
+                     'target_cellular_components', 'target_molecular_functions', 
+                     'target_biological_processes', 'targets_likely_paralogs']
+    
+    # Also exclude result columns that might have been added
+    exclude_cols.extend([col for col in data_frame.columns 
+                        if any(x in col.lower() for x in ['diffusion', 'pseudotime', 'cloud', 'distance', 'trajectory'])])
+    
+    feature_cols = [col for col in data_frame.columns 
+                   if col not in exclude_cols and 
+                   data_frame[col].dtype in [np.float64, np.float32, np.int64, np.int32]]
+    
+    # Filter to numeric columns only
+    feature_cols = [col for col in feature_cols if data_frame[col].dtype in [np.float64, np.float32, np.int64, np.int32]]
+    
+    if len(feature_cols) == 0:
+        print(f"  Warning: No feature columns found for statistics")
+        return
+    
+    # Prepare output (both print and file)
+    output_lines = []
+    
+    def add_line(line):
+        output_lines.append(line)
+        print(line)
+    
+    add_line(f"\n{'='*60}")
+    add_line(f"Feature Statistics for {cloud_name}")
+    add_line(f"{'='*60}")
+    
+    # Get data for each region
+    within_data = data_frame.loc[within_cloud, feature_cols]
+    around_not_within = around_cloud & ~within_cloud
+    around_data = data_frame.loc[around_not_within, feature_cols] if around_not_within.sum() > 0 else pd.DataFrame()
+    outside_data = data_frame.loc[outside_cloud, feature_cols]
+    
+    n_within = within_cloud.sum()
+    n_around = around_not_within.sum()
+    n_outside = outside_cloud.sum()
+    n_total = len(data_frame)
+    
+    add_line(f"\nSample counts:")
+    add_line(f"  Within cloud: {n_within} ({n_within/n_total*100:.1f}%)")
+    add_line(f"  Around cloud (not within): {n_around} ({n_around/n_total*100:.1f}%)")
+    add_line(f"  Outside cloud: {n_outside} ({n_outside/n_total*100:.1f}%)")
+    add_line(f"  Total: {n_total}")
+    
+    if n_within == 0:
+        add_line(f"\n  Warning: No samples within cloud - cannot compute statistics")
+        if output_file:
+            with open(output_file, 'w') as f:
+                f.write('\n'.join(output_lines))
+        return
+    
+    # Compute statistics for each region
+    add_line(f"\n{'Feature':<30} {'Region':<20} {'Mean':>12} {'Min':>12} {'Max':>12} {'Std':>12}")
+    add_line(f"{'-'*30} {'-'*20} {'-'*12} {'-'*12} {'-'*12} {'-'*12}")
+    
+    for col in feature_cols:
+        # Within cloud
+        if n_within > 0:
+            within_vals = within_data[col].dropna()
+            if len(within_vals) > 0:
+                add_line(f"{col[:29]:<30} {'Within cloud':<20} "
+                      f"{within_vals.mean():>12.4f} {within_vals.min():>12.4f} "
+                      f"{within_vals.max():>12.4f} {within_vals.std():>12.4f}")
+        
+        # Around cloud (not within)
+        if n_around > 0:
+            around_vals = around_data[col].dropna() if len(around_data) > 0 else pd.Series(dtype=float)
+            if len(around_vals) > 0:
+                add_line(f"{col[:29]:<30} {'Around cloud':<20} "
+                      f"{around_vals.mean():>12.4f} {around_vals.min():>12.4f} "
+                      f"{around_vals.max():>12.4f} {around_vals.std():>12.4f}")
+        
+        # Outside cloud
+        if n_outside > 0:
+            outside_vals = outside_data[col].dropna()
+            if len(outside_vals) > 0:
+                add_line(f"{col[:29]:<30} {'Outside cloud':<20} "
+                      f"{outside_vals.mean():>12.4f} {outside_vals.min():>12.4f} "
+                      f"{outside_vals.max():>12.4f} {outside_vals.std():>12.4f}")
+        
+        # Add separator between features
+        if col != feature_cols[-1]:
+            add_line("")
+    
+    # Summary comparison
+    add_line(f"\n{'='*60}")
+    add_line(f"Summary: Feature Ranges")
+    add_line(f"{'='*60}")
+    add_line(f"{'Feature':<30} {'Within Cloud Range':<30} {'Outside Cloud Range':<30}")
+    add_line(f"{'-'*30} {'-'*30} {'-'*30}")
+    
+    for col in feature_cols[:15]:  # Show top 15 features to avoid too much output
+        within_vals = within_data[col].dropna()
+        outside_vals = outside_data[col].dropna()
+        
+        if len(within_vals) > 0 and len(outside_vals) > 0:
+            within_range = f"[{within_vals.min():.3f}, {within_vals.max():.3f}]"
+            outside_range = f"[{outside_vals.min():.3f}, {outside_vals.max():.3f}]"
+            add_line(f"{col[:29]:<30} {within_range:<30} {outside_range:<30}")
+    
+    if len(feature_cols) > 15:
+        add_line(f"\n  ... and {len(feature_cols) - 15} more features")
+    
+    add_line(f"{'='*60}\n")
+    
+    # Save to file if specified
+    if output_file:
+        # Save as CSV for easier analysis
+        csv_file = output_file.replace('.txt', '.csv')
+        
+        # Create DataFrame with statistics
+        stats_rows = []
+        for col in feature_cols:
+            # Within cloud
+            if n_within > 0:
+                within_vals = within_data[col].dropna()
+                if len(within_vals) > 0:
+                    stats_rows.append({
+                        'feature': col,
+                        'region': 'within_cloud',
+                        'mean': within_vals.mean(),
+                        'min': within_vals.min(),
+                        'max': within_vals.max(),
+                        'std': within_vals.std(),
+                        'count': len(within_vals)
+                    })
+            
+            # Around cloud (not within)
+            if n_around > 0:
+                around_vals = around_data[col].dropna() if len(around_data) > 0 else pd.Series(dtype=float)
+                if len(around_vals) > 0:
+                    stats_rows.append({
+                        'feature': col,
+                        'region': 'around_cloud',
+                        'mean': around_vals.mean(),
+                        'min': around_vals.min(),
+                        'max': around_vals.max(),
+                        'std': around_vals.std(),
+                        'count': len(around_vals)
+                    })
+            
+            # Outside cloud
+            if n_outside > 0:
+                outside_vals = outside_data[col].dropna()
+                if len(outside_vals) > 0:
+                    stats_rows.append({
+                        'feature': col,
+                        'region': 'outside_cloud',
+                        'mean': outside_vals.mean(),
+                        'min': outside_vals.min(),
+                        'max': outside_vals.max(),
+                        'std': outside_vals.std(),
+                        'count': len(outside_vals)
+                    })
+        
+        stats_df = pd.DataFrame(stats_rows)
+        
+        # Add sample count summary as metadata
+        summary_df = pd.DataFrame([{
+            'region': 'within_cloud',
+            'count': n_within,
+            'percent': n_within/n_total*100
+        }, {
+            'region': 'around_cloud',
+            'count': n_around,
+            'percent': n_around/n_total*100
+        }, {
+            'region': 'outside_cloud',
+            'count': n_outside,
+            'percent': n_outside/n_total*100
+        }, {
+            'region': 'total',
+            'count': n_total,
+            'percent': 100.0
+        }])
+        
+        # Save CSV
+        stats_df.to_csv(csv_file, index=False)
+        print(f"  Saved feature statistics (CSV) to: {csv_file}")
+        
+        # Also save summary
+        summary_file = csv_file.replace('.csv', '_summary.csv')
+        summary_df.to_csv(summary_file, index=False)
+        
+        # Keep text file for backward compatibility
+        with open(output_file, 'w') as f:
+            f.write('\n'.join(output_lines))
+        print(f"  Saved feature statistics (text) to: {output_file}")
+
+
+def apply_mimic_cloud_to_dataset(scaled_data, cloud_definition, data_frame=None, scaler=None):
     """
     Apply a mimic cloud definition (from another dataset) to a new dataset.
+    
+    With adaptive epsilon, different systems may have different scalers. This function
+    can use raw features from the cloud definition and scale them with the target system's scaler.
     
     Parameters:
     -----------
@@ -711,6 +976,12 @@ def apply_mimic_cloud_to_dataset(scaled_data, cloud_definition):
         Scaled feature matrix for new dataset (n_samples, n_features)
     cloud_definition : dict
         Cloud definition from define_mimic_cloud_in_feature_space or load_mimic_cloud_definition
+    data_frame : DataFrame, optional
+        DataFrame with raw feature columns. Required if using raw features for transfer.
+    scaler : sklearn scaler, optional
+        Scaler fitted on the target system. Required if using raw features for transfer.
+        If provided along with raw features, will scale the cloud definition's raw features
+        using this scaler instead of using the pre-scaled features.
     
     Returns:
     --------
@@ -723,9 +994,58 @@ def apply_mimic_cloud_to_dataset(scaled_data, cloud_definition):
     """
     from scipy.spatial.distance import cdist
     
-    core_mimic_features = cloud_definition['core_mimic_features']
-    threshold_within = cloud_definition['threshold_within']
-    threshold_around = cloud_definition['threshold_around']
+    # Check if we should use raw features (better for cross-system transfer)
+    use_raw_features = (
+        'core_mimic_features_raw' in cloud_definition and 
+        cloud_definition['core_mimic_features_raw'] is not None and
+        'feature_columns' in cloud_definition and
+        cloud_definition['feature_columns'] is not None and
+        scaler is not None and
+        data_frame is not None
+    )
+    
+    if use_raw_features:
+        # Use raw features and scale with target system's scaler
+        print("  Using raw features from cloud definition, scaling with target system's scaler")
+        feature_columns = cloud_definition['feature_columns']
+        
+        # Check that feature columns exist in target data_frame
+        missing_cols = [col for col in feature_columns if col not in data_frame.columns]
+        if missing_cols:
+            print(f"  Warning: Missing feature columns in target data: {missing_cols}")
+            print(f"  Falling back to pre-scaled features (may not transfer well)")
+            use_raw_features = False
+        else:
+            # Extract raw features from cloud definition and scale with target scaler
+            core_mimic_features_raw = cloud_definition['core_mimic_features_raw']
+            core_mimic_features = scaler.transform(core_mimic_features_raw)
+            
+            # Recalculate thresholds in the target system's scaled space
+            # This is approximate - we scale the raw features and recompute distances
+            core_pairwise_distances = cdist(core_mimic_features, core_mimic_features, metric='euclidean')
+            upper_triangle = np.triu(core_pairwise_distances, k=1)
+            core_pairwise_flat = upper_triangle[upper_triangle > 0]
+            
+            if len(core_pairwise_flat) > 0:
+                q75_core = np.percentile(core_pairwise_flat, 75)
+                q90_core = np.percentile(core_pairwise_flat, 90)
+                threshold_within = q75_core
+                threshold_around = q90_core * 1.25
+            else:
+                threshold_within = cloud_definition['threshold_within']
+                threshold_around = cloud_definition['threshold_around']
+            
+            print(f"  Recalculated thresholds in target system's scaled space:")
+            print(f"    Within cloud: {threshold_within:.6f} (original: {cloud_definition['threshold_within']:.6f})")
+            print(f"    Around cloud: {threshold_around:.6f} (original: {cloud_definition['threshold_around']:.6f})")
+    
+    if not use_raw_features:
+        # Use pre-scaled features (original behavior)
+        core_mimic_features = cloud_definition['core_mimic_features']
+        threshold_within = cloud_definition['threshold_within']
+        threshold_around = cloud_definition['threshold_around']
+        print("  Using pre-scaled features from cloud definition")
+        print("  Note: This assumes source and target systems use similar scaling")
     
     # Check feature dimensions match
     if scaled_data.shape[1] != core_mimic_features.shape[1]:
@@ -757,7 +1077,296 @@ def apply_mimic_cloud_to_dataset(scaled_data, cloud_definition):
     return results
 
 
-def compute_diffusion_map_analysis(scaled_data, data_frame, pca_test_dir, organism_name, diffusion_alpha=1.0, diffusion_n_neighbors=15, plot_3d=False, use_natural_attractor=False, transfer_cloud_from=None, save_cloud_definition=False):
+def define_mimic_cloud_spectral_clustering(scaled_data, data_frame, mimic_queries, n_clusters=None, gamma=None, output_file=None):
+    """
+    Define mimic cloud using spectral clustering.
+    This identifies the cluster containing known mimics and uses it as the cloud.
+    The number of clusters is automatically determined using the eigengap heuristic,
+    which finds the largest gap in the graph Laplacian eigenvalues.
+    
+    Parameters:
+    -----------
+    scaled_data : array-like
+        Scaled feature matrix (n_samples, n_features)
+    data_frame : DataFrame
+        DataFrame with 'query' column to identify mimics
+    mimic_queries : list
+        List of query IDs that are known mimics
+    n_clusters : int, optional
+        Number of clusters for spectral clustering. If None (recommended), will be 
+        automatically determined using eigengap heuristic on the graph Laplacian.
+    gamma : float, optional
+        RBF kernel parameter. If None, will use median distance heuristic.
+    output_file : str, optional
+        Path to save cloud definition (JSON format)
+    
+    Returns:
+    --------
+    cloud_results : dict
+        Dictionary containing:
+        - 'within_cloud': boolean array indicating samples within mimic cluster
+        - 'around_cloud': boolean array (same as within_cloud for spectral clustering)
+        - 'cluster_labels': array of cluster assignments for all samples
+        - 'mimic_cluster_id': ID of the cluster containing mimics
+        - 'cluster_sizes': dict mapping cluster ID to size
+        - 'mimic_queries': list of mimic query IDs found
+    """
+    import json
+    from scipy.spatial.distance import cdist, pdist, squareform
+    
+    # Find mimic indices
+    mimic_mask = data_frame['query'].isin(mimic_queries).values
+    mimic_indices = np.where(mimic_mask)[0]
+    
+    if len(mimic_indices) == 0:
+        print("Warning: No mimics found in dataset for spectral clustering")
+        return None
+    
+    print(f"\nDefining mimic cloud using spectral clustering...")
+    print(f"  Found {len(mimic_indices)} mimic alignments")
+    
+    n_samples = scaled_data.shape[0]
+    
+    # Estimate gamma (RBF kernel parameter) if not provided
+    if gamma is None:
+        # Use median pairwise distance as heuristic
+        sample_indices = np.random.choice(n_samples, min(1000, n_samples), replace=False)
+        sample_distances = pdist(scaled_data[sample_indices], metric='euclidean')
+        median_dist = np.median(sample_distances)
+        gamma = 1.0 / (2.0 * median_dist ** 2) if median_dist > 0 else 1.0
+        print(f"  Estimated gamma (RBF parameter): {gamma:.6f} (median distance: {median_dist:.6f})")
+    else:
+        print(f"  Using gamma: {gamma:.6f}")
+    
+    # Automatically determine number of clusters using eigengap heuristic
+    if n_clusters is None:
+        print("  Automatically determining optimal number of clusters using eigengap heuristic...")
+        try:
+            from sklearn.metrics.pairwise import rbf_kernel
+            from scipy.sparse import csgraph
+            from scipy.linalg import eigh
+            
+            # Build affinity matrix using RBF kernel
+            # For large datasets, use a sample
+            if n_samples > 5000:
+                print(f"    Large dataset ({n_samples} samples), using subsample for eigengap analysis...")
+                sample_size = 5000
+                sample_indices = np.random.choice(n_samples, sample_size, replace=False)
+                sample_data = scaled_data[sample_indices]
+                affinity_matrix = rbf_kernel(sample_data, gamma=gamma)
+            else:
+                affinity_matrix = rbf_kernel(scaled_data, gamma=gamma)
+            
+            # Compute normalized Laplacian
+            degree_matrix = np.diag(np.sum(affinity_matrix, axis=1))
+            laplacian = degree_matrix - affinity_matrix
+            # Normalized Laplacian: L_norm = D^(-1/2) * L * D^(-1/2)
+            degree_sqrt_inv = np.diag(1.0 / np.sqrt(np.sum(affinity_matrix, axis=1) + 1e-10))
+            laplacian_norm = degree_sqrt_inv @ laplacian @ degree_sqrt_inv
+            
+            # Compute eigenvalues (only need first k_max+1)
+            k_max = min(20, n_samples - 1)  # Check up to 20 clusters
+            eigenvalues, _ = eigh(laplacian_norm, subset_by_index=[0, k_max])
+            eigenvalues = np.sort(eigenvalues)
+            
+            # Find eigengap (largest gap between consecutive eigenvalues)
+            eigengaps = np.diff(eigenvalues[:k_max])
+            optimal_k_idx = np.argmax(eigengaps)
+            n_clusters = optimal_k_idx + 1  # +1 because gap is between eigenvalues
+            
+            # Ensure reasonable bounds
+            n_clusters = max(2, min(n_clusters, min(20, n_samples // 10)))
+            
+            print(f"    Eigengap analysis: optimal k = {n_clusters}")
+            print(f"    Top 5 eigenvalues: {eigenvalues[:5]}")
+            print(f"    Largest eigengap: {eigengaps[optimal_k_idx]:.6f} (between λ{n_clusters-1} and λ{n_clusters})")
+            
+        except Exception as e:
+            print(f"    Error in eigengap analysis: {e}")
+            print(f"    Falling back to heuristic: sqrt(n_samples/2)")
+            # Fallback heuristic
+            n_clusters = max(2, min(20, int(np.sqrt(n_samples / 2))))
+            print(f"    Using n_clusters: {n_clusters}")
+    else:
+        print(f"  Using specified n_clusters: {n_clusters}")
+    
+    # Perform spectral clustering
+    print(f"  Performing spectral clustering with k={n_clusters}...")
+    try:
+        spectral = SpectralClustering(
+            n_clusters=n_clusters,
+            affinity='rbf',
+            gamma=gamma,
+            assign_labels='kmeans',
+            random_state=42,
+            n_jobs=-1
+        )
+        cluster_labels = spectral.fit_predict(scaled_data)
+    except Exception as e:
+        print(f"  Error in spectral clustering: {e}")
+        print("  Falling back to distance-based method")
+        return None
+    
+    # Identify which cluster contains the mimics
+    mimic_cluster_ids = cluster_labels[mimic_indices]
+    unique_mimic_clusters, counts = np.unique(mimic_cluster_ids, return_counts=True)
+    
+    # Find the cluster with the most mimics
+    most_common_idx = np.argmax(counts)
+    mimic_cluster_id = unique_mimic_clusters[most_common_idx]
+    n_mimics_in_cluster = counts[most_common_idx]
+    
+    print(f"  Mimics found in {len(unique_mimic_clusters)} cluster(s)")
+    print(f"  Primary mimic cluster: {mimic_cluster_id} ({n_mimics_in_cluster}/{len(mimic_indices)} mimics)")
+    
+    # If mimics are split across clusters, we can optionally merge them
+    # For now, use the primary cluster
+    if len(unique_mimic_clusters) > 1:
+        print(f"  Note: {len(unique_mimic_clusters)} clusters contain mimics, using primary cluster")
+        for cluster_id, count in zip(unique_mimic_clusters, counts):
+            if cluster_id != mimic_cluster_id:
+                print(f"    Cluster {cluster_id}: {count} mimics")
+    
+    # Define cloud membership
+    within_cloud = cluster_labels == mimic_cluster_id
+    around_cloud = within_cloud.copy()  # For spectral clustering, these are the same
+    
+    # Calculate cluster sizes
+    unique_labels, label_counts = np.unique(cluster_labels, return_counts=True)
+    cluster_sizes = dict(zip(unique_labels, label_counts))
+    
+    print(f"  Cloud statistics:")
+    print(f"    Samples in mimic cluster: {within_cloud.sum()}")
+    print(f"    Cluster sizes: {cluster_sizes}")
+    
+    # Get mimic queries found
+    mimic_queries_found = data_frame.iloc[mimic_indices]['query'].values.tolist()
+    
+    # Create results dictionary
+    cloud_results = {
+        'within_cloud': within_cloud,
+        'around_cloud': around_cloud,
+        'cluster_labels': cluster_labels,
+        'mimic_cluster_id': int(mimic_cluster_id),
+        'cluster_sizes': {int(k): int(v) for k, v in cluster_sizes.items()},
+        'mimic_queries': mimic_queries_found,
+        'n_clusters': n_clusters,
+        'gamma': float(gamma),
+        'n_mimics_in_cluster': int(n_mimics_in_cluster),
+        'n_total_mimics': int(len(mimic_indices))
+    }
+    
+    # Save to file if specified
+    if output_file:
+        cloud_results_for_json = cloud_results.copy()
+        # Convert numpy arrays to lists for JSON
+        cloud_results_for_json['within_cloud'] = within_cloud.tolist()
+        cloud_results_for_json['around_cloud'] = around_cloud.tolist()
+        cloud_results_for_json['cluster_labels'] = cluster_labels.tolist()
+        with open(output_file, 'w') as f:
+            json.dump(cloud_results_for_json, f, indent=2)
+        print(f"  Saved spectral clustering cloud definition to: {output_file}")
+    
+    return cloud_results
+
+
+def suggest_optimal_n_neighbors(scaled_data, n_samples=None):
+    """
+    Suggest optimal n_neighbors value for diffusion map based on heuristics and graph connectivity.
+    
+    Parameters:
+    -----------
+    scaled_data : array-like
+        Scaled feature matrix (n_samples, n_features)
+    n_samples : int, optional
+        Number of samples (if None, will use scaled_data.shape[0])
+    
+    Returns:
+    --------
+    suggested_k : int
+        Suggested n_neighbors value
+    recommendations : dict
+        Dictionary with heuristic values and explanations
+    """
+    if n_samples is None:
+        n_samples = scaled_data.shape[0]
+    
+    # Heuristic 1: sqrt(n_samples) - common rule of thumb
+    heuristic_sqrt = max(5, int(np.sqrt(n_samples)))
+    
+    # Heuristic 2: log(n_samples) - for larger datasets
+    heuristic_log = max(5, int(np.log(n_samples) * 2))
+    
+    # Heuristic 3: n_samples / 10 - ensures connectivity but not too dense
+    heuristic_frac = max(5, min(50, int(n_samples / 10)))
+    
+    # Heuristic 4: Fixed range based on dataset size
+    if n_samples < 100:
+        heuristic_size = max(3, min(10, n_samples // 5))
+    elif n_samples < 1000:
+        heuristic_size = 15
+    elif n_samples < 5000:
+        heuristic_size = 20
+    else:
+        heuristic_size = 30
+    
+    # Test graph connectivity for a few candidate values
+    from sklearn.neighbors import kneighbors_graph
+    
+    candidates = sorted(set([heuristic_sqrt, heuristic_log, heuristic_frac, heuristic_size, 10, 15, 20, 30]))
+    candidates = [c for c in candidates if 3 <= c < n_samples]
+    
+    connectivity_results = {}
+    for k in candidates[:5]:  # Test up to 5 candidates
+        try:
+            knn_graph = kneighbors_graph(scaled_data, n_neighbors=k, mode='connectivity', 
+                                        metric='euclidean', include_self=False)
+            # Check if graph is connected (or has few components)
+            from scipy.sparse.csgraph import connected_components
+            n_components, _ = connected_components(csgraph=knn_graph, directed=False)
+            
+            # Calculate average degree
+            degrees = np.array(knn_graph.sum(axis=1)).flatten()
+            avg_degree = np.mean(degrees)
+            
+            connectivity_results[k] = {
+                'n_components': n_components,
+                'avg_degree': avg_degree,
+                'is_well_connected': n_components <= max(1, n_samples // 100)  # Allow some small disconnected components
+            }
+        except:
+            pass
+    
+    # Choose best candidate: well-connected with reasonable degree
+    best_k = heuristic_size  # Default
+    if connectivity_results:
+        well_connected = {k: v for k, v in connectivity_results.items() 
+                         if v['is_well_connected']}
+        if well_connected:
+            # Prefer moderate average degree (not too sparse, not too dense)
+            best_k = min(well_connected.keys(), 
+                        key=lambda k: abs(well_connected[k]['avg_degree'] - 15))
+        else:
+            # If none are well-connected, use the one with fewest components
+            best_k = min(connectivity_results.keys(),
+                        key=lambda k: connectivity_results[k]['n_components'])
+    
+    recommendations = {
+        'suggested': best_k,
+        'heuristics': {
+            'sqrt(n)': heuristic_sqrt,
+            'log(n)*2': heuristic_log,
+            'n/10': heuristic_frac,
+            'size_based': heuristic_size
+        },
+        'connectivity_analysis': connectivity_results,
+        'n_samples': n_samples
+    }
+    
+    return best_k, recommendations
+
+
+def compute_diffusion_map_analysis(scaled_data, data_frame, pca_test_dir, organism_name, diffusion_alpha=1.0, diffusion_n_neighbors=15, plot_3d=False, use_natural_attractor=False, transfer_cloud_from=None, save_cloud_definition=False, use_adaptive_epsilon=False, adaptive_k_neighbors=7, auto_n_neighbors=False, use_spectral_cloud=False, spectral_n_clusters=None, spectral_gamma=None, scaler=None, epsilon_scale=1.0):
     """
     Compute diffusion map and diffusion pseudotime analysis.
     This is for trajectory analysis, not clustering.
@@ -791,21 +1400,107 @@ def compute_diffusion_map_analysis(scaled_data, data_frame, pca_test_dir, organi
     else:
         print(f"Using Diffusion Map for trajectory analysis (alpha={diffusion_alpha}, n_neighbors={diffusion_n_neighbors})...")
     
+    # Auto-determine n_neighbors if requested
+    if auto_n_neighbors:
+        print("\n" + "="*60)
+        print("Auto-determining optimal n_neighbors for diffusion map...")
+        print("="*60)
+        suggested_k, recommendations = suggest_optimal_n_neighbors(scaled_data)
+        print(f"  Suggested n_neighbors: {suggested_k}")
+        print(f"  Heuristic values:")
+        for name, value in recommendations['heuristics'].items():
+            print(f"    {name}: {value}")
+        if recommendations['connectivity_analysis']:
+            print(f"  Connectivity analysis:")
+            for k, info in sorted(recommendations['connectivity_analysis'].items()):
+                print(f"    k={k}: {info['n_components']} components, avg_degree={info['avg_degree']:.1f}, "
+                      f"well_connected={info['is_well_connected']}")
+        diffusion_n_neighbors = suggested_k
+        print(f"  Using n_neighbors={diffusion_n_neighbors}")
+        print("="*60 + "\n")
+    
     # Create k-nearest neighbors graph with distances
     knn_graph = kneighbors_graph(scaled_data, n_neighbors=diffusion_n_neighbors, mode='distance', metric='euclidean', include_self=True)
     
     # Convert to symmetric affinity matrix (Gaussian kernel)
-    distances = knn_graph.data
-    if len(distances) > 0:
-        bandwidth = np.median(distances[distances > 0])
+    # Use adaptive epsilon (bandwidth) if requested
+    if use_adaptive_epsilon:
+        print(f"  Using adaptive epsilon (local kernel width) with k={adaptive_k_neighbors} neighbors...")
+        from sklearn.neighbors import NearestNeighbors
+        
+        # Compute local scales for each point based on k-nearest neighbors
+        nn = NearestNeighbors(n_neighbors=adaptive_k_neighbors + 1)  # +1 because includes self
+        nn.fit(scaled_data)
+        distances_nn, indices_nn = nn.kneighbors(scaled_data)
+        
+        # Local scale (epsilon) for each point: distance to k-th neighbor (excluding self)
+        local_epsilons = distances_nn[:, adaptive_k_neighbors]  # k-th neighbor (0-indexed, excluding self)
+        # Avoid zero scales
+        local_epsilons = np.maximum(local_epsilons, np.percentile(local_epsilons, 1))
+        
+        # Apply scaling factor if provided
+        if epsilon_scale != 1.0:
+            local_epsilons = local_epsilons * epsilon_scale
+            print(f"    Applied epsilon scaling factor: {epsilon_scale}")
+        
+        print(f"    Local epsilon statistics:")
+        print(f"      Min: {np.min(local_epsilons):.6f}")
+        print(f"      Median: {np.median(local_epsilons):.6f}")
+        print(f"      Max: {np.max(local_epsilons):.6f}")
+        
+        # Create symmetric affinity matrix with adaptive bandwidths
+        knn_graph_sym = 0.5 * (knn_graph + knn_graph.T)  # Make symmetric
+        
+        # For each edge (i, j), use max of local epsilons (conservative approach)
+        n_samples = scaled_data.shape[0]
+        affinities_list = []
+        indices_list = []
+        indptr_list = [0]
+        
+        for i in range(n_samples):
+            row_start = knn_graph_sym.indptr[i]
+            row_end = knn_graph_sym.indptr[i + 1]
+            row_indices = knn_graph_sym.indices[row_start:row_end]
+            row_distances = knn_graph_sym.data[row_start:row_end]
+            
+            row_affinities = []
+            row_indices_out = []
+            
+            for j_idx, j in enumerate(row_indices):
+                if i == j:
+                    # Self-affinity is 1
+                    row_affinities.append(1.0)
+                    row_indices_out.append(j)
+                else:
+                    # Use max of local epsilons for this pair (conservative approach)
+                    # For tighter clustering, could use min or mean instead
+                    epsilon_ij = max(local_epsilons[i], local_epsilons[j])
+                    # Optional: scale down epsilon for tighter clustering (uncomment if needed)
+                    # epsilon_ij = epsilon_ij * 0.7  # 30% reduction for tighter clusters
+                    dist_ij = row_distances[j_idx]
+                    affinity_ij = np.exp(-dist_ij**2 / (2 * epsilon_ij**2))
+                    row_affinities.append(affinity_ij)
+                    row_indices_out.append(j)
+            
+            affinities_list.extend(row_affinities)
+            indices_list.extend(row_indices_out)
+            indptr_list.append(len(affinities_list))
+        
+        affinity_matrix = csr_matrix((affinities_list, indices_list, indptr_list), shape=(n_samples, n_samples))
     else:
-        bandwidth = 1.0
-    
-    # Create Gaussian affinity matrix
-    knn_graph_sym = 0.5 * (knn_graph + knn_graph.T)  # Make symmetric
-    distances_sym = knn_graph_sym.data
-    affinities = np.exp(-distances_sym**2 / (2 * bandwidth**2))
-    affinity_matrix = csr_matrix((affinities, knn_graph_sym.indices, knn_graph_sym.indptr), shape=knn_graph_sym.shape)
+        # Fixed global bandwidth (original approach)
+        distances = knn_graph.data
+        if len(distances) > 0:
+            bandwidth = np.median(distances[distances > 0])
+        else:
+            bandwidth = 1.0
+        print(f"  Using fixed epsilon (bandwidth): {bandwidth:.6f}")
+        
+        # Create Gaussian affinity matrix
+        knn_graph_sym = 0.5 * (knn_graph + knn_graph.T)  # Make symmetric
+        distances_sym = knn_graph_sym.data
+        affinities = np.exp(-distances_sym**2 / (2 * bandwidth**2))
+        affinity_matrix = csr_matrix((affinities, knn_graph_sym.indices, knn_graph_sym.indptr), shape=knn_graph_sym.shape)
     
     # Compute row sums for normalization
     row_sums = np.array(affinity_matrix.sum(axis=1)).flatten()
@@ -1059,6 +1754,54 @@ def compute_diffusion_map_analysis(scaled_data, data_frame, pca_test_dir, organi
     # Feature-space cloud definition and transfer
     transferred_cloud_results = None
     local_cloud_definition = None
+    spectral_cloud_results = None
+    
+    # Define spectral clustering cloud if requested (runs alongside distance-based cloud)
+    if use_spectral_cloud:
+        print("\n" + "="*60)
+        print("Defining mimic cloud using spectral clustering (parallel to distance-based method)")
+        print("="*60)
+        spectral_output_file = os.path.join(pca_test_dir, f'{organism_name}_spectral_cloud_definition.json')
+        spectral_cloud_results = define_mimic_cloud_spectral_clustering(
+            scaled_data, data_frame, validation_list,
+            n_clusters=spectral_n_clusters,
+            gamma=spectral_gamma,
+            output_file=spectral_output_file
+        )
+        if spectral_cloud_results:
+            # Add spectral cloud results to DataFrame
+            results_df['spectral_within_cloud'] = spectral_cloud_results['within_cloud']
+            results_df['spectral_around_cloud'] = spectral_cloud_results['around_cloud']
+            results_df['spectral_cluster_label'] = spectral_cloud_results['cluster_labels']
+            
+            # Calculate and store mimic distances from cluster centroid for analysis
+            if 'query' in results_df.columns:
+                mimic_mask = results_df['query'].isin(validation_list).values
+                mimic_indices = np.where(mimic_mask)[0]
+                if len(mimic_indices) > 0:
+                    dc_cols = [col for col in results_df.columns if col.startswith('Diffusion')]
+                    if len(dc_cols) >= 3:
+                        all_coords_3d = results_df[dc_cols[:3]].values
+                        mimic_coords_3d = all_coords_3d[mimic_indices]
+                        mimic_center = np.mean(mimic_coords_3d, axis=0)
+                        mimic_distances = np.linalg.norm(mimic_coords_3d - mimic_center, axis=1)
+                        
+                        # Initialize distance column for all samples
+                        results_df['spectral_mimic_distance'] = np.nan
+                        results_df.loc[mimic_mask, 'spectral_mimic_distance'] = mimic_distances
+                        
+                        # Classify mimics
+                        median_dist = np.median(mimic_distances)
+                        q75_dist = np.percentile(mimic_distances, 75)
+                        results_df['spectral_mimic_type'] = 'non_mimic'
+                        results_df.loc[mimic_mask & (results_df['spectral_mimic_distance'] <= median_dist), 'spectral_mimic_type'] = 'core'
+                        results_df.loc[mimic_mask & (results_df['spectral_mimic_distance'] > q75_dist), 'spectral_mimic_type'] = 'outlier'
+                        results_df.loc[mimic_mask & (results_df['spectral_mimic_type'] == 'non_mimic'), 'spectral_mimic_type'] = 'intermediate'
+            
+            print(f"  Applied spectral clustering cloud to current dataset:")
+            print(f"    Within cloud: {spectral_cloud_results['within_cloud'].sum()} samples")
+            print(f"    Mimic cluster ID: {spectral_cloud_results['mimic_cluster_id']}")
+            print(f"    Total clusters: {spectral_cloud_results['n_clusters']}")
     
     # Define and save cloud in feature space if requested
     if save_cloud_definition:
@@ -1066,9 +1809,21 @@ def compute_diffusion_map_analysis(scaled_data, data_frame, pca_test_dir, organi
         print("Defining mimic cloud in feature space (for transfer to other datasets)")
         print("="*60)
         cloud_output_file = os.path.join(pca_test_dir, f'{organism_name}_mimic_cloud_definition.json')
-        local_cloud_definition = define_mimic_cloud_in_feature_space(
-            scaled_data, data_frame, validation_list, output_file=cloud_output_file
-        )
+        # Get feature columns from data_frame (exclude non-feature columns)
+        exclude_cols = ['query', 'target', 'system', 'label', 'cluster', 'go_term']
+        feature_columns = [col for col in data_frame.columns 
+                          if col not in exclude_cols and 
+                          data_frame[col].dtype in [np.float64, np.float32, np.int64, np.int32]]
+        # Match to scaled_data dimensions
+        if len(feature_columns) == scaled_data.shape[1]:
+            local_cloud_definition = define_mimic_cloud_in_feature_space(
+                scaled_data, data_frame, validation_list, output_file=cloud_output_file,
+                feature_columns=feature_columns
+            )
+        else:
+            local_cloud_definition = define_mimic_cloud_in_feature_space(
+                scaled_data, data_frame, validation_list, output_file=cloud_output_file
+            )
         if local_cloud_definition:
             # Apply to current dataset and add to results
             local_cloud_results = apply_mimic_cloud_to_dataset(scaled_data, local_cloud_definition)
@@ -1079,6 +1834,10 @@ def compute_diffusion_map_analysis(scaled_data, data_frame, pca_test_dir, organi
             print(f"  Applied feature-space cloud to current dataset:")
             print(f"    Within cloud: {local_cloud_results['within_cloud'].sum()} samples")
             print(f"    Around cloud: {local_cloud_results['around_cloud'].sum()} samples")
+            
+            # Report feature statistics for local cloud
+            local_stats_file = os.path.join(pca_test_dir, f'{organism_name}_local_cloud_feature_statistics.txt')
+            report_cloud_feature_statistics(data_frame, local_cloud_results, cloud_name="local cloud", output_file=local_stats_file)
     
     # Load and apply transferred cloud if provided
     if transfer_cloud_from:
@@ -1087,7 +1846,10 @@ def compute_diffusion_map_analysis(scaled_data, data_frame, pca_test_dir, organi
         print("="*60)
         try:
             transferred_cloud_definition = load_mimic_cloud_definition(transfer_cloud_from)
-            transferred_cloud_results = apply_mimic_cloud_to_dataset(scaled_data, transferred_cloud_definition)
+            transferred_cloud_results = apply_mimic_cloud_to_dataset(
+                scaled_data, transferred_cloud_definition, 
+                data_frame=data_frame, scaler=scaler
+            )
             results_df['transferred_within_cloud'] = transferred_cloud_results['within_cloud']
             results_df['transferred_around_cloud'] = transferred_cloud_results['around_cloud']
             results_df['transferred_min_dist_to_mimic'] = transferred_cloud_results['min_distances']
@@ -1096,6 +1858,10 @@ def compute_diffusion_map_analysis(scaled_data, data_frame, pca_test_dir, organi
             print(f"    Within cloud: {transferred_cloud_results['within_cloud'].sum()} samples")
             print(f"    Around cloud: {transferred_cloud_results['around_cloud'].sum()} samples")
             print(f"    Cloud from: {len(transferred_cloud_definition['core_mimic_queries'])} core mimics")
+            
+            # Report feature statistics for transferred cloud
+            transferred_stats_file = os.path.join(pca_test_dir, f'{organism_name}_transferred_cloud_feature_statistics.txt')
+            report_cloud_feature_statistics(data_frame, transferred_cloud_results, cloud_name="transferred cloud", output_file=transferred_stats_file)
         except Exception as e:
             print(f"  Error loading/applying transferred cloud: {e}")
             import traceback
@@ -1279,6 +2045,102 @@ def compute_diffusion_map_analysis(scaled_data, data_frame, pca_test_dir, organi
             plt.close()
     
     # ============================================================
+    # 3D Visualizations with Transferred Cloud Membership Labels
+    # ============================================================
+    if plot_3d and transferred_cloud_results is not None and n_diffusion_components >= 3:
+        print("\n" + "="*60)
+        print("Creating 3D visualizations with transferred cloud membership labels")
+        print("="*60)
+        
+        transferred_within = transferred_cloud_results['within_cloud']
+        transferred_around = transferred_cloud_results['around_cloud']
+        transferred_outside = ~transferred_around
+        
+        # Define multiple viewing angles
+        view_angles = [
+            (30, 45, 'standard'),
+            (0, 0, 'xy_plane'),
+            (90, 0, 'xz_plane'),
+            (0, 90, 'yz_plane'),
+            (30, 135, 'diagonal1'),
+            (30, 225, 'diagonal2'),
+            (60, 45, 'elevated'),
+        ]
+        
+        for elev, azim, suffix in view_angles:
+            fig = plt.figure(figsize=(14, 10))
+            ax = fig.add_subplot(111, projection='3d')
+            
+            # Plot points outside cloud (gray, small, low alpha)
+            if transferred_outside.sum() > 0:
+                ax.scatter(diffusion_coords[transferred_outside, 0], 
+                          diffusion_coords[transferred_outside, 1], 
+                          diffusion_coords[transferred_outside, 2],
+                          c='lightgray', s=15, alpha=0.2, 
+                          label=f'Outside cloud ({transferred_outside.sum()})', zorder=1)
+            
+            # Plot points around cloud but not within (orange)
+            transferred_around_not_within = transferred_around & ~transferred_within
+            if transferred_around_not_within.sum() > 0:
+                ax.scatter(diffusion_coords[transferred_around_not_within, 0], 
+                          diffusion_coords[transferred_around_not_within, 1], 
+                          diffusion_coords[transferred_around_not_within, 2],
+                          c='orange', s=40, alpha=0.6, 
+                          label=f'Around cloud ({transferred_around_not_within.sum()})', zorder=2)
+            
+            # Plot points within cloud (purple/blue, larger, higher alpha)
+            if transferred_within.sum() > 0:
+                ax.scatter(diffusion_coords[transferred_within, 0], 
+                          diffusion_coords[transferred_within, 1], 
+                          diffusion_coords[transferred_within, 2],
+                          c='purple', s=60, alpha=0.8, 
+                          label=f'Within cloud ({transferred_within.sum()})', zorder=3)
+            
+            # Highlight root point
+            ax.scatter([diffusion_coords[root_idx, 0]], 
+                      [diffusion_coords[root_idx, 1]], 
+                      [diffusion_coords[root_idx, 2]],
+                      c='red', s=300, marker='*', label='Root', 
+                      zorder=5, edgecolors='black', linewidths=1.5)
+            
+            # Highlight mimic points if available
+            if len(mimic_indices) > 0:
+                mimic_coords = diffusion_coords[mimic_indices, :]
+                ax.scatter(mimic_coords[:, 0], mimic_coords[:, 1], mimic_coords[:, 2],
+                          c='lime', s=400, marker='o', label=f'Mimics (n={len(mimic_indices)})', 
+                          zorder=4, edgecolors='black', linewidths=2, alpha=0.9)
+            
+            # Highlight candidate points if available
+            if len(candidate_indices) > 0:
+                candidate_coords = diffusion_coords[candidate_indices, :]
+                ax.scatter(candidate_coords[:, 0], candidate_coords[:, 1], candidate_coords[:, 2],
+                          c='cyan', s=400, marker='s', label=f'Candidates (n={len(candidate_indices)})', 
+                          zorder=4, edgecolors='black', linewidths=2, alpha=0.9)
+            
+            # Set robust axis limits
+            xlim_low, xlim_high = compute_robust_axis_limits(diffusion_coords[:, 0], percentile_low=1.0, percentile_high=99.0)
+            ylim_low, ylim_high = compute_robust_axis_limits(diffusion_coords[:, 1], percentile_low=1.0, percentile_high=99.0)
+            zlim_low, zlim_high = compute_robust_axis_limits(diffusion_coords[:, 2], percentile_low=1.0, percentile_high=99.0)
+            ax.set_xlim(xlim_low, xlim_high)
+            ax.set_ylim(ylim_low, ylim_high)
+            ax.set_zlim(zlim_low, zlim_high)
+            
+            ax.set_xlabel('Diffusion Coordinate 1', fontsize=12)
+            ax.set_ylabel('Diffusion Coordinate 2', fontsize=12)
+            ax.set_zlabel('Diffusion Coordinate 3', fontsize=12)
+            ax.set_title(f'Diffusion Map 3D - Transferred Cloud Membership\n{organism_name.capitalize()} (View: elev={elev}°, azim={azim}°)\n'
+                        f'Within: {transferred_within.sum()} | Around: {transferred_around_not_within.sum()} | Outside: {transferred_outside.sum()}', 
+                        fontsize=11)
+            ax.view_init(elev=elev, azim=azim)
+            ax.legend(loc='upper left', fontsize=9, bbox_to_anchor=(0, 1))
+            ax.grid(True, alpha=0.3)
+            
+            plot_file_3d_cloud = os.path.join(pca_test_dir, f'diffusion_map_{organism_name}_3d_cloud_membership_{suffix}.png')
+            plt.savefig(plot_file_3d_cloud, dpi=300, bbox_inches='tight')
+            print(f"Saved 3D cloud membership plot ({suffix}) to {plot_file_3d_cloud}")
+            plt.close()
+    
+    # ============================================================
     # DC3 and DC4 Visualizations
     # ============================================================
     if n_diffusion_components >= 3:
@@ -1451,6 +2313,145 @@ def compute_diffusion_map_analysis(scaled_data, data_frame, pca_test_dir, organi
                 plt.savefig(plot_file_3d_dc134, dpi=300, bbox_inches='tight')
                 print(f"Saved 3D plot (DC1-DC3-DC4, {suffix}) to {plot_file_3d_dc134}")
                 plt.close()
+            
+            # Cloud membership visualizations for DC1-DC2-DC3 and DC1-DC3-DC4
+            if transferred_cloud_results is not None:
+                transferred_within = transferred_cloud_results['within_cloud']
+                transferred_around = transferred_cloud_results['around_cloud']
+                transferred_outside = ~transferred_around
+                transferred_around_not_within = transferred_around & ~transferred_within
+                
+                # DC1-DC2-DC3 with cloud membership
+                for elev, azim, suffix in view_angles:
+                    fig = plt.figure(figsize=(14, 10))
+                    ax = fig.add_subplot(111, projection='3d')
+                    
+                    # Plot by cloud membership
+                    if transferred_outside.sum() > 0:
+                        ax.scatter(diffusion_coords[transferred_outside, 0], 
+                                  diffusion_coords[transferred_outside, 1], 
+                                  diffusion_coords[transferred_outside, 2],
+                                  c='lightgray', s=15, alpha=0.2, 
+                                  label=f'Outside cloud ({transferred_outside.sum()})', zorder=1)
+                    if transferred_around_not_within.sum() > 0:
+                        ax.scatter(diffusion_coords[transferred_around_not_within, 0], 
+                                  diffusion_coords[transferred_around_not_within, 1], 
+                                  diffusion_coords[transferred_around_not_within, 2],
+                                  c='orange', s=40, alpha=0.6, 
+                                  label=f'Around cloud ({transferred_around_not_within.sum()})', zorder=2)
+                    if transferred_within.sum() > 0:
+                        ax.scatter(diffusion_coords[transferred_within, 0], 
+                                  diffusion_coords[transferred_within, 1], 
+                                  diffusion_coords[transferred_within, 2],
+                                  c='purple', s=60, alpha=0.8, 
+                                  label=f'Within cloud ({transferred_within.sum()})', zorder=3)
+                    
+                    # Root and highlights
+                    ax.scatter([diffusion_coords[root_idx, 0]], 
+                              [diffusion_coords[root_idx, 1]], 
+                              [diffusion_coords[root_idx, 2]],
+                              c='red', s=300, marker='*', label='Root', 
+                              zorder=5, edgecolors='black', linewidths=1.5)
+                    if len(mimic_indices) > 0:
+                        mimic_coords = diffusion_coords[mimic_indices, :]
+                        ax.scatter(mimic_coords[:, 0], mimic_coords[:, 1], mimic_coords[:, 2],
+                                  c='lime', s=400, marker='o', label=f'Mimics (n={len(mimic_indices)})', 
+                                  zorder=4, edgecolors='black', linewidths=2, alpha=0.9)
+                    if len(candidate_indices) > 0:
+                        candidate_coords = diffusion_coords[candidate_indices, :]
+                        ax.scatter(candidate_coords[:, 0], candidate_coords[:, 1], candidate_coords[:, 2],
+                                  c='cyan', s=400, marker='s', label=f'Candidates (n={len(candidate_indices)})', 
+                                  zorder=4, edgecolors='black', linewidths=2, alpha=0.9)
+                    
+                    # Set robust axis limits
+                    xlim_low, xlim_high = compute_robust_axis_limits(diffusion_coords[:, 0], percentile_low=1.0, percentile_high=99.0)
+                    ylim_low, ylim_high = compute_robust_axis_limits(diffusion_coords[:, 1], percentile_low=1.0, percentile_high=99.0)
+                    zlim_low, zlim_high = compute_robust_axis_limits(diffusion_coords[:, 2], percentile_low=1.0, percentile_high=99.0)
+                    ax.set_xlim(xlim_low, xlim_high)
+                    ax.set_ylim(ylim_low, ylim_high)
+                    ax.set_zlim(zlim_low, zlim_high)
+                    
+                    ax.set_xlabel('DC1', fontsize=12)
+                    ax.set_ylabel('DC2', fontsize=12)
+                    ax.set_zlabel('DC3', fontsize=12)
+                    ax.set_title(f'Diffusion Map 3D: DC1-DC2-DC3 - Transferred Cloud Membership\n'
+                                f'(View: elev={elev}°, azim={azim}°)\n'
+                                f'Within: {transferred_within.sum()} | Around: {transferred_around_not_within.sum()} | Outside: {transferred_outside.sum()}', 
+                                fontsize=11)
+                    ax.view_init(elev=elev, azim=azim)
+                    ax.legend(loc='upper left', fontsize=9, bbox_to_anchor=(0, 1))
+                    ax.grid(True, alpha=0.3)
+                    
+                    plot_file_3d_dc123_cloud = os.path.join(pca_test_dir, f'diffusion_map_{organism_name}_3d_dc123_cloud_membership_{suffix}.png')
+                    plt.savefig(plot_file_3d_dc123_cloud, dpi=300, bbox_inches='tight')
+                    print(f"Saved 3D DC1-DC2-DC3 cloud membership plot ({suffix}) to {plot_file_3d_dc123_cloud}")
+                    plt.close()
+                
+                # DC1-DC3-DC4 with cloud membership
+                for elev, azim, suffix in view_angles:
+                    fig = plt.figure(figsize=(14, 10))
+                    ax = fig.add_subplot(111, projection='3d')
+                    
+                    # Plot by cloud membership
+                    if transferred_outside.sum() > 0:
+                        ax.scatter(diffusion_coords[transferred_outside, 0], 
+                                  diffusion_coords[transferred_outside, 2], 
+                                  diffusion_coords[transferred_outside, 3],
+                                  c='lightgray', s=15, alpha=0.2, 
+                                  label=f'Outside cloud ({transferred_outside.sum()})', zorder=1)
+                    if transferred_around_not_within.sum() > 0:
+                        ax.scatter(diffusion_coords[transferred_around_not_within, 0], 
+                                  diffusion_coords[transferred_around_not_within, 2], 
+                                  diffusion_coords[transferred_around_not_within, 3],
+                                  c='orange', s=40, alpha=0.6, 
+                                  label=f'Around cloud ({transferred_around_not_within.sum()})', zorder=2)
+                    if transferred_within.sum() > 0:
+                        ax.scatter(diffusion_coords[transferred_within, 0], 
+                                  diffusion_coords[transferred_within, 2], 
+                                  diffusion_coords[transferred_within, 3],
+                                  c='purple', s=60, alpha=0.8, 
+                                  label=f'Within cloud ({transferred_within.sum()})', zorder=3)
+                    
+                    # Root and highlights
+                    ax.scatter([diffusion_coords[root_idx, 0]], 
+                              [diffusion_coords[root_idx, 2]], 
+                              [diffusion_coords[root_idx, 3]],
+                              c='red', s=300, marker='*', label='Root', 
+                              zorder=5, edgecolors='black', linewidths=1.5)
+                    if len(mimic_indices) > 0:
+                        mimic_coords = diffusion_coords[mimic_indices, :]
+                        ax.scatter(mimic_coords[:, 0], mimic_coords[:, 2], mimic_coords[:, 3],
+                                  c='lime', s=400, marker='o', label=f'Mimics (n={len(mimic_indices)})', 
+                                  zorder=4, edgecolors='black', linewidths=2, alpha=0.9)
+                    if len(candidate_indices) > 0:
+                        candidate_coords = diffusion_coords[candidate_indices, :]
+                        ax.scatter(candidate_coords[:, 0], candidate_coords[:, 2], candidate_coords[:, 3],
+                                  c='cyan', s=400, marker='s', label=f'Candidates (n={len(candidate_indices)})', 
+                                  zorder=4, edgecolors='black', linewidths=2, alpha=0.9)
+                    
+                    # Set robust axis limits
+                    xlim_low, xlim_high = compute_robust_axis_limits(diffusion_coords[:, 0], percentile_low=1.0, percentile_high=99.0)
+                    ylim_low, ylim_high = compute_robust_axis_limits(diffusion_coords[:, 2], percentile_low=1.0, percentile_high=99.0)
+                    zlim_low, zlim_high = compute_robust_axis_limits(diffusion_coords[:, 3], percentile_low=1.0, percentile_high=99.0)
+                    ax.set_xlim(xlim_low, xlim_high)
+                    ax.set_ylim(ylim_low, ylim_high)
+                    ax.set_zlim(zlim_low, zlim_high)
+                    
+                    ax.set_xlabel('DC1', fontsize=12)
+                    ax.set_ylabel('DC3', fontsize=12)
+                    ax.set_zlabel('DC4', fontsize=12)
+                    ax.set_title(f'Diffusion Map 3D: DC1-DC3-DC4 - Transferred Cloud Membership\n'
+                                f'(View: elev={elev}°, azim={azim}°)\n'
+                                f'Within: {transferred_within.sum()} | Around: {transferred_around_not_within.sum()} | Outside: {transferred_outside.sum()}', 
+                                fontsize=11)
+                    ax.view_init(elev=elev, azim=azim)
+                    ax.legend(loc='upper left', fontsize=9, bbox_to_anchor=(0, 1))
+                    ax.grid(True, alpha=0.3)
+                    
+                    plot_file_3d_dc134_cloud = os.path.join(pca_test_dir, f'diffusion_map_{organism_name}_3d_dc134_cloud_membership_{suffix}.png')
+                    plt.savefig(plot_file_3d_dc134_cloud, dpi=300, bbox_inches='tight')
+                    print(f"Saved 3D DC1-DC3-DC4 cloud membership plot ({suffix}) to {plot_file_3d_dc134_cloud}")
+                    plt.close()
     
     # ============================================================
     # 1D Structure Analysis: Project onto DC1 alone
@@ -2066,35 +3067,33 @@ def compute_diffusion_map_analysis(scaled_data, data_frame, pca_test_dir, organi
             plateau_features = plateau_df[plateau_df['plateau_detected']]['feature'].tolist()
             print(f"  Plateau features: {', '.join(plateau_features)}")
         
-        # Create compact plateau visualization for PowerPoint
-        # Layout: 2 plots on left, 3 plots on right, summary stats in middle/bottom
+        # Create compact plateau visualization
+        # Layout: plots only, no summary table
         if len(available_features) > 0:
             from matplotlib.gridspec import GridSpec
             
-            # Create figure optimized for PowerPoint (10x7.5 inches, 16:9 aspect ratio)
-            fig = plt.figure(figsize=(10, 7.5))
-            gs = GridSpec(3, 3, figure=fig, hspace=0.4, wspace=0.4, 
+            # Create figure optimized for plots only
+            fig = plt.figure(figsize=(12, 8))
+            gs = GridSpec(3, 2, figure=fig, hspace=0.4, wspace=0.3, 
                          left=0.08, right=0.95, top=0.95, bottom=0.08)
             
-            # Left column: 2 plots stacked
+            # Left column: 3 plots stacked
             plot_axes_left = []
             if len(available_features) >= 1:
                 plot_axes_left.append(fig.add_subplot(gs[0, 0]))
             if len(available_features) >= 2:
                 plot_axes_left.append(fig.add_subplot(gs[1, 0]))
-            
-            # Right column: 3 plots stacked
-            plot_axes_right = []
             if len(available_features) >= 3:
-                plot_axes_right.append(fig.add_subplot(gs[0, 2]))
-            if len(available_features) >= 4:
-                plot_axes_right.append(fig.add_subplot(gs[1, 2]))
-            if len(available_features) >= 5:
-                plot_axes_right.append(fig.add_subplot(gs[2, 2]))
+                plot_axes_left.append(fig.add_subplot(gs[2, 0]))
             
-            # Middle column: Summary statistics
-            summary_ax = fig.add_subplot(gs[:, 1])
-            summary_ax.axis('off')
+            # Right column: remaining plots stacked
+            plot_axes_right = []
+            if len(available_features) >= 4:
+                plot_axes_right.append(fig.add_subplot(gs[0, 1]))
+            if len(available_features) >= 5:
+                plot_axes_right.append(fig.add_subplot(gs[1, 1]))
+            if len(available_features) >= 6:
+                plot_axes_right.append(fig.add_subplot(gs[2, 1]))
             
             # Helper function to create a single plateau plot
             def create_plateau_plot(ax, feat, result, feat_values, distances_for_plateau, distance_type):
@@ -2147,44 +3146,19 @@ def compute_diffusion_map_analysis(scaled_data, data_frame, pca_test_dir, organi
                 ax.tick_params(labelsize=8)
                 ax.grid(True, alpha=0.3)
             
-            # Plot left column (first 2 features)
-            for i, (feat, result) in enumerate(zip(available_features[:2], plateau_results[:2])):
+            # Plot left column (first 3 features)
+            for i, (feat, result) in enumerate(zip(available_features[:3], plateau_results[:3])):
                 if i < len(plot_axes_left):
                     feat_values = data_frame[feat].values
                     create_plateau_plot(plot_axes_left[i], feat, result, feat_values, distances_for_plateau, distance_type)
             
             # Plot right column (remaining features, up to 3)
-            for i, (feat, result) in enumerate(zip(available_features[2:5], plateau_results[2:5])):
+            for i, (feat, result) in enumerate(zip(available_features[3:6], plateau_results[3:6])):
                 if i < len(plot_axes_right):
                     feat_values = data_frame[feat].values
                     create_plateau_plot(plot_axes_right[i], feat, result, feat_values, distances_for_plateau, distance_type)
             
-            # Add summary statistics in middle column
-            summary_text = "Plateau Detection Summary\n" + "="*40 + "\n\n"
-            summary_text += f"Distance Type: {distance_type}\n"
-            summary_text += f"Total Features: {len(available_features)}\n\n"
-            
-            n_plateaus = plateau_df['plateau_detected'].sum()
-            summary_text += f"Features with Plateaus: {n_plateaus}/{len(available_features)}\n\n"
-            
-            summary_text += "Feature Classifications:\n"
-            for _, row in plateau_df.iterrows():
-                status = "✓" if row['plateau_detected'] else "✗"
-                summary_text += f"  {status} {row['feature']:15s}: {row['classification']}\n"
-            
-            summary_text += "\n" + "="*40 + "\n"
-            summary_text += "Metrics Summary:\n\n"
-            summary_text += f"Avg Plateau Score: {plateau_df['plateau_score'].mean():.3f}\n"
-            summary_text += f"Avg Slope: {plateau_df['slope'].abs().mean():.6f}\n"
-            summary_text += f"Avg Var Ratio: {plateau_df['var_ratio'].mean():.3f}\n"
-            
-            summary_ax.text(0.1, 0.95, summary_text, transform=summary_ax.transAxes,
-                          fontsize=9, verticalalignment='top', family='monospace',
-                          bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.3))
-            
-            # Add overall title
-            fig.suptitle(f'Feature Plateau Analysis: Distance from Attractor ({distance_type})', 
-                        fontsize=12, fontweight='bold', y=0.98)
+            # No overall title (removed per user request)
             
             plateau_plot_file = os.path.join(pca_test_dir, f'diffusion_map_{organism_name}_plateau_detection.png')
             plt.savefig(plateau_plot_file, dpi=300, bbox_inches='tight')
@@ -2496,34 +3470,32 @@ def compute_diffusion_map_analysis(scaled_data, data_frame, pca_test_dir, organi
             plateau_features_3d = plateau_df_3d[plateau_df_3d['plateau_detected']]['feature'].tolist()
             print(f"  Plateau features: {', '.join(plateau_features_3d)}")
         
-        # Create compact 3D plateau visualization for PowerPoint (same layout as 2D)
+        # Create compact 3D plateau visualization (plots only, no summary table)
         if len(available_features) > 0:
             from matplotlib.gridspec import GridSpec
             
-            # Create figure optimized for PowerPoint (10x7.5 inches)
-            fig = plt.figure(figsize=(10, 7.5))
-            gs = GridSpec(3, 3, figure=fig, hspace=0.4, wspace=0.4, 
+            # Create figure optimized for plots only
+            fig = plt.figure(figsize=(12, 8))
+            gs = GridSpec(3, 2, figure=fig, hspace=0.4, wspace=0.3, 
                          left=0.08, right=0.95, top=0.95, bottom=0.08)
             
-            # Left column: 2 plots stacked
+            # Left column: 3 plots stacked
             plot_axes_left = []
             if len(available_features) >= 1:
                 plot_axes_left.append(fig.add_subplot(gs[0, 0]))
             if len(available_features) >= 2:
                 plot_axes_left.append(fig.add_subplot(gs[1, 0]))
-            
-            # Right column: 3 plots stacked
-            plot_axes_right = []
             if len(available_features) >= 3:
-                plot_axes_right.append(fig.add_subplot(gs[0, 2]))
-            if len(available_features) >= 4:
-                plot_axes_right.append(fig.add_subplot(gs[1, 2]))
-            if len(available_features) >= 5:
-                plot_axes_right.append(fig.add_subplot(gs[2, 2]))
+                plot_axes_left.append(fig.add_subplot(gs[2, 0]))
             
-            # Middle column: Summary statistics
-            summary_ax = fig.add_subplot(gs[:, 1])
-            summary_ax.axis('off')
+            # Right column: remaining plots stacked
+            plot_axes_right = []
+            if len(available_features) >= 4:
+                plot_axes_right.append(fig.add_subplot(gs[0, 1]))
+            if len(available_features) >= 5:
+                plot_axes_right.append(fig.add_subplot(gs[1, 1]))
+            if len(available_features) >= 6:
+                plot_axes_right.append(fig.add_subplot(gs[2, 1]))
             
             # Helper function to create a single 3D plateau plot
             def create_plateau_plot_3d(ax, feat, result, feat_values, distances_for_plateau_3d, distance_type_3d):
@@ -2576,44 +3548,19 @@ def compute_diffusion_map_analysis(scaled_data, data_frame, pca_test_dir, organi
                 ax.tick_params(labelsize=8)
                 ax.grid(True, alpha=0.3)
             
-            # Plot left column (first 2 features)
-            for i, (feat, result) in enumerate(zip(available_features[:2], plateau_results_3d[:2])):
+            # Plot left column (first 3 features)
+            for i, (feat, result) in enumerate(zip(available_features[:3], plateau_results_3d[:3])):
                 if i < len(plot_axes_left):
                     feat_values = data_frame[feat].values
                     create_plateau_plot_3d(plot_axes_left[i], feat, result, feat_values, distances_for_plateau_3d, distance_type_3d)
             
             # Plot right column (remaining features, up to 3)
-            for i, (feat, result) in enumerate(zip(available_features[2:5], plateau_results_3d[2:5])):
+            for i, (feat, result) in enumerate(zip(available_features[3:6], plateau_results_3d[3:6])):
                 if i < len(plot_axes_right):
                     feat_values = data_frame[feat].values
                     create_plateau_plot_3d(plot_axes_right[i], feat, result, feat_values, distances_for_plateau_3d, distance_type_3d)
             
-            # Add summary statistics in middle column
-            summary_text = "3D Plateau Detection Summary\n" + "="*40 + "\n\n"
-            summary_text += f"Distance Type: {distance_type_3d}\n"
-            summary_text += f"Total Features: {len(available_features)}\n\n"
-            
-            n_plateaus_3d = plateau_df_3d['plateau_detected'].sum()
-            summary_text += f"Features with Plateaus: {n_plateaus_3d}/{len(available_features)}\n\n"
-            
-            summary_text += "Feature Classifications:\n"
-            for _, row in plateau_df_3d.iterrows():
-                status = "✓" if row['plateau_detected'] else "✗"
-                summary_text += f"  {status} {row['feature']:15s}: {row['classification']}\n"
-            
-            summary_text += "\n" + "="*40 + "\n"
-            summary_text += "Metrics Summary:\n\n"
-            summary_text += f"Avg Plateau Score: {plateau_df_3d['plateau_score'].mean():.3f}\n"
-            summary_text += f"Avg Slope: {plateau_df_3d['slope'].abs().mean():.6f}\n"
-            summary_text += f"Avg Var Ratio: {plateau_df_3d['var_ratio'].mean():.3f}\n"
-            
-            summary_ax.text(0.1, 0.95, summary_text, transform=summary_ax.transAxes,
-                          fontsize=9, verticalalignment='top', family='monospace',
-                          bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.3))
-            
-            # Add overall title
-            fig.suptitle(f'Feature Plateau Analysis: 3D Distance from Attractor ({distance_type_3d})', 
-                        fontsize=12, fontweight='bold', y=0.98)
+            # No overall title (removed per user request)
             
             plateau_plot_file_3d = os.path.join(pca_test_dir, f'diffusion_map_{organism_name}_plateau_detection_3d.png')
             plt.savefig(plateau_plot_file_3d, dpi=300, bbox_inches='tight')
@@ -3170,6 +4117,305 @@ def compute_diffusion_map_analysis(scaled_data, data_frame, pca_test_dir, organi
     else:
         print("  (Skipping: 'query' column not found in results)")
     
+    # Visualize spectral clustering cloud if available
+    if spectral_cloud_results is not None and 'query' in results_df.columns:
+        print("\n" + "="*60)
+        print("Creating visualization of spectral clustering mimic cloud")
+        print("="*60)
+        
+        mimic_mask = results_df['query'].isin(validation_list).values
+        mimic_indices = np.where(mimic_mask)[0]
+        
+        if len(mimic_indices) > 0:
+            dc_cols = [col for col in results_df.columns if col.startswith('Diffusion')]
+            if len(dc_cols) >= 3:
+                all_coords_3d = results_df[dc_cols[:3]].values
+                spectral_within = spectral_cloud_results['within_cloud']
+                spectral_around = spectral_cloud_results['around_cloud']
+                spectral_outside = ~spectral_around
+                cluster_labels = spectral_cloud_results['cluster_labels']
+                mimic_cluster_id = spectral_cloud_results['mimic_cluster_id']
+                
+                # Get mimic coordinates
+                mimic_coords_3d = all_coords_3d[mimic_indices]
+                mimic_center = np.mean(mimic_coords_3d, axis=0)
+                
+                # Calculate distances of mimics from cluster centroid to identify core vs outliers
+                from scipy.spatial.distance import cdist
+                mimic_distances_to_center = np.linalg.norm(mimic_coords_3d - mimic_center, axis=1)
+                median_mimic_distance = np.median(mimic_distances_to_center)
+                q75_mimic_distance = np.percentile(mimic_distances_to_center, 75)
+                
+                # Classify mimics as core vs outliers
+                core_mimic_mask = mimic_distances_to_center <= median_mimic_distance
+                outlier_mimic_mask = mimic_distances_to_center > q75_mimic_distance
+                
+                print(f"  Mimic distribution analysis:")
+                print(f"    Total mimics: {len(mimic_indices)}")
+                print(f"    Core mimics (≤ median distance): {core_mimic_mask.sum()}")
+                print(f"    Outlier mimics (> 75th percentile): {outlier_mimic_mask.sum()}")
+                print(f"    Median distance from center: {median_mimic_distance:.4f}")
+                print(f"    75th percentile distance: {q75_mimic_distance:.4f}")
+                
+                # Check if multi-system
+                is_multi_system = 'system' in results_df.columns
+                
+                viewing_angles = [
+                    {'elev': 20, 'azim': 45, 'suffix': 'standard'},
+                    {'elev': 20, 'azim': 135, 'suffix': 'rotated'},
+                    {'elev': 90, 'azim': 0, 'suffix': 'top_down'},
+                    {'elev': 0, 'azim': 0, 'suffix': 'side_view'},
+                    {'elev': 30, 'azim': 60, 'suffix': 'elevated'},
+                    {'elev': 20, 'azim': 225, 'suffix': 'diagonal1'},
+                    {'elev': 20, 'azim': 315, 'suffix': 'diagonal2'},
+                    {'elev': 0, 'azim': 90, 'suffix': 'yz_plane'}
+                ]
+                
+                for view in viewing_angles:
+                    fig = plt.figure(figsize=(16, 12))
+                    ax = fig.add_subplot(111, projection='3d')
+                    
+                    if is_multi_system:
+                        # Multi-system mode: color by system first
+                        systems = results_df['system'].unique()
+                        system_colors = plt.cm.Set3(np.linspace(0, 1, len(systems)))
+                        system_color_map = dict(zip(systems, system_colors))
+                        
+                        for system in systems:
+                            system_mask = results_df['system'] == system
+                            system_coords = all_coords_3d[system_mask]
+                            ax.scatter(system_coords[:, 0], 
+                                     system_coords[:, 1], 
+                                     system_coords[:, 2],
+                                     c=[system_color_map[system]], s=8, alpha=0.4, 
+                                     label=f'{system} (n={system_mask.sum()})', zorder=1)
+                        
+                        # Overlay spectral cloud regions
+                        around_not_within = spectral_around & ~spectral_within
+                        if around_not_within.sum() > 0:
+                            ax.scatter(all_coords_3d[around_not_within, 0], 
+                                     all_coords_3d[around_not_within, 1], 
+                                     all_coords_3d[around_not_within, 2],
+                                     c='orange', s=12, alpha=0.6, edgecolors='black', linewidths=0.5,
+                                     label=f'Spectral around cloud ({around_not_within.sum()})', zorder=3)
+                        
+                        if spectral_within.sum() > 0:
+                            ax.scatter(all_coords_3d[spectral_within, 0], 
+                                     all_coords_3d[spectral_within, 1], 
+                                     all_coords_3d[spectral_within, 2],
+                                     c='blue', s=15, alpha=0.8, edgecolors='black', linewidths=1,
+                                     label=f'Spectral within cloud ({spectral_within.sum()})', zorder=4)
+                    else:
+                        # Single-system mode
+                        if spectral_outside.sum() > 0:
+                            ax.scatter(all_coords_3d[spectral_outside, 0], 
+                                     all_coords_3d[spectral_outside, 1], 
+                                     all_coords_3d[spectral_outside, 2],
+                                     c='lightgray', s=5, alpha=0.2, label=f'Outside spectral cloud ({spectral_outside.sum()})', zorder=1)
+                        
+                        around_not_within = spectral_around & ~spectral_within
+                        if around_not_within.sum() > 0:
+                            ax.scatter(all_coords_3d[around_not_within, 0], 
+                                     all_coords_3d[around_not_within, 1], 
+                                     all_coords_3d[around_not_within, 2],
+                                     c='orange', s=8, alpha=0.4, label=f'Spectral around cloud ({around_not_within.sum()})', zorder=2)
+                        
+                        if spectral_within.sum() > 0:
+                            ax.scatter(all_coords_3d[spectral_within, 0], 
+                                     all_coords_3d[spectral_within, 1], 
+                                     all_coords_3d[spectral_within, 2],
+                                     c='blue', s=10, alpha=0.6, label=f'Spectral within cloud ({spectral_within.sum()})', zorder=3)
+                    
+                    # Plot mimics with color coding: core (red) vs outliers (orange)
+                    if core_mimic_mask.sum() > 0:
+                        core_coords = mimic_coords_3d[core_mimic_mask]
+                        ax.scatter(core_coords[:, 0], 
+                                 core_coords[:, 1], 
+                                 core_coords[:, 2],
+                                 c='red', s=100, alpha=1.0, edgecolors='black', linewidths=2, 
+                                 label=f'Core mimics ({core_mimic_mask.sum()})', zorder=10)
+                    
+                    if outlier_mimic_mask.sum() > 0:
+                        outlier_coords = mimic_coords_3d[outlier_mimic_mask]
+                        ax.scatter(outlier_coords[:, 0], 
+                                 outlier_coords[:, 1], 
+                                 outlier_coords[:, 2],
+                                 c='orange', s=120, alpha=1.0, edgecolors='black', linewidths=2, 
+                                 marker='^', label=f'Outlier mimics ({outlier_mimic_mask.sum()})', zorder=11)
+                    
+                    # Plot intermediate mimics (between core and outlier)
+                    intermediate_mask = ~core_mimic_mask & ~outlier_mimic_mask
+                    if intermediate_mask.sum() > 0:
+                        intermediate_coords = mimic_coords_3d[intermediate_mask]
+                        ax.scatter(intermediate_coords[:, 0], 
+                                 intermediate_coords[:, 1], 
+                                 intermediate_coords[:, 2],
+                                 c='darkred', s=100, alpha=0.8, edgecolors='black', linewidths=1.5, 
+                                 label=f'Intermediate mimics ({intermediate_mask.sum()})', zorder=10)
+                    
+                    # Plot cluster center (green star)
+                    ax.scatter([mimic_center[0]], 
+                             [mimic_center[1]], 
+                             [mimic_center[2]],
+                             c='green', marker='*', s=300, alpha=1.0, edgecolors='black', linewidths=1,
+                             label='Mimic center', zorder=11)
+                    
+                    # Draw convex hull of mimics
+                    try:
+                        from scipy.spatial import ConvexHull
+                        if len(mimic_coords_3d) >= 4:
+                            hull = ConvexHull(mimic_coords_3d)
+                            for simplex in hull.simplices:
+                                ax.plot3D(mimic_coords_3d[simplex, 0],
+                                        mimic_coords_3d[simplex, 1],
+                                        mimic_coords_3d[simplex, 2],
+                                        'r--', alpha=0.3, linewidth=1, zorder=5)
+                    except:
+                        pass
+                    
+                    # Set labels and title
+                    ax.set_xlabel('DC1', fontsize=12)
+                    ax.set_ylabel('DC2', fontsize=12)
+                    ax.set_zlabel('DC3', fontsize=12)
+                    
+                    if is_multi_system:
+                        title = f'Spectral Clustering: Mimic Cloud Across Systems\n(View: elev={view["elev"]}°, azim={view["azim"]}°)\n'
+                        title += f'Total - Within: {spectral_within.sum()} | Outside: {spectral_outside.sum()}\n'
+                        title += f'Mimic Cluster ID: {mimic_cluster_id} | Total Clusters: {spectral_cloud_results["n_clusters"]}\n'
+                        title += f'Mimics: Core={core_mimic_mask.sum()} | Outlier={outlier_mimic_mask.sum()} | Intermediate={intermediate_mask.sum()}\n'
+                        for system in systems:
+                            system_mask = results_df['system'] == system
+                            sys_within = (system_mask & spectral_within).sum()
+                            sys_outside = (system_mask & spectral_outside).sum()
+                            title += f'{system}: W={sys_within} O={sys_outside} | '
+                        ax.set_title(title, fontsize=10)
+                    else:
+                        ax.set_title(f'Spectral Clustering: Mimic Cloud in 3D Diffusion Space\n(View: elev={view["elev"]}°, azim={view["azim"]}°)\n' +
+                                   f'Within: {spectral_within.sum()} | Outside: {spectral_outside.sum()}\n' +
+                                   f'Mimic Cluster ID: {mimic_cluster_id} | Total Clusters: {spectral_cloud_results["n_clusters"]}\n' +
+                                   f'Mimics: Core={core_mimic_mask.sum()} | Outlier={outlier_mimic_mask.sum()} | Intermediate={intermediate_mask.sum()}', 
+                                   fontsize=11)
+                    
+                    ax.view_init(elev=view['elev'], azim=view['azim'])
+                    
+                    # Set robust axis limits
+                    def compute_robust_axis_limits_3d(data, percentile_low=1.0, percentile_high=99.0, padding_factor=0.05):
+                        if len(data) == 0:
+                            return -1, 1
+                        low_bound = np.percentile(data, percentile_low)
+                        high_bound = np.percentile(data, percentile_high)
+                        data_range = high_bound - low_bound
+                        if data_range == 0:
+                            padding = abs(low_bound * 0.1) if low_bound != 0 else 1.0
+                            return low_bound - padding, high_bound + padding
+                        padding = data_range * padding_factor
+                        return low_bound - padding, high_bound + padding
+                    
+                    xlim = compute_robust_axis_limits_3d(all_coords_3d[:, 0])
+                    ylim = compute_robust_axis_limits_3d(all_coords_3d[:, 1])
+                    zlim = compute_robust_axis_limits_3d(all_coords_3d[:, 2])
+                    ax.set_xlim(xlim)
+                    ax.set_ylim(ylim)
+                    ax.set_zlim(zlim)
+                    
+                    ax.legend(loc='upper left', fontsize=9, bbox_to_anchor=(0, 1))
+                    ax.grid(True, alpha=0.3)
+                    
+                    # Save plot
+                    spectral_plot_file = os.path.join(pca_test_dir, f'diffusion_map_{organism_name}_spectral_cloud_3d_{view["suffix"]}.png')
+                    plt.savefig(spectral_plot_file, dpi=300, bbox_inches='tight')
+                    plt.close()
+                    print(f"  ✓ Saved: {spectral_plot_file}")
+                
+                print("✓ Spectral clustering cloud 3D visualizations complete")
+                
+                # Also create 2D plot
+                if len(dc_cols) >= 2:
+                    fig, ax = plt.subplots(figsize=(12, 10))
+                    
+                    if is_multi_system:
+                        systems = results_df['system'].unique()
+                        system_colors = plt.cm.Set3(np.linspace(0, 1, len(systems)))
+                        system_color_map = dict(zip(systems, system_colors))
+                        
+                        for system in systems:
+                            system_mask = results_df['system'] == system
+                            system_coords = results_df.loc[system_mask, dc_cols[:2]].values
+                            ax.scatter(system_coords[:, 0], system_coords[:, 1],
+                                     c=[system_color_map[system]], s=8, alpha=0.4, 
+                                     label=f'{system} (n={system_mask.sum()})')
+                        
+                        if spectral_within.sum() > 0:
+                            ax.scatter(results_df.loc[spectral_within, dc_cols[0]], 
+                                     results_df.loc[spectral_within, dc_cols[1]],
+                                     c='blue', s=15, alpha=0.8, edgecolors='black', linewidths=1,
+                                     label=f'Spectral within cloud ({spectral_within.sum()})', zorder=4)
+                    else:
+                        if spectral_outside.sum() > 0:
+                            ax.scatter(results_df.loc[spectral_outside, dc_cols[0]], 
+                                     results_df.loc[spectral_outside, dc_cols[1]],
+                                     c='lightgray', s=5, alpha=0.2, label=f'Outside ({spectral_outside.sum()})')
+                        
+                        if spectral_within.sum() > 0:
+                            ax.scatter(results_df.loc[spectral_within, dc_cols[0]], 
+                                     results_df.loc[spectral_within, dc_cols[1]],
+                                     c='blue', s=10, alpha=0.6, label=f'Within cloud ({spectral_within.sum()})')
+                    
+                    # Plot mimics with color coding: core (red) vs outliers (orange)
+                    mimic_coords_2d = results_df.iloc[mimic_indices][dc_cols[:2]].values
+                    mimic_center_2d = np.mean(mimic_coords_2d, axis=0)
+                    
+                    # Recalculate 2D distances for consistency
+                    mimic_distances_2d = np.linalg.norm(mimic_coords_2d - mimic_center_2d, axis=1)
+                    median_mimic_distance_2d = np.median(mimic_distances_2d)
+                    q75_mimic_distance_2d = np.percentile(mimic_distances_2d, 75)
+                    core_mimic_mask_2d = mimic_distances_2d <= median_mimic_distance_2d
+                    outlier_mimic_mask_2d = mimic_distances_2d > q75_mimic_distance_2d
+                    intermediate_mask_2d = ~core_mimic_mask_2d & ~outlier_mimic_mask_2d
+                    
+                    if core_mimic_mask_2d.sum() > 0:
+                        core_coords_2d = mimic_coords_2d[core_mimic_mask_2d]
+                        ax.scatter(core_coords_2d[:, 0], core_coords_2d[:, 1],
+                                 c='red', s=100, alpha=1.0, edgecolors='black', linewidths=2,
+                                 label=f'Core mimics ({core_mimic_mask_2d.sum()})', zorder=10)
+                    
+                    if outlier_mimic_mask_2d.sum() > 0:
+                        outlier_coords_2d = mimic_coords_2d[outlier_mimic_mask_2d]
+                        ax.scatter(outlier_coords_2d[:, 0], outlier_coords_2d[:, 1],
+                                 c='orange', s=120, alpha=1.0, edgecolors='black', linewidths=2,
+                                 marker='^', label=f'Outlier mimics ({outlier_mimic_mask_2d.sum()})', zorder=11)
+                    
+                    if intermediate_mask_2d.sum() > 0:
+                        intermediate_coords_2d = mimic_coords_2d[intermediate_mask_2d]
+                        ax.scatter(intermediate_coords_2d[:, 0], intermediate_coords_2d[:, 1],
+                                 c='darkred', s=100, alpha=0.8, edgecolors='black', linewidths=1.5,
+                                 label=f'Intermediate mimics ({intermediate_mask_2d.sum()})', zorder=10)
+                    
+                    ax.scatter([mimic_center_2d[0]], [mimic_center_2d[1]],
+                             c='green', marker='*', s=300, alpha=1.0, edgecolors='black', linewidths=1,
+                             label='Mimic center', zorder=11)
+                    
+                    ax.set_xlabel('DC1', fontsize=12)
+                    ax.set_ylabel('DC2', fontsize=12)
+                    ax.set_title(f'Spectral Clustering: Mimic Cloud in 2D Diffusion Space\n' +
+                               f'Within: {spectral_within.sum()} | Outside: {spectral_outside.sum()}\n' +
+                               f'Mimic Cluster ID: {mimic_cluster_id} | Total Clusters: {spectral_cloud_results["n_clusters"]}\n' +
+                               f'Mimics: Core={core_mimic_mask_2d.sum()} | Outlier={outlier_mimic_mask_2d.sum()} | Intermediate={intermediate_mask_2d.sum()}',
+                               fontsize=11)
+                    ax.legend(loc='upper left', fontsize=9)
+                    ax.grid(True, alpha=0.3)
+                    
+                    spectral_2d_file = os.path.join(pca_test_dir, f'diffusion_map_{organism_name}_spectral_cloud_2d.png')
+                    plt.savefig(spectral_2d_file, dpi=300, bbox_inches='tight')
+                    plt.close()
+                    print(f"  ✓ Saved: {spectral_2d_file}")
+            else:
+                print("  (Skipping: Need at least 3 diffusion components for 3D visualization)")
+        else:
+            print("  (Skipping: No known mimics found in results)")
+    elif spectral_cloud_results is not None:
+        print("  (Skipping spectral cloud visualization: 'query' column not found in results)")
+    
     # Visualize transferred cloud (works even without local mimics)
     if transferred_cloud_results is not None:
         print("\n" + "="*60)
@@ -3450,7 +4696,7 @@ def estimate_optimal_clusters(reduced_data, clustering_method='kmeans', k_range=
     return optimal_k, scores
 
 
-def value_driven_pca_clustering(pca_test_dir, data_frame, organism_name, n_clusters=10, clustering_method='kmeans', include_lengths=False, plot_3d=False, use_umap=False, umap_n_neighbors=15, umap_min_dist=0.1, include_evolutionary=False, include_targeting=False, include_plddt=False, include_go_terms=False, scaler_type='robust', use_diffusion=False, diffusion_alpha=1.0, diffusion_n_neighbors=15, exclude_derived_features=False, auto_clusters=False, cluster_estimation_method='silhouette', use_natural_attractor=False, save_cloud_definition=False, transfer_cloud_from=None, adjust_tm_score=False):
+def value_driven_pca_clustering(pca_test_dir, data_frame, organism_name, n_clusters=10, clustering_method='kmeans', include_lengths=False, plot_3d=False, use_umap=False, umap_n_neighbors=15, umap_min_dist=0.1, include_evolutionary=False, include_targeting=False, include_plddt=False, include_go_terms=False, scaler_type='robust', use_diffusion=False, diffusion_alpha=1.0, diffusion_n_neighbors=15, exclude_derived_features=False, auto_clusters=False, cluster_estimation_method='silhouette', use_natural_attractor=False, save_cloud_definition=False, transfer_cloud_from=None, adjust_tm_score=False, use_adaptive_epsilon=False, adaptive_k_neighbors=7, auto_n_neighbors=False, use_spectral_cloud=False, spectral_n_clusters=None, spectral_gamma=None, epsilon_scale=1.0):
     """
     Perform purely value-driven clustering based on alignment features only.
     No GO term labels are used - clustering is based solely on alignment feature values.
@@ -3705,7 +4951,15 @@ def value_driven_pca_clustering(pca_test_dir, data_frame, organism_name, n_clust
             plot_3d=plot_3d,
             use_natural_attractor=use_natural_attractor,
             save_cloud_definition=save_cloud_definition,
-            transfer_cloud_from=transfer_cloud_from
+            transfer_cloud_from=transfer_cloud_from,
+            use_adaptive_epsilon=use_adaptive_epsilon,
+            adaptive_k_neighbors=adaptive_k_neighbors,
+            auto_n_neighbors=auto_n_neighbors,
+            use_spectral_cloud=use_spectral_cloud if 'use_spectral_cloud' in locals() else False,
+            spectral_n_clusters=spectral_n_clusters if 'spectral_n_clusters' in locals() else None,
+            spectral_gamma=spectral_gamma if 'spectral_gamma' in locals() else None,
+            scaler=scaler,
+            epsilon_scale=epsilon_scale
         )
         return  # Exit early - no clustering for diffusion maps
     elif use_umap:
@@ -4238,6 +5492,25 @@ def analyze_system_manifold_overlap(diffusion_results_file, output_dir, n_neighb
     from sklearn.neighbors import NearestNeighbors
     import seaborn as sns
     
+    def simplify_system_name(name):
+        """Simplify system names for display in plots."""
+        name_lower = name.lower()
+        if 'amoeba' in name_lower or 'ameoba' in name_lower:
+            return 'amoeba'
+        elif 'human' in name_lower:
+            return 'human'
+        elif 'wmel' in name_lower or 'wolbachia' in name_lower:
+            return 'wmel'
+        elif 'dros' in name_lower or 'drosophila' in name_lower:
+            return 'dros'
+        elif 'legionella' in name_lower or 'leg' in name_lower:
+            return 'legionella'
+        elif 'helicobacter' in name_lower or 'hp' in name_lower:
+            return 'helicobacter'
+        else:
+            # Return first word or keep original if short
+            return name.split('_')[0] if '_' in name else name
+    
     print("\n" + "="*60)
     print("System Manifold Overlap Analysis")
     print("="*60)
@@ -4252,7 +5525,11 @@ def analyze_system_manifold_overlap(diffusion_results_file, output_dir, n_neighb
     systems = sorted(results_df['system'].unique())
     n_systems = len(systems)
     
+    # Create simplified names for display
+    system_display_names = {sys: simplify_system_name(sys) for sys in systems}
+    
     print(f"Found {n_systems} systems: {', '.join(systems)}")
+    print(f"Display names: {', '.join([f'{k} -> {v}' for k, v in system_display_names.items()])}")
     
     # Get diffusion coordinates
     if use_dc123:
@@ -4270,6 +5547,87 @@ def analyze_system_manifold_overlap(diffusion_results_file, output_dir, n_neighb
     coords = results_df[dc_cols].values
     
     os.makedirs(output_dir, exist_ok=True)
+    
+    # VALIDATION: Check if systems form distinct sub-structures in the merged manifold
+    print("\n" + "="*60)
+    print("VALIDATION: Checking if systems form distinct sub-structures")
+    print("="*60)
+    
+    from sklearn.metrics import silhouette_score
+    
+    # 1. System size balance
+    system_sizes = results_df['system'].value_counts()
+    print(f"\nSystem sizes:")
+    for sys, size in system_sizes.items():
+        pct = size / len(results_df) * 100
+        print(f"  {sys}: {size} alignments ({pct:.1f}%)")
+    
+    size_ratio = system_sizes.max() / system_sizes.min()
+    if size_ratio > 5:
+        print(f"\n  WARNING: Large size imbalance (ratio: {size_ratio:.1f}x)")
+        print(f"    The larger system may dominate the global diffusion map structure.")
+        print(f"    Consider: (1) subsampling larger system, (2) separate analysis, or")
+        print(f"    (3) interpreting results with this imbalance in mind.")
+    else:
+        print(f"\n  System sizes are reasonably balanced (ratio: {size_ratio:.1f}x)")
+    
+    # 2. Spatial separation (silhouette score)
+    system_labels = results_df['system'].astype('category').cat.codes.values
+    if len(np.unique(system_labels)) > 1:
+        silhouette = silhouette_score(coords, system_labels)
+        print(f"\n  Silhouette score (system separation): {silhouette:.3f}")
+        print(f"    Range: -1 (poor separation) to +1 (perfect separation)")
+        if silhouette > 0.3:
+            print(f"    ✓ Systems form reasonably distinct clusters")
+        elif silhouette > 0.1:
+            print(f"    ⚠ Systems show some separation but significant overlap")
+        else:
+            print(f"    ⚠ Systems are highly overlapping - may not form distinct sub-structures")
+    
+    # 3. Centroid separation
+    centroids = {}
+    for sys in systems:
+        mask = results_df['system'] == sys
+        centroids[sys] = coords[mask].mean(axis=0)
+    
+    print(f"\n  Centroid distances (between system centers):")
+    min_centroid_dist = float('inf')
+    for i, sys1 in enumerate(systems):
+        for j, sys2 in enumerate(systems):
+            if i < j:
+                dist = np.linalg.norm(centroids[sys1] - centroids[sys2])
+                print(f"    {sys1} <-> {sys2}: {dist:.4f}")
+                min_centroid_dist = min(min_centroid_dist, dist)
+    
+    # 4. Within-system spread vs between-system distance
+    print(f"\n  System spread (std within each system):")
+    for sys in systems:
+        mask = results_df['system'] == sys
+        spread = coords[mask].std(axis=0).mean()  # Average std across dimensions
+        print(f"    {sys}: {spread:.4f}")
+    
+    avg_spread = np.mean([coords[results_df['system'] == sys].std(axis=0).mean() 
+                          for sys in systems])
+    separation_ratio = min_centroid_dist / avg_spread if avg_spread > 0 else 0
+    print(f"\n  Separation ratio (centroid distance / avg spread): {separation_ratio:.2f}")
+    if separation_ratio > 2.0:
+        print(f"    ✓ Systems are well-separated relative to their spread")
+    elif separation_ratio > 1.0:
+        print(f"    ⚠ Systems show moderate separation")
+    else:
+        print(f"    ⚠ Systems overlap significantly - may not be distinct sub-structures")
+    
+    print("\n" + "="*60)
+    print("INTERPRETATION:")
+    print("  The merged diffusion map approach is VALID if:")
+    print("    1. Systems form distinct regions (silhouette > 0.1, separation ratio > 1.0)")
+    print("    2. You want to understand how systems relate in a unified feature space")
+    print("    3. The global structure captures meaningful biological relationships")
+    print("\n  This approach is INAPPROPRIATE if:")
+    print("    1. Systems are completely overlapping (silhouette < 0, separation ratio < 0.5)")
+    print("    2. One system dominates (size ratio > 10x) and you want equal representation")
+    print("    3. You need system-specific manifolds that are not influenced by others")
+    print("="*60 + "\n")
     
     # 1. Compute pairwise system overlap statistics
     print("\nComputing pairwise system overlap statistics...")
@@ -4331,6 +5689,132 @@ def analyze_system_manifold_overlap(diffusion_results_file, output_dir, n_neighb
             total_neighbors = neighbors1_in_1 + neighbors1_in_2 + neighbors2_in_1 + neighbors2_in_2
             jaccard_similarity = shared_neighbors / total_neighbors if total_neighbors > 0 else 0
             
+            # ===== GLOBAL GEOMETRIC ANALYSIS =====
+            # 1. Centroid distance (center of mass separation)
+            centroid1 = np.mean(coords1, axis=0)
+            centroid2 = np.mean(coords2, axis=0)
+            centroid_distance = np.linalg.norm(centroid1 - centroid2)
+            
+            # 2. Covariance matrix comparison (shape/orientation)
+            cov1 = np.cov(coords1.T)
+            cov2 = np.cov(coords2.T)
+            
+            # Eigenvalues (principal axes lengths)
+            eigenvals1, eigenvecs1 = np.linalg.eigh(cov1)
+            eigenvals2, eigenvecs2 = np.linalg.eigh(cov2)
+            # Sort by eigenvalue (largest first)
+            idx1 = eigenvals1.argsort()[::-1]
+            idx2 = eigenvals2.argsort()[::-1]
+            eigenvals1 = eigenvals1[idx1]
+            eigenvals2 = eigenvals2[idx2]
+            eigenvecs1 = eigenvecs1[:, idx1]
+            eigenvecs2 = eigenvecs2[:, idx2]
+            
+            # Principal direction alignment (dot product of first principal components)
+            # NOTE: PC1 may not be informative if DC1 has minimal variation
+            pc1_alignment = abs(np.dot(eigenvecs1[:, 0], eigenvecs2[:, 0]))
+            
+            # Pseudotime gradient alignment (more informative - captures actual flow direction)
+            # Compute gradient direction from low to high pseudotime
+            pseudotime_gradient_alignment = np.nan
+            if 'diffusion_pseudotime' in results_df.columns:
+                try:
+                    # Get pseudotime values for each system
+                    pseudotime1 = results_df.loc[mask1, 'diffusion_pseudotime'].values
+                    pseudotime2 = results_df.loc[mask2, 'diffusion_pseudotime'].values
+                    
+                    # Compute gradient direction: direction from low to high pseudotime
+                    # Use least squares to find direction of increasing pseudotime
+                    # gradient = (X^T X)^(-1) X^T y, where X is coords and y is pseudotime
+                    
+                    # System 1: find direction of increasing pseudotime
+                    if len(pseudotime1) > 2 and pseudotime1.std() > 1e-6:
+                        # Center the coordinates and pseudotime
+                        coords1_centered = coords1 - coords1.mean(axis=0)
+                        pseudotime1_centered = pseudotime1 - pseudotime1.mean()
+                        # Least squares: gradient = (X^T X)^(-1) X^T y
+                        try:
+                            gradient1 = np.linalg.lstsq(coords1_centered, pseudotime1_centered, rcond=None)[0]
+                            gradient1 = gradient1 / (np.linalg.norm(gradient1) + 1e-10)  # Normalize
+                        except:
+                            gradient1 = None
+                    else:
+                        gradient1 = None
+                    
+                    # System 2: find direction of increasing pseudotime
+                    if len(pseudotime2) > 2 and pseudotime2.std() > 1e-6:
+                        # Center the coordinates and pseudotime
+                        coords2_centered = coords2 - coords2.mean(axis=0)
+                        pseudotime2_centered = pseudotime2 - pseudotime2.mean()
+                        # Least squares: gradient = (X^T X)^(-1) X^T y
+                        try:
+                            gradient2 = np.linalg.lstsq(coords2_centered, pseudotime2_centered, rcond=None)[0]
+                            gradient2 = gradient2 / (np.linalg.norm(gradient2) + 1e-10)  # Normalize
+                        except:
+                            gradient2 = None
+                    else:
+                        gradient2 = None
+                    
+                    # Compute alignment of gradient directions
+                    if gradient1 is not None and gradient2 is not None:
+                        pseudotime_gradient_alignment = abs(np.dot(gradient1, gradient2))
+                except:
+                    pseudotime_gradient_alignment = np.nan
+            
+            # Alternative: Direction of maximum variation (if pseudotime not available)
+            # Use the principal component with largest eigenvalue (most variation)
+            max_var_alignment = np.nan
+            if len(eigenvals1) > 0 and len(eigenvals2) > 0:
+                # Find which PC has maximum variance (not necessarily PC1)
+                max_var_idx1 = np.argmax(eigenvals1)
+                max_var_idx2 = np.argmax(eigenvals2)
+                max_var_alignment = abs(np.dot(eigenvecs1[:, max_var_idx1], eigenvecs2[:, max_var_idx2]))
+            
+            # Volume comparison (determinant of covariance = approximate volume)
+            vol1 = np.sqrt(np.linalg.det(cov1)) if np.linalg.det(cov1) > 0 else 0
+            vol2 = np.sqrt(np.linalg.det(cov2)) if np.linalg.det(cov2) > 0 else 0
+            volume_ratio = vol1 / vol2 if vol2 > 0 else np.inf
+            
+            # Span comparison (range in each dimension)
+            span1 = np.max(coords1, axis=0) - np.min(coords1, axis=0)
+            span2 = np.max(coords2, axis=0) - np.min(coords2, axis=0)
+            span_ratio = np.mean(span1 / span2) if np.all(span2 > 0) else np.nan
+            
+            # Mahalanobis distance between centroids (accounts for shape)
+            try:
+                # Use pooled covariance for Mahalanobis distance
+                pooled_cov = (cov1 * (len(coords1) - 1) + cov2 * (len(coords2) - 1)) / (len(coords1) + len(coords2) - 2)
+                inv_pooled_cov = np.linalg.pinv(pooled_cov)
+                diff = centroid1 - centroid2
+                mahalanobis_distance = np.sqrt(diff @ inv_pooled_cov @ diff)
+            except:
+                mahalanobis_distance = np.nan
+            
+            # 3. Convex hull overlap (global geometric overlap)
+            try:
+                from scipy.spatial import ConvexHull
+                hull1 = ConvexHull(coords1)
+                hull2 = ConvexHull(coords2)
+                
+                # Count points from sys1 inside hull2 and vice versa
+                from scipy.spatial.distance import cdist
+                # Check if points from sys1 are inside hull2
+                # (simplified: check if distance to hull is small)
+                hull2_distances = cdist(coords1, coords2[hull2.vertices])
+                points1_in_hull2 = (hull2_distances.min(axis=1) < np.percentile(cdist(coords2, coords2[hull2.vertices]).min(axis=1), 10)).sum()
+                
+                hull1_distances = cdist(coords2, coords1[hull1.vertices])
+                points2_in_hull1 = (hull1_distances.min(axis=1) < np.percentile(cdist(coords1, coords1[hull1.vertices]).min(axis=1), 10)).sum()
+                
+                convex_hull_overlap_pct = ((points1_in_hull2 / len(coords1)) + (points2_in_hull1 / len(coords2))) / 2 * 100
+            except:
+                convex_hull_overlap_pct = np.nan
+            
+            # 4. Spread comparison (standard deviation in each dimension)
+            std1 = np.std(coords1, axis=0)
+            std2 = np.std(coords2, axis=0)
+            std_ratio = np.mean(std1 / std2) if np.all(std2 > 0) else np.nan
+            
             overlap_stats.append({
                 'system1': sys1,
                 'system2': sys2,
@@ -4339,7 +5823,17 @@ def analyze_system_manifold_overlap(diffusion_results_file, output_dir, n_neighb
                 'avg_overlap_pct': avg_overlap,
                 'jaccard_similarity': jaccard_similarity,
                 'n_samples_sys1': len(coords1),
-                'n_samples_sys2': len(coords2)
+                'n_samples_sys2': len(coords2),
+                # Global geometric metrics
+                'centroid_distance': centroid_distance,
+                'mahalanobis_distance': mahalanobis_distance,
+                'pc1_alignment': pc1_alignment,  # May be uninformative if DC1 has minimal variation
+                'pseudotime_gradient_alignment': pseudotime_gradient_alignment,  # Flow direction alignment
+                'max_variation_alignment': max_var_alignment,  # Direction of maximum variation
+                'volume_ratio': volume_ratio,
+                'span_ratio': span_ratio,
+                'std_ratio': std_ratio,
+                'convex_hull_overlap_pct': convex_hull_overlap_pct
             })
     
     overlap_df = pd.DataFrame(overlap_stats)
@@ -4368,18 +5862,21 @@ def analyze_system_manifold_overlap(diffusion_results_file, output_dir, n_neighb
     np.fill_diagonal(overlap_matrix, 100.0)
     np.fill_diagonal(jaccard_matrix, 1.0)
     
+    # Use simplified names for display
+    display_labels = [system_display_names[sys] for sys in systems]
+    
     fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(16, 6))
     
     # Overlap percentage heatmap
     sns.heatmap(overlap_matrix, annot=True, fmt='.1f', cmap='YlOrRd', 
-                xticklabels=systems, yticklabels=systems, ax=ax1, cbar_kws={'label': 'Overlap %'})
+                xticklabels=display_labels, yticklabels=display_labels, ax=ax1, cbar_kws={'label': 'Overlap %'})
     ax1.set_title('System Manifold Overlap Percentage')
     ax1.set_xlabel('System')
     ax1.set_ylabel('System')
     
     # Jaccard similarity heatmap
     sns.heatmap(jaccard_matrix, annot=True, fmt='.3f', cmap='Blues',
-                xticklabels=systems, yticklabels=systems, ax=ax2, cbar_kws={'label': 'Jaccard Similarity'})
+                xticklabels=display_labels, yticklabels=display_labels, ax=ax2, cbar_kws={'label': 'Jaccard Similarity'})
     ax2.set_title('System Manifold Jaccard Similarity')
     ax2.set_xlabel('System')
     ax2.set_ylabel('System')
@@ -4414,25 +5911,120 @@ def analyze_system_manifold_overlap(diffusion_results_file, output_dir, n_neighb
         
         if n_dims == 2:
             ax = axes[idx]
-            ax.scatter(coords1[:, 0], coords1[:, 1], alpha=0.5, s=10, label=sys1, c='blue')
-            ax.scatter(coords2[:, 0], coords2[:, 1], alpha=0.5, s=10, label=sys2, c='red')
+            ax.scatter(coords1[:, 0], coords1[:, 1], alpha=0.5, s=10, label=system_display_names[sys1], c='blue')
+            ax.scatter(coords2[:, 0], coords2[:, 1], alpha=0.5, s=10, label=system_display_names[sys2], c='red')
+            
+            # Add global geometric features
+            # Centroids
+            centroid1 = np.mean(coords1, axis=0)
+            centroid2 = np.mean(coords2, axis=0)
+            ax.scatter(centroid1[0], centroid1[1], s=200, marker='*', c='blue', 
+                      edgecolors='black', linewidths=1.5, label=f'{system_display_names[sys1]} centroid', zorder=5)
+            ax.scatter(centroid2[0], centroid2[1], s=200, marker='*', c='red', 
+                      edgecolors='black', linewidths=1.5, label=f'{system_display_names[sys2]} centroid', zorder=5)
+            
+            # Principal components (first PC as arrows)
+            # The arrow shows the main direction of variation (first principal component)
+            # It points in the direction where the system's data spreads the most
+            cov1 = np.cov(coords1.T)
+            cov2 = np.cov(coords2.T)
+            eigenvals1, eigenvecs1 = np.linalg.eigh(cov1)
+            eigenvals2, eigenvecs2 = np.linalg.eigh(cov2)
+            idx1 = eigenvals1.argsort()[::-1]
+            idx2 = eigenvals2.argsort()[::-1]
+            pc1_1 = eigenvecs1[:, idx1[0]] * np.sqrt(eigenvals1[idx1[0]]) * 2
+            pc1_2 = eigenvecs2[:, idx2[0]] * np.sqrt(eigenvals2[idx2[0]]) * 2
+            arrow1 = ax.arrow(centroid1[0], centroid1[1], pc1_1[0], pc1_1[1], 
+                   head_width=0.05, head_length=0.05, fc='blue', ec='blue', linewidth=2, alpha=0.7,
+                   label=f'{system_display_names[sys1]} PC1 (main variation)')
+            arrow2 = ax.arrow(centroid2[0], centroid2[1], pc1_2[0], pc1_2[1], 
+                   head_width=0.05, head_length=0.05, fc='red', ec='red', linewidth=2, alpha=0.7,
+                   label=f'{system_display_names[sys2]} PC1 (main variation)')
+            
+            # Covariance ellipses (2 standard deviations)
+            from matplotlib.patches import Ellipse
+            angle1 = np.degrees(np.arctan2(eigenvecs1[1, idx1[0]], eigenvecs1[0, idx1[0]]))
+            angle2 = np.degrees(np.arctan2(eigenvecs2[1, idx2[0]], eigenvecs2[0, idx2[0]]))
+            width1 = 2 * np.sqrt(eigenvals1[idx1[0]]) * 2
+            height1 = 2 * np.sqrt(eigenvals1[idx1[1]]) * 2
+            width2 = 2 * np.sqrt(eigenvals2[idx2[0]]) * 2
+            height2 = 2 * np.sqrt(eigenvals2[idx2[1]]) * 2
+            ellipse1 = Ellipse(centroid1, width1, height1, angle=angle1, 
+                              alpha=0.2, facecolor='blue', edgecolor='blue', linewidth=2)
+            ellipse2 = Ellipse(centroid2, width2, height2, angle=angle2, 
+                              alpha=0.2, facecolor='red', edgecolor='red', linewidth=2)
+            ax.add_patch(ellipse1)
+            ax.add_patch(ellipse2)
+            
+            # Centroid distance line
+            ax.plot([centroid1[0], centroid2[0]], [centroid1[1], centroid2[1]], 
+                   'k--', alpha=0.5, linewidth=1, label=f'Centroid dist: {row["centroid_distance"]:.3f}')
+            
             ax.set_xlabel('DC1')
             ax.set_ylabel('DC2')
-            ax.set_title(f'{sys1} vs {sys2}\nOverlap: {row["avg_overlap_pct"]:.1f}%')
-            ax.legend()
+            title = f'{system_display_names[sys1]} vs {system_display_names[sys2]}\nOverlap: {row["avg_overlap_pct"]:.1f}% | '
+            if 'pseudotime_gradient_alignment' in row and not np.isnan(row['pseudotime_gradient_alignment']):
+                title += f'Pseudotime grad align: {row["pseudotime_gradient_alignment"]:.3f} | '
+            elif 'max_variation_alignment' in row and not np.isnan(row['max_variation_alignment']):
+                title += f'Max var align: {row["max_variation_alignment"]:.3f} | '
+            else:
+                title += f'PC1 align: {row["pc1_alignment"]:.3f} | '
+            title += f'Centroid dist: {row["centroid_distance"]:.3f}'
+            ax.set_title(title, fontsize=9)
+            ax.legend(fontsize=7, loc='best')
+            ax.grid(True, alpha=0.3)
         else:
-            # 3D plot
+            # 3D plot with global geometric features
             fig = plt.figure(figsize=(10, 8))
             ax = fig.add_subplot(111, projection='3d')
             ax.scatter(coords1[:, 0], coords1[:, 1], coords1[:, 2], 
-                      alpha=0.5, s=10, label=sys1, c='blue')
+                      alpha=0.5, s=10, label=system_display_names[sys1], c='blue')
             ax.scatter(coords2[:, 0], coords2[:, 1], coords2[:, 2],
-                      alpha=0.5, s=10, label=sys2, c='red')
+                      alpha=0.5, s=10, label=system_display_names[sys2], c='red')
+            
+            # Add centroids
+            centroid1 = np.mean(coords1, axis=0)
+            centroid2 = np.mean(coords2, axis=0)
+            ax.scatter(centroid1[0], centroid1[1], centroid1[2], s=200, marker='*', 
+                      c='blue', edgecolors='black', linewidths=1.5, label=f'{system_display_names[sys1]} centroid', zorder=5)
+            ax.scatter(centroid2[0], centroid2[1], centroid2[2], s=200, marker='*', 
+                      c='red', edgecolors='black', linewidths=1.5, label=f'{system_display_names[sys2]} centroid', zorder=5)
+            
+            # Add first principal component as arrow
+            # The arrow shows the main direction of variation (first principal component)
+            # It points in the direction where the system's data spreads the most
+            cov1 = np.cov(coords1.T)
+            cov2 = np.cov(coords2.T)
+            eigenvals1, eigenvecs1 = np.linalg.eigh(cov1)
+            eigenvals2, eigenvecs2 = np.linalg.eigh(cov2)
+            idx1 = eigenvals1.argsort()[::-1]
+            idx2 = eigenvals2.argsort()[::-1]
+            pc1_1 = eigenvecs1[:, idx1[0]] * np.sqrt(eigenvals1[idx1[0]]) * 2
+            pc1_2 = eigenvecs2[:, idx2[0]] * np.sqrt(eigenvals2[idx2[0]]) * 2
+            ax.quiver(centroid1[0], centroid1[1], centroid1[2], 
+                     pc1_1[0], pc1_1[1], pc1_1[2], color='blue', arrow_length_ratio=0.2, linewidth=2,
+                     label=f'{system_display_names[sys1]} PC1 (main variation)')
+            ax.quiver(centroid2[0], centroid2[1], centroid2[2], 
+                     pc1_2[0], pc1_2[1], pc1_2[2], color='red', arrow_length_ratio=0.2, linewidth=2,
+                     label=f'{system_display_names[sys2]} PC1 (main variation)')
+            
+            # Centroid distance line
+            ax.plot([centroid1[0], centroid2[0]], [centroid1[1], centroid2[1]], 
+                   [centroid1[2], centroid2[2]], 'k--', alpha=0.5, linewidth=1)
+            
             ax.set_xlabel('DC1')
             ax.set_ylabel('DC2')
             ax.set_zlabel('DC3')
-            ax.set_title(f'{sys1} vs {sys2}\nOverlap: {row["avg_overlap_pct"]:.1f}%')
-            ax.legend()
+            title = f'{system_display_names[sys1]} vs {system_display_names[sys2]}\nOverlap: {row["avg_overlap_pct"]:.1f}% | '
+            if 'pseudotime_gradient_alignment' in row and not np.isnan(row['pseudotime_gradient_alignment']):
+                title += f'Pseudotime grad align: {row["pseudotime_gradient_alignment"]:.3f} | '
+            elif 'max_variation_alignment' in row and not np.isnan(row['max_variation_alignment']):
+                title += f'Max var align: {row["max_variation_alignment"]:.3f} | '
+            else:
+                title += f'PC1 align: {row["pc1_alignment"]:.3f} | '
+            title += f'Centroid dist: {row["centroid_distance"]:.3f}'
+            ax.set_title(title, fontsize=9)
+            ax.legend(fontsize=7, loc='best')
             
             pair_file = os.path.join(output_dir, f'system_pairwise_{sys1}_vs_{sys2}.png')
             plt.savefig(pair_file, dpi=300, bbox_inches='tight')
@@ -4461,7 +6053,7 @@ def analyze_system_manifold_overlap(diffusion_results_file, output_dir, n_neighb
             ax.hexbin(system_coords[:, 0], system_coords[:, 1], gridsize=30, cmap='viridis', mincnt=1)
             ax.set_xlabel('DC1')
             ax.set_ylabel('DC2')
-            ax.set_title(f'{system}\n(n={len(system_coords)})')
+            ax.set_title(f'{system_display_names[system]}\n(n={len(system_coords)})')
         
         plt.tight_layout()
         density_file = os.path.join(output_dir, 'system_manifold_densities.png')
@@ -4469,7 +6061,79 @@ def analyze_system_manifold_overlap(diffusion_results_file, output_dir, n_neighb
         plt.close()
         print(f"Saved density plots to: {density_file}")
     
-    # 5. Summary statistics
+    # 5. Create global geometric metrics visualization
+    print("Creating global geometric metrics visualization...")
+    if len(overlap_df) > 0:
+        # Create matrices for global metrics
+        # Note: pc1_alignment may be uninformative if DC1 has minimal variation
+        metric_names = ['centroid_distance', 'mahalanobis_distance', 
+                       'pseudotime_gradient_alignment', 'max_variation_alignment', 'pc1_alignment',
+                       'volume_ratio', 'span_ratio', 'std_ratio', 'convex_hull_overlap_pct']
+        
+        # Build matrices for each metric
+        # Filter to only metrics that exist in the dataframe
+        available_metrics = [m for m in metric_names if m in overlap_df.columns]
+        n_metrics = len(available_metrics)
+        
+        # Create appropriate grid size
+        if n_metrics <= 9:
+            n_rows, n_cols = 3, 3
+            figsize = (18, 15)
+        elif n_metrics <= 12:
+            n_rows, n_cols = 3, 4
+            figsize = (24, 15)
+        else:
+            n_rows, n_cols = 4, 4
+            figsize = (24, 20)
+        
+        fig, axes = plt.subplots(n_rows, n_cols, figsize=figsize)
+        axes = axes.flatten()
+        
+        # Turn off unused subplots
+        for idx in range(n_metrics, len(axes)):
+            axes[idx].axis('off')
+        
+        for idx, metric in enumerate(available_metrics):
+                
+            matrix = np.zeros((n_systems, n_systems))
+            matrix[:] = np.nan
+            
+            for _, row in overlap_df.iterrows():
+                i = systems.index(row['system1'])
+                j = systems.index(row['system2'])
+                val = row[metric]
+                if not np.isnan(val) and not np.isinf(val):
+                    matrix[i, j] = val
+                    matrix[j, i] = val
+            
+            # Set diagonal (self-comparison)
+            if metric in ['pc1_alignment', 'pseudotime_gradient_alignment', 'max_variation_alignment', 'convex_hull_overlap_pct']:
+                if metric == 'convex_hull_overlap_pct':
+                    np.fill_diagonal(matrix, 100.0)
+                else:
+                    np.fill_diagonal(matrix, 1.0)  # Perfect alignment with self
+            elif metric in ['volume_ratio', 'span_ratio', 'std_ratio']:
+                np.fill_diagonal(matrix, 1.0)
+            else:
+                np.fill_diagonal(matrix, 0.0)
+            
+            # Create heatmap
+            ax = axes[idx]
+            mask = np.isnan(matrix)
+            sns.heatmap(matrix, annot=True, fmt='.3f', cmap='viridis', 
+                       xticklabels=display_labels, yticklabels=display_labels, ax=ax,
+                       mask=mask, cbar_kws={'label': metric.replace('_', ' ').title()})
+            ax.set_title(metric.replace('_', ' ').title(), fontsize=10, fontweight='bold')
+            ax.set_xlabel('System')
+            ax.set_ylabel('System')
+        
+        plt.tight_layout()
+        geom_file = os.path.join(output_dir, 'system_global_geometric_metrics.png')
+        plt.savefig(geom_file, dpi=300, bbox_inches='tight')
+        plt.close()
+        print(f"Saved global geometric metrics to: {geom_file}")
+    
+    # 6. Summary statistics
     print("\n" + "="*60)
     print("Manifold Overlap Summary")
     print("="*60)
@@ -4491,6 +6155,43 @@ def analyze_system_manifold_overlap(diffusion_results_file, output_dir, n_neighb
             print(f"  {row['system1']} <-> {row['system2']}: {row['avg_overlap_pct']:.1f}%")
     else:
         print("\nWarning: Could not compute overlap percentage statistics")
+    
+    # Global geometric summary
+    if len(overlap_df) > 0:
+        print(f"\nGlobal Geometric Analysis:")
+        print(f"  Closest systems (by centroid distance):")
+        if 'centroid_distance' in overlap_df.columns:
+            closest = overlap_df.nsmallest(min(3, len(overlap_df)), 'centroid_distance')
+            for _, row in closest.iterrows():
+                print(f"    {row['system1']} <-> {row['system2']}: {row['centroid_distance']:.4f}")
+        
+        print(f"  Most aligned systems (by pseudotime gradient - flow direction):")
+        if 'pseudotime_gradient_alignment' in overlap_df.columns:
+            most_aligned = overlap_df.nlargest(min(3, len(overlap_df)), 'pseudotime_gradient_alignment')
+            for _, row in most_aligned.iterrows():
+                if not np.isnan(row['pseudotime_gradient_alignment']):
+                    print(f"    {row['system1']} <-> {row['system2']}: {row['pseudotime_gradient_alignment']:.3f}")
+        
+        print(f"  Most aligned systems (by maximum variation direction):")
+        if 'max_variation_alignment' in overlap_df.columns:
+            most_aligned = overlap_df.nlargest(min(3, len(overlap_df)), 'max_variation_alignment')
+            for _, row in most_aligned.iterrows():
+                if not np.isnan(row['max_variation_alignment']):
+                    print(f"    {row['system1']} <-> {row['system2']}: {row['max_variation_alignment']:.3f}")
+        
+        print(f"  Most aligned systems (by PC1 - may be uninformative if DC1 has minimal variation):")
+        if 'pc1_alignment' in overlap_df.columns:
+            most_aligned = overlap_df.nlargest(min(3, len(overlap_df)), 'pc1_alignment')
+            for _, row in most_aligned.iterrows():
+                print(f"    {row['system1']} <-> {row['system2']}: {row['pc1_alignment']:.3f}")
+        
+        print(f"  Most similar volume (by volume ratio, closest to 1.0):")
+        if 'volume_ratio' in overlap_df.columns:
+            vol_ratios = overlap_df.copy()
+            vol_ratios['vol_diff_from_1'] = abs(vol_ratios['volume_ratio'] - 1.0)
+            most_similar_vol = vol_ratios.nsmallest(min(3, len(vol_ratios)), 'vol_diff_from_1')
+            for _, row in most_similar_vol.iterrows():
+                print(f"    {row['system1']} <-> {row['system2']}: {row['volume_ratio']:.3f}")
     
     print(f"\nAll results saved to: {output_dir}")
     print("="*60 + "\n")
