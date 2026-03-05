@@ -38,13 +38,8 @@ import requests.packages.urllib3.util.connection as urllib3_cn
 from loguru import logger
 from lxml import etree
 
-# ---------------------------------------------------------------------------
-# Loguru configuration
-# ---------------------------------------------------------------------------
-# Remove default handler so we can control output
 logger.remove()
 
-# INFO+ to stdout (summary messages only)
 logger.add(
     sys.stdout,
     level="INFO",
@@ -64,7 +59,6 @@ def _configure_file_logging(output_dir):
     logger.info(f"Debug log file: {log_path}")
 
 
-# Forcing IPv4 – avoids IPv6-related connection issues (curl -4 equivalent)
 def _force_ipv4():
     """Force requests/urllib3 to use IPv4 sockets only.
 
@@ -78,17 +72,11 @@ def _force_ipv4():
         urllib3_cn.allowed_gai_family = allowed_gai_family
         logger.debug("Configured urllib3 to use IPv4 only (AF_INET).")
     except Exception as e:
-        # If this fails for any reason, fall back silently – requests will
-        # use its default behavior.
         logger.debug(f"Could not force IPv4: {e}")
 
 
 _force_ipv4()
 
-
-# ============================================================================
-# Step 1 – MyGene.info
-# ============================================================================
 def map_uniprot_to_entrez_mygene(uniprot_ids, cache_file=None, batch_size=1000):
     """
     Maps UniProt IDs to Entrez Gene IDs using MyGene.info API.
@@ -153,10 +141,123 @@ def map_uniprot_to_entrez_mygene(uniprot_ids, cache_file=None, batch_size=1000):
     return mapping_results
 
 
-# ---------------------------------------------------------------------------
-# Lit-search output: columns written to the separate lit-search file
-# (Query/Target IDs + these columns only; main results keep analysis columns only)
-# ---------------------------------------------------------------------------
+def map_mygene_fallback_identifiers(uniprot_ids, cache_file=None, batch_size=1000):
+    """
+    For UniProt IDs that have a MyGene.info record, fetch richer identifiers
+    (gene name, locus tag, GenBank/RefSeq accessions, common name).
+
+    This does NOT try to infer Entrez IDs; it is meant to complement
+    map_uniprot_to_entrez_mygene() by providing better fallback identifiers
+    for IDs that already map to MyGene.
+
+    Returns:
+        dict {uniprot_id: {
+            "gene_name":   str | None,
+            "locus_tag":   str | None,
+            "genbank_acc": str | None,
+            "common_name": str | None,
+        }}
+    """
+    cache = _load_cache(cache_file)
+    ids_to_query = [uid for uid in uniprot_ids if uid not in cache]
+
+    if not ids_to_query:
+        logger.info("MyGene.info fallback – all IDs found in cache")
+        return cache
+
+    logger.info(f"MyGene.info fallback – querying {len(ids_to_query)} IDs …")
+    mg = mygene.MyGeneInfo()
+    results = cache.copy()
+
+    def _first_str(val):
+        if isinstance(val, str):
+            return val
+        if isinstance(val, (list, tuple)) and val:
+            # pick first string-like value
+            for v in val:
+                if isinstance(v, str):
+                    return v
+                if isinstance(v, dict):
+                    # common shapes like {"accession": "..."}
+                    for key in ("accession", "value", "id"):
+                        if key in v and isinstance(v[key], str):
+                            return v[key]
+        if isinstance(val, dict):
+            # accession dicts may have "protein" or "genomic" keys
+            for key in ("protein", "genomic", "rna"):
+                if key in val:
+                    sub = val[key]
+                    if isinstance(sub, str):
+                        return sub
+                    if isinstance(sub, (list, tuple)) and sub:
+                        for v in sub:
+                            if isinstance(v, str):
+                                return v
+        return None
+
+    for i in tqdm(range(0, len(ids_to_query), batch_size), desc="MyGene fallback IDs"):
+        batch = ids_to_query[i:i + batch_size]
+        try:
+            resp = mg.querymany(
+                batch,
+                scopes=["uniprot", "accession", "uniprot.Swiss-Prot", "uniprot.TrEMBL"],
+                fields="symbol,name,locus_tag,accession,refseq,summary",
+                species="all",
+                as_dataframe=False,
+                returnall=True,
+            )
+
+            for result in resp.get("out", []):
+                qid = result.get("query", "")
+                if not qid:
+                    continue
+
+                gene_name = result.get("symbol") or result.get("name")
+                locus_tag = result.get("locus_tag")
+
+                common_name = result.get("name")
+                if not common_name:
+                    common_name = result.get("summary")
+
+                genbank_acc = None
+                acc_val = result.get("accession")
+                if acc_val:
+                    genbank_acc = _first_str(acc_val)
+                if not genbank_acc:
+                    refseq_val = result.get("refseq")
+                    if refseq_val:
+                        genbank_acc = _first_str(refseq_val)
+
+                results[qid] = {
+                    "gene_name": gene_name,
+                    "locus_tag": locus_tag,
+                    "genbank_acc": genbank_acc,
+                    "common_name": common_name,
+                }
+
+            for nf in resp.get("notfound", []):
+                if nf not in results:
+                    results[nf] = {
+                        "gene_name": None,
+                        "locus_tag": None,
+                        "genbank_acc": None,
+                        "common_name": None,
+                    }
+
+        except Exception as e:
+            logger.error(f"MyGene fallback batch error at index {i}: {e}")
+            for uid in batch:
+                if uid not in results:
+                    results[uid] = {
+                        "gene_name": None,
+                        "locus_tag": None,
+                        "genbank_acc": None,
+                        "common_name": None,
+                    }
+
+    _save_cache(results, cache_file)
+    return results
+
 LIT_SEARCH_COLUMNS = [
     "query_entrez_id", "target_entrez_id",
     "query_gene_name", "target_gene_name",
@@ -170,13 +271,15 @@ def get_lit_search_columns():
     """Return the list of column names that belong in the lit-search output file."""
     return list(LIT_SEARCH_COLUMNS)
 
-
-# ============================================================================
-# Step 2 – UniProt REST API  →  fallback IDs only (no GeneID – see module docstring)
-# ============================================================================
 _EMPTY_ENTRY = {
-    "gene_id": None, "genbank_acc": None, "refseq_acc": None,
-    "kegg_locus": None, "gene_name": None, "locus_tag": None, "status": "not_found",
+    "gene_id": None,
+    "genbank_acc": None,
+    "refseq_acc": None,
+    "kegg_locus": None,
+    "gene_name": None,
+    "locus_tag": None,
+    "common_name": None,
+    "status": "not_found",
 }
 
 
@@ -240,6 +343,21 @@ def _extract_uniprot_entry(entry):
     if not locus_tag and kegg_locus:
         locus_tag = kegg_locus
 
+    common_name = None
+    desc = entry.get("proteinDescription") or {}
+    rec = desc.get("recommendedName") or {}
+    full = rec.get("fullName") or {}
+    name_val = full.get("value")
+    if name_val:
+        common_name = name_val
+    if not common_name:
+        for alt in desc.get("alternativeNames") or []:
+            full_alt = (alt.get("fullName") or {})
+            name_val = full_alt.get("value")
+            if name_val:
+                common_name = name_val
+                break
+
     return {
         "gene_id": gene_id,
         "genbank_acc": genbank_acc,
@@ -247,6 +365,7 @@ def _extract_uniprot_entry(entry):
         "kegg_locus": kegg_locus,
         "gene_name": gene_name,
         "locus_tag": locus_tag,
+        "common_name": common_name,
         "status": "found",
     }
 
@@ -325,10 +444,6 @@ def map_uniprot_entries(uniprot_ids, cache_file=None, batch_size=25):
     _save_cache(results, cache_file)
     return results
 
-
-# ============================================================================
-# Step 3 – UniParc (EBI Proteins API) for entries removed from UniProtKB
-# ============================================================================
 def _extract_uniparc_xrefs(db_references, taxid):
     """
     Extract identifiers from EBI Proteins API UniParc dbReference list,
@@ -452,10 +567,6 @@ def map_uniparc_entries(uniprot_ids, taxid=None, cache_file=None):
     return results
 
 
-
-# ============================================================================
-# Shared helpers
-# ============================================================================
 def _load_cache(cache_file):
     """Load a JSON cache file, returning {} on any error."""
     if not cache_file or not os.path.exists(cache_file):
@@ -483,9 +594,6 @@ def _save_cache(data, cache_file):
         logger.warning(f"Could not save cache {cache_file}: {e}")
 
 
-# ============================================================================
-# NCBI helpers: locus_tag from GenBank protein, gene description (common name)
-# ============================================================================
 NCBI_EUTILS = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils"
 NCBI_RATE_DELAY = 0.35
 
@@ -544,16 +652,13 @@ def _batch_genbank_to_locus_tag(accessions, timeout=60):
 
     out = {}
 
-    # split sequences from batch xml
     for gbseq in genpept_tree.findall(".//GBSeq"):
-        # get genbank accession for matching to accessions list
         accession = gbseq.findtext("./GBSeq_primary-accession")
         if not accession:
             accession = gbseq.findtext("./GBSeq_accession-version")
         if not accession:
             logger.warning(f"No accession found in GenBank record {gbseq.findtext('./GBSeq_locus-name')}")
 
-        # get feature table for parsing locus_tag
         cds_feats = gbseq.xpath(".//GBFeature[GBFeature_key='CDS']")
 
         locus_tag = None
@@ -570,13 +675,11 @@ def _batch_genbank_to_locus_tag(accessions, timeout=60):
             if locus_tag is None:
                 logger.debug(f"No locus tag found for {accession}")
 
-        # store by accession and versionless accession (QQL98079.1 -> QQL98079)
         accession = accession.strip()
         out[accession] = locus_tag
         if "." in accession:
             out[accession.split(".", 1)[0]] = locus_tag
 
-    # Shape into accession -> locus_tag dict for every requested accession
     result = {}
     for acc in accessions:
         key = str(acc).strip()
@@ -711,6 +814,7 @@ def run(df, query_col="query", target_col="target",
 
     CACHE_FILES = {
         "mygene":    "mygene_cache.json",
+        "mygene_fallback": "mygene_fallback_cache.json",
         "uniprot":   "uniprot_entries_cache.json",
         "uniparc":   "uniparc_entries_cache.json",
         "genbank_locus": "genbank_locus_tag_cache.json",
@@ -745,9 +849,6 @@ def run(df, query_col="query", target_col="target",
     # Fallback identifiers collected across Steps 2-3
     fallback_ids = {}  # uid → {"locus_tag": ..., "gene_name": ..., "genbank_acc": ...}
 
-    # ------------------------------------------------------------------
-    # Step 1: MyGene.info
-    # ------------------------------------------------------------------
     mygene_results = map_uniprot_to_entrez_mygene(
         list(all_ids), cache_file=_cache("mygene"), batch_size=batch_size
     )
@@ -756,10 +857,6 @@ def run(df, query_col="query", target_col="target",
             id_mapping[uid] = eid
     _log_step_summary("Step 1 (MyGene.info)", id_mapping, all_ids)
 
-    # ------------------------------------------------------------------
-    # Step 2: UniProt REST API  →  fallback IDs only
-    # (UniProt GeneID xrefs are unreliable — stale/reused NCBI Gene IDs)
-    # ------------------------------------------------------------------
     unmapped = [uid for uid in all_ids if id_mapping[uid] is None]
     not_found_in_uniprot = []
 
@@ -774,19 +871,29 @@ def run(df, query_col="query", target_col="target",
                 "locus_tag": info.get("locus_tag"),
                 "gene_name": info.get("gene_name"),
                 "genbank_acc": info.get("genbank_acc"),
+                "common_name": info.get("common_name"),
             }
             if info.get("status") == "not_found":
                 not_found_in_uniprot.append(uid)
 
-        n_found = sum(1 for uid in unmapped
-                      if isinstance(uniprot_results.get(uid), dict)
-                      and uniprot_results[uid].get("status") == "found")
-        n_locus = sum(1 for uid in unmapped
-                      if isinstance(uniprot_results.get(uid), dict)
-                      and uniprot_results[uid].get("locus_tag"))
-        n_genbank = sum(1 for uid in unmapped
-                        if isinstance(uniprot_results.get(uid), dict)
-                        and uniprot_results[uid].get("genbank_acc"))
+        n_found = sum(
+            1
+            for uid in unmapped
+            if isinstance(uniprot_results.get(uid), dict)
+            and uniprot_results[uid].get("status") == "found"
+        )
+        n_locus = sum(
+            1
+            for uid in unmapped
+            if isinstance(uniprot_results.get(uid), dict)
+            and uniprot_results[uid].get("locus_tag")
+        )
+        n_genbank = sum(
+            1
+            for uid in unmapped
+            if isinstance(uniprot_results.get(uid), dict)
+            and uniprot_results[uid].get("genbank_acc")
+        )
         logger.info(
             f"Step 2 (UniProt): {n_found}/{len(unmapped)} entries found, "
             f"{n_locus} locus tag, {n_genbank} GenBank acc, "
@@ -795,10 +902,6 @@ def run(df, query_col="query", target_col="target",
     else:
         logger.info("Step 2 (UniProt): skipped – no unmapped IDs")
 
-    # ------------------------------------------------------------------
-    # Step 3: UniParc  →  for IDs not found in UniProtKB
-    # Split by query vs target to use the correct taxid for filtering
-    # ------------------------------------------------------------------
     if not_found_in_uniprot:
         nf_query = [uid for uid in not_found_in_uniprot if uid in query_ids]
         nf_target = [uid for uid in not_found_in_uniprot if uid in target_ids]
@@ -829,6 +932,8 @@ def run(df, query_col="query", target_col="target",
                 "locus_tag": existing.get("locus_tag") or info.get("locus_tag"),
                 "gene_name": existing.get("gene_name") or info.get("gene_name"),
                 "genbank_acc": existing.get("genbank_acc") or info.get("genbank_acc"),
+                # common_name only comes from UniProt, so preserve any existing value
+                "common_name": existing.get("common_name"),
             }
 
         n_uniparc_found = sum(1 for info in uniparc_results.values()
@@ -841,26 +946,67 @@ def run(df, query_col="query", target_col="target",
     else:
         logger.info("Step 3 (UniParc): skipped – no missing UniProt entries")
 
-    # ------------------------------------------------------------------
-    # Step 4: When locus_tag is missing but GenBank acc present, get from NCBI
-    # (GenBank accession consistently coincides with correct locus tag for e.g. wMel)
-    # ------------------------------------------------------------------
-    n_filled = fill_locus_tag_from_genbank(fallback_ids, cache_file=_cache("genbank_locus"))
+    n_filled = fill_locus_tag_from_genbank(
+        fallback_ids, cache_file=_cache("genbank_locus")
+    )
     if n_filled:
-        logger.info(f"Step 4 (GenBank→locus_tag): filled {n_filled} locus tags from NCBI protein")
+        logger.info(
+            f"Step 4 (GenBank→locus_tag): filled {n_filled} locus tags from NCBI protein"
+        )
 
-    # ------------------------------------------------------------------
-    # Step 5: Gene descriptions (common names) from Entrez for literature search
-    # ------------------------------------------------------------------
+    # Ensure fallback identifiers (gene_name, locus_tag, genbank_acc, common_name)
+    # are available for all UniProt IDs, not just those unmapped by MyGene.info.
+    # This is needed so both query and target proteins have rich identifiers for
+    # text-based literature searches.
+    missing_fallback = [uid for uid in all_ids if uid not in fallback_ids]
+    if missing_fallback:
+        logger.info(
+            f"Step 6 (UniProt fallback IDs): filling fallback identifiers for "
+            f"{len(missing_fallback)} mapped IDs"
+        )
+        extra_uniprot = map_uniprot_entries(
+            missing_fallback, cache_file=_cache("uniprot"), batch_size=25
+        )
+        for uid, info in extra_uniprot.items():
+            if not isinstance(info, dict):
+                continue
+            existing = fallback_ids.get(uid, {})
+            fallback_ids[uid] = {
+                "locus_tag": existing.get("locus_tag") or info.get("locus_tag"),
+                "gene_name": existing.get("gene_name") or info.get("gene_name"),
+                "genbank_acc": existing.get("genbank_acc") or info.get("genbank_acc"),
+                "common_name": existing.get("common_name") or info.get("common_name"),
+            }
+
+    # For IDs that have a trusted MyGene mapping, prefer MyGene-derived
+    # identifiers over UniProt/UniParc fallbacks when available.
+    mygene_mapped_ids = [uid for uid, eid in mygene_results.items() if eid is not None]
+    if mygene_mapped_ids:
+        logger.info(
+            f"MyGene fallback IDs: enriching identifiers for "
+            f"{len(mygene_mapped_ids)} IDs with MyGene mappings"
+        )
+        mygene_fallbacks = map_mygene_fallback_identifiers(
+            mygene_mapped_ids, cache_file=_cache("mygene_fallback"), batch_size=batch_size
+        )
+        for uid in mygene_mapped_ids:
+            mg = mygene_fallbacks.get(uid) or {}
+            if not mg:
+                continue
+            existing = fallback_ids.get(uid, {})
+            fallback_ids[uid] = {
+                "locus_tag": mg.get("locus_tag") or existing.get("locus_tag"),
+                "gene_name": mg.get("gene_name") or existing.get("gene_name"),
+                "genbank_acc": mg.get("genbank_acc") or existing.get("genbank_acc"),
+                "common_name": mg.get("common_name") or existing.get("common_name"),
+            }
+
     unique_gene_ids = list({eid for eid in id_mapping.values() if eid is not None})
     gene_descriptions = fetch_gene_descriptions(unique_gene_ids, cache_file=_cache("entrez_description"))
     if gene_descriptions:
         n_with_desc = sum(1 for v in gene_descriptions.values() if v)
         logger.info(f"Step 5 (Entrez description): {n_with_desc}/{len(gene_descriptions)} gene descriptions fetched")
 
-    # ------------------------------------------------------------------
-    # Final summary
-    # ------------------------------------------------------------------
     total = len(all_ids)
     mapped = sum(1 for v in id_mapping.values() if v is not None)
     unmapped_final = total - mapped
@@ -871,9 +1017,6 @@ def run(df, query_col="query", target_col="target",
 
     _save_mapping_stats(id_mapping, fallback_ids, output_dir)
 
-    # ------------------------------------------------------------------
-    # Apply mapping to DataFrame
-    # ------------------------------------------------------------------
     def _safe_int(x):
         if x is None or (isinstance(x, float) and pd.isna(x)):
             return None
@@ -891,9 +1034,8 @@ def run(df, query_col="query", target_col="target",
             lambda uid: fallback_ids.get(uid, {}).get("locus_tag"))
         result_df["query_genbank_acc"] = result_df[query_col].map(
             lambda uid: fallback_ids.get(uid, {}).get("genbank_acc"))
-        result_df["query_common_name"] = result_df["query_entrez_id"].map(
-            lambda eid: gene_descriptions.get(_safe_int(eid)) if _safe_int(eid) is not None else None
-        )
+        result_df["query_common_name"] = result_df[query_col].map(
+            lambda uid: fallback_ids.get(uid, {}).get("common_name"))
     if target_col in result_df.columns:
         result_df["target_entrez_id"] = result_df[target_col].map(id_mapping)
         result_df["target_gene_name"] = result_df[target_col].map(
@@ -913,15 +1055,10 @@ def run(df, query_col="query", target_col="target",
         mt = result_df["target_entrez_id"].notna().sum()
         logger.info(f"Target column: {mt}/{len(result_df)} rows mapped")
 
-    # Return only the lit-search table (query/target IDs + mapping columns)
     id_cols = [c for c in [query_col, target_col] if c in result_df.columns]
     lit_cols = [c for c in LIT_SEARCH_COLUMNS if c in result_df.columns]
     return result_df[id_cols + lit_cols].copy()
 
-
-# ============================================================================
-# Stats output
-# ============================================================================
 def _save_mapping_stats(id_mapping, fallback_ids, output_dir):
     """Write a JSON summary of mapped / unmapped IDs and available fallbacks."""
     stats_file = os.path.join(output_dir, "mapping_stats.json")
@@ -946,10 +1083,6 @@ def _save_mapping_stats(id_mapping, fallback_ids, output_dir):
     except Exception as e:
         logger.warning(f"Could not save stats file: {e}")
 
-
-# ============================================================================
-# CLI
-# ============================================================================
 def main():
     """Command-line interface for the mapping module."""
     parser = argparse.ArgumentParser(
@@ -1019,9 +1152,6 @@ def main():
         logger.info(f"Writing lit-search output: {args.output}")
         result_df.to_csv(args.output, index=False)
         logger.info(f"Saved {len(result_df)} rows")
-    except Exception as e:
-        logger.error(f"Error writing output: {e}")
-        return 1
     except Exception as e:
         logger.error(f"Error writing output: {e}")
         return 1
