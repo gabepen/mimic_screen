@@ -184,8 +184,8 @@ def main():
         '--scaler',
         type=str,
         default='robust',
-        choices=['robust', 'zscore', 'standard', 'minmax'],
-        help='Scaling method: robust (default, robust to outliers), zscore/standard (mean=0, std=1), or minmax (0-1 range)'
+        choices=['none', 'fixed', 'robust', 'zscore', 'standard', 'minmax'],
+        help='Scaling method: none (no scaling), fixed (scales from [per-feature min, 1.0] -> [0,1], best for cloud transfer), robust (default, median/IQR), zscore/standard (mean=0, std=1), or minmax (0-1 range)'
     )
     parser.add_argument(
         '--use_diffusion',
