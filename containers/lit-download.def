@@ -1,0 +1,33 @@
+Bootstrap: docker
+From: python:3.11-slim
+
+%labels
+    Author gabe
+    Description "CPU-only image for bulk literature download (auto_lit_search.collect)"
+
+%post
+    set -e
+    apt-get update
+    DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+        git \
+        curl \
+        ca-certificates \
+        build-essential
+    apt-get clean
+    rm -rf /var/lib/apt/lists/*
+
+    python -m pip install --no-cache-dir --upgrade pip
+    python -m pip install --no-cache-dir \
+        pandas \
+        requests \
+        loguru \
+        pypdf
+
+%environment
+    export PYTHONUNBUFFERED=1
+    export PIP_NO_CACHE_DIR=1
+
+%runscript
+    echo "Use singularity exec to run the downloader, e.g.:"
+    echo "  singularity exec $SINGULARITY_CONTAINER python -m auto_lit_search.collect \"\$@\""
+
