@@ -1,14 +1,10 @@
 """
 Collect module for automated literature search pipeline (Module 3 of 4).
 
-Validates papers using paper-centric gene-in-paper checks (Europe PMC Annotations)
-and PubTator 3.0 relation extraction. Outputs high-confidence paper list for
-full-text analysis; papers not validated by either are flagged for future
-LLM evaluation (placeholder only).
+Bulk full-text downloader.
 
-Lit-OTAR-style validation is done by paper ID: for each PMID we fetch all gene/protein
-annotations from Europe PMC; if our gene (UniProt) appears, we treat it as validated.
-No Ensembl IDs required, so it works for non-model organisms.
+Consumes mapping+search results and downloads full texts for all discovered
+papers into a shared data directory for later LLM analysis.
 
 Pipeline Interface:
     run(df_or_path, **kwargs) -> pd.DataFrame
@@ -17,432 +13,319 @@ Pipeline Interface:
 import argparse
 import json
 import os
-import re
 import sys
 import time
-from typing import Any, Dict, List, Optional, Set, Tuple
+from dataclasses import dataclass
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 import pandas as pd
 import requests
 from loguru import logger
 
+
+logger.remove()
+logger.add(
+    sys.stdout,
+    level="INFO",
+    format="<green>{time:HH:mm:ss}</green> | <level>{level:<7}</level> | {message}",
+)
+
+
 EUROPEPMC_SEARCH_URL = "https://www.ebi.ac.uk/europepmc/webservices/rest/search"
-EUROPEPMC_ANNOTATIONS_URL = "https://www.ebi.ac.uk/europepmc/annotations_api/annotationsByArticleIds"
-PUBTATOR_EXPORT_URL = "https://www.ncbi.nlm.nih.gov/research/pubtator3-api/publications/export/biocjson"
+EUROPEPMC_FULLTEXT_BASE = "https://www.ebi.ac.uk/europepmc/webservices/rest"
 API_DELAY = 0.35
-PUBTATOR_DELAY = 0.35
-PUBTATOR_BATCH_SIZE = 100
+
+
+@dataclass
+class DownloadRecord:
+    paper_id: str
+    source: str
+    pmcid: Optional[str]
+    pdf_path: Optional[str]
+    text_path: Optional[str]
+    status: str
+    message: Optional[str] = None
 
 
 def _configure_file_logging(output_dir: str) -> None:
     os.makedirs(output_dir, exist_ok=True)
-    log_path = os.path.join(output_dir, "collect_debug.log")
+    log_path = os.path.join(output_dir, "collect_download_debug.log")
     logger.add(
         log_path,
         level="DEBUG",
         format="{time:YYYY-MM-DD HH:mm:ss} | {level:<7} | {message}",
         rotation="10 MB",
     )
-    logger.info(f"Collect debug log file: {log_path}")
+    logger.info(f"Collect (download) debug log file: {log_path}")
 
 
-def paper_id_to_pmid(
+def _normalize_paper_id(pid: Any) -> Optional[str]:
+    if pid is None:
+        return None
+    s = str(pid).strip()
+    if not s or s.lower() == "nan":
+        return None
+    return s
+
+
+def _resolve_to_pmcid(
     paper_id: str,
     session: requests.Session,
     cache: Dict[str, Optional[str]],
-    cache_path: Optional[str] = None,
-    timeout: int = 30,
+    delay: float = API_DELAY,
 ) -> Optional[str]:
     """
-    Resolve paper_id (DOI, PMID:123, PMC id, etc.) to PMID string.
-    Uses cache; if not cached, queries Europe PMC search by EXT_ID and reads pmid.
-    Returns None if already PMID (return numeric part), or if resolution fails.
+    Resolve an arbitrary paper identifier to a Europe PMC PMCID, if possible.
+
+    Supported inputs:
+        - PMC123456 or PMC:123456
+        - PMID:123456 or bare numeric PMID
+        - DOI (10.xxxx/...)
+        - Other IDs resolvable via EXT_ID search.
     """
-    if not paper_id or not str(paper_id).strip():
-        return None
-    s = str(paper_id).strip()
-    if s.upper().startswith("PMID:"):
-        num = s[5:].strip()
-        if num.isdigit():
-            return num
-        return None
-    if s.isdigit() and len(s) <= 8:
-        return s
     if paper_id in cache:
         return cache[paper_id]
-    time.sleep(API_DELAY)
-    query = None
-    if s.upper().startswith("DOI:"):
-        query = f"EXT_ID:{s[4:].strip()}"
-    elif s.upper().startswith("PMC"):
-        query = f"EXT_ID:{s}"
-    elif re.match(r"^10\.\d+/", s):
-        query = f"EXT_ID:{s}"
-    if not query:
-        cache[paper_id] = None
-        return None
+
+    pid = paper_id.strip()
+    u = pid.upper()
+
+    # Already a PMC id.
+    if u.startswith("PMC:"):
+        pmcid = u[4:].strip()
+        pmcid = f"PMC{pmcid}" if not pmcid.upper().startswith("PMC") else pmcid
+        cache[paper_id] = pmcid
+        return pmcid
+    if u.startswith("PMC"):
+        cache[paper_id] = u
+        return u
+
+    # Try to resolve via EXT_ID search.
+    if u.startswith("PMID:"):
+        ext_id = u[5:].strip()
+    else:
+        ext_id = pid
+
+    time.sleep(delay)
     try:
         resp = session.get(
             EUROPEPMC_SEARCH_URL,
-            params={"query": query, "format": "json", "pageSize": 1},
-            timeout=timeout,
+            params={
+                "query": f"EXT_ID:{ext_id}",
+                "format": "json",
+                "resultType": "core",
+                "pageSize": 1,
+            },
+            timeout=30,
         )
         resp.raise_for_status()
         data = resp.json()
     except Exception as e:
-        logger.debug(f"Europe PMC PMID lookup failed for {paper_id}: {e}")
+        logger.debug(f"EXT_ID lookup failed for {paper_id}: {e}")
         cache[paper_id] = None
         return None
+
     results = (data.get("resultList") or {}).get("result") or []
     if not results:
         cache[paper_id] = None
         return None
     rec = results[0]
-    pmid = rec.get("pmid")
-    if pmid is not None:
-        pmid_str = str(pmid).strip()
-        if pmid_str.isdigit():
-            cache[paper_id] = pmid_str
-            return pmid_str
-    cache[paper_id] = None
-    return None
-
-
-def fetch_pubtator_biocjson(
-    pmids: List[str],
-    session: requests.Session,
-    cache_dir: Optional[str],
-    delay: float = PUBTATOR_DELAY,
-    timeout: int = 60,
-) -> Dict[str, Any]:
-    """
-    Fetch PubTator 3.0 biocjson for a list of PMIDs. Batches in chunks of 100.
-    Returns dict pmid -> biocjson document (or empty dict for missing/failed).
-    """
-    if not pmids:
-        return {}
-    pmids = [str(p).strip() for p in pmids if str(p).strip().isdigit()]
-    pmids = list(dict.fromkeys(pmids))
-    out: Dict[str, Any] = {}
-    cache_file = None
-    if cache_dir:
-        os.makedirs(cache_dir, exist_ok=True)
-    for i in range(0, len(pmids), PUBTATOR_BATCH_SIZE):
-        batch = pmids[i : i + PUBTATOR_BATCH_SIZE]
-        batch_key = ",".join(sorted(batch))
-        if cache_dir:
-            safe = re.sub(r"[^\w\-]", "_", batch_key)[:200]
-            cache_file = os.path.join(cache_dir, f"pubtator_{safe}.json")
-            if os.path.exists(cache_file):
-                try:
-                    with open(cache_file, "r", encoding="utf-8") as f:
-                        raw = json.load(f)
-                    if isinstance(raw, list):
-                        for doc in raw:
-                            doc_id = doc.get("id") or (doc.get("passages", [{}])[0].get("document", {}).get("id") if doc.get("passages") else None)
-                            if not doc_id and doc.get("passages"):
-                                infons = doc.get("passages", [{}])[0].get("infons", {})
-                                doc_id = infons.get("pmid") or infons.get("article_id")
-                            if doc_id:
-                                out[str(doc_id)] = doc
-                    elif isinstance(raw, dict):
-                        if "documents" in raw:
-                            for doc in raw["documents"] or []:
-                                doc_id = doc.get("id") if isinstance(doc, dict) else None
-                                if not doc_id and isinstance(doc, dict) and doc.get("passages"):
-                                    infons = doc.get("passages", [{}])[0].get("infons", {})
-                                    doc_id = infons.get("pmid") or infons.get("article_id")
-                                if doc_id:
-                                    out[str(doc_id)] = doc
-                        else:
-                            doc_id = raw.get("id")
-                            if doc_id:
-                                out[str(doc_id)] = raw
-                except Exception as e:
-                    logger.debug(f"PubTator cache read failed {cache_file}: {e}")
-                continue
-        time.sleep(delay)
-        try:
-            resp = session.get(
-                PUBTATOR_EXPORT_URL,
-                params={"pmids": ",".join(batch)},
-                timeout=timeout,
-            )
-            resp.raise_for_status()
-            raw = resp.json()
-        except Exception as e:
-            logger.debug(f"PubTator export failed for batch: {e}")
-            continue
-        if cache_dir and cache_file:
-            try:
-                with open(cache_file, "w", encoding="utf-8") as f:
-                    json.dump(raw, f, indent=0)
-            except Exception as e:
-                logger.debug(f"PubTator cache write failed: {e}")
-        if isinstance(raw, list):
-            for doc in raw:
-                doc_id = doc.get("id")
-                if not doc_id and doc.get("passages"):
-                    infons = doc.get("passages", [{}])[0].get("infons", {})
-                    doc_id = infons.get("pmid") or infons.get("article_id")
-                if doc_id:
-                    out[str(doc_id)] = doc
-        elif isinstance(raw, dict):
-            if "documents" in raw:
-                for doc in raw["documents"] or []:
-                    doc_id = doc.get("id") if isinstance(doc, dict) else None
-                    if not doc_id and isinstance(doc, dict) and doc.get("passages"):
-                        infons = doc.get("passages", [{}])[0].get("infons", {})
-                        doc_id = infons.get("pmid") or infons.get("article_id")
-                    if doc_id:
-                        out[str(doc_id)] = doc
-            else:
-                doc_id = raw.get("id")
-                if doc_id:
-                    out[str(doc_id)] = raw
-    return out
-
-
-def _bioc_doc_pmid(doc: Dict[str, Any]) -> Optional[str]:
-    """Extract PMID from a BioC JSON document."""
-    doc_id = doc.get("id")
-    if doc_id:
-        return str(doc_id)
-    passages = doc.get("passages") or []
-    if passages and isinstance(passages[0], dict):
-        infons = passages[0].get("infons") or {}
-        return infons.get("pmid") or infons.get("article_id")
-    return None
-
-
-def _extract_gene_ids_from_bioc(doc: Dict[str, Any]) -> Set[str]:
-    """Collect all Gene entity IDs (NCBI Gene) from annotations and relations."""
-    gene_ids: Set[str] = set()
-    passages = doc.get("passages") or []
-    for p in passages:
-        if not isinstance(p, dict):
-            continue
-        for ann in p.get("annotations") or []:
-            if not isinstance(ann, dict):
-                continue
-            infons = ann.get("infons") or {}
-            if infons.get("type") == "Gene" or "Gene" in str(infons.get("type", "")):
-                eid = infons.get("id") or ann.get("id")
-                if eid:
-                    gene_ids.add(str(eid))
-        for rel in p.get("relations") or []:
-            if not isinstance(rel, dict):
-                continue
-            nodes = rel.get("nodes") or []
-            for node in nodes:
-                if isinstance(node, dict):
-                    ref = node.get("refid")
-                    if ref:
-                        for a in p.get("annotations") or []:
-                            if isinstance(a, dict) and a.get("id") == ref:
-                                inf = a.get("infons") or {}
-                                if inf.get("type") == "Gene":
-                                    gid = inf.get("id") or a.get("id")
-                                    if gid:
-                                        gene_ids.add(str(gid))
-                                break
-    return gene_ids
-
-
-def gene_in_pubtator_relations(doc: Dict[str, Any], entrez_id: Optional[str]) -> Tuple[bool, List[str]]:
-    """
-    Return (True, list of relation types) if the gene (by NCBI Gene/Entrez ID)
-    appears in any relation in the document; else (False, []).
-    """
-    if not entrez_id:
-        return False, []
-    eid = str(entrez_id).strip()
-    if not eid.isdigit():
-        return False, []
-    gene_ids = _extract_gene_ids_from_bioc(doc)
-    if eid not in gene_ids:
-        return False, []
-    relation_types: List[str] = []
-    passages = doc.get("passages") or []
-    for p in passages:
-        if not isinstance(p, dict):
-            continue
-        for rel in p.get("relations") or []:
-            if isinstance(rel, dict):
-                inf = rel.get("infons")
-                rel_type = inf.get("type") if isinstance(inf, dict) else rel.get("type")
-                if rel_type and rel_type not in relation_types:
-                    relation_types.append(str(rel_type))
-    return True, relation_types
-
-
-def fetch_annotations_for_pmid(
-    pmid: str,
-    session: requests.Session,
-    cache: Dict[str, List[Dict[str, Any]]],
-    cache_path: Optional[str] = None,
-    timeout: int = 30,
-) -> List[Dict[str, Any]]:
-    """Fetch Europe PMC annotations for one article by PMID. Article id format: MED:pmid."""
-    if not pmid or not str(pmid).strip().isdigit():
-        return []
-    p = str(pmid).strip()
-    article_id = f"MED:{p}"
-    if article_id in cache:
-        return cache[article_id]
-    time.sleep(API_DELAY)
-    try:
-        resp = session.get(
-            EUROPEPMC_ANNOTATIONS_URL,
-            params={"articleIds": article_id},
-            timeout=timeout,
-        )
-        resp.raise_for_status()
-        data = resp.json()
-    except Exception as e:
-        logger.debug(f"Annotations API failed for {article_id}: {e}")
-        cache[article_id] = []
-        return []
-    anns = data if isinstance(data, list) else data.get("annotations", data.get("result", []))
-    if not isinstance(anns, list) and isinstance(data, dict):
-        results = data.get("results") or []
-        if results and isinstance(results[0], dict):
-            anns = results[0].get("annotations") or []
-    if not isinstance(anns, list):
-        anns = []
-    cache[article_id] = anns
-    return anns
-
-
-def _uniprot_from_annotation(ann: Dict[str, Any]) -> Optional[str]:
-    """Extract UniProt accession from an annotation body or target URI (Europe PMC JSON-LD)."""
-    def from_uri(uri: Any) -> Optional[str]:
-        if not isinstance(uri, str):
-            return None
-        s = uri.upper().strip()
-        for prefix in (
-            "UNIPROT.ORG/UNIPROT/",
-            "HTTP://WWW.UNIPROT.ORG/UNIPROT/",
-            "HTTPS://WWW.UNIPROT.ORG/UNIPROT/",
-            "HTTP://PURL.UNIPROT.ORG/UNIPROT/",
-            "HTTPS://PURL.UNIPROT.ORG/UNIPROT/",
-        ):
-            if prefix in s:
-                rest = s.split(prefix, 1)[1].split("/")[0].split("?")[0].strip()
-                if rest and len(rest) <= 12 and rest.isalnum():
-                    return rest
+    pmcid = rec.get("pmcid")
+    if not pmcid:
+        cache[paper_id] = None
         return None
 
-    body = ann.get("body")
-    if isinstance(body, str):
-        acc = from_uri(body)
-        if acc:
-            return acc
-    if isinstance(body, dict):
-        for k in ("id", "@id"):
-            acc = from_uri(body.get(k))
-            if acc:
-                return acc
-
-    target = ann.get("target")
-    if isinstance(target, str):
-        acc = from_uri(target)
-        if acc:
-            return acc
-    if isinstance(target, dict):
-        for item in target.get("items") or []:
-            if isinstance(item, dict):
-                acc = from_uri(item.get("id"))
-                if acc:
-                    return acc
-        acc = from_uri(target.get("id") or target.get("@id"))
-        if acc:
-            return acc
-    return None
+    pmcid = str(pmcid).strip()
+    if not pmcid.upper().startswith("PMC"):
+        pmcid = f"PMC{pmcid}"
+    cache[paper_id] = pmcid
+    return pmcid
 
 
-def build_paper_uniprot_sets(
-    pmids: List[str],
+def _fetch_fulltext_pdf(
+    pmcid: str,
     session: requests.Session,
-    cache: Dict[str, List[Dict[str, Any]]],
-    cache_path: Optional[str] = None,
-) -> Dict[str, Set[str]]:
+    pdf_dir: str,
+    timeout: int = 120,
+) -> Optional[str]:
     """
-    For each PMID, fetch Europe PMC annotations and collect all UniProt IDs
-    mentioned in that paper. Returns pmid -> set of UniProt accessions (upper).
-    Enables paper-centric lookup: get all genes for a given paper, match by UniProt.
+    Download full-text PDF for a given PMCID from Europe PMC, if available.
+
+    Saves to pdf_dir and returns local path, or None if not available.
     """
-    pmids = [str(p).strip() for p in pmids if str(p).strip().isdigit()]
-    pmids = list(dict.fromkeys(pmids))
-    out: Dict[str, Set[str]] = {}
-    for p in pmids:
-        anns = fetch_annotations_for_pmid(p, session, cache, cache_path)
-        accs: Set[str] = set()
-        for ann in anns:
-            acc = _uniprot_from_annotation(ann)
-            if acc:
-                accs.add(acc.upper())
-        out[p] = accs
-    return out
+    os.makedirs(pdf_dir, exist_ok=True)
+    safe = pmcid.replace("/", "_").replace(":", "_")
+    out_path = os.path.join(pdf_dir, f"{safe}.pdf")
+    if os.path.exists(out_path) and os.path.getsize(out_path) > 0:
+        logger.debug(f"PDF cache hit: {out_path}")
+        return out_path
+
+    url = f"{EUROPEPMC_FULLTEXT_BASE}/{pmcid}/fullTextPDF"
+    logger.debug(f"Fetching PDF for {pmcid} -> {url}")
+    time.sleep(API_DELAY)
+    try:
+        resp = session.get(url, timeout=timeout)
+        # Some responses may be HTML if PDF is not available.
+        resp.raise_for_status()
+        content_type = resp.headers.get("Content-Type", "").lower()
+        if "pdf" not in content_type:
+            logger.debug(
+                f"PDF not available for {pmcid} (content-type={content_type!r})"
+            )
+            return None
+        with open(out_path, "wb") as f:
+            f.write(resp.content)
+        return out_path
+    except Exception as e:
+        logger.debug(f"PDF fetch failed for {pmcid}: {e}")
+        return None
+
+
+def _fetch_fulltext_xml(
+    pmcid: str,
+    session: requests.Session,
+    xml_dir: str,
+    timeout: int = 120,
+) -> Optional[str]:
+    """
+    Download full-text XML for a given PMCID from Europe PMC, if available.
+
+    Saves to xml_dir and returns local path, or None if not available.
+    """
+    os.makedirs(xml_dir, exist_ok=True)
+    safe = pmcid.replace("/", "_").replace(":", "_")
+    out_path = os.path.join(xml_dir, f"{safe}.xml")
+    if os.path.exists(out_path) and os.path.getsize(out_path) > 0:
+        logger.debug(f"XML cache hit: {out_path}")
+        return out_path
+
+    url = f"{EUROPEPMC_FULLTEXT_BASE}/{pmcid}/fullTextXML"
+    logger.debug(f"Fetching XML for {pmcid} -> {url}")
+    time.sleep(API_DELAY)
+    try:
+        resp = session.get(url, timeout=timeout)
+        resp.raise_for_status()
+        text = resp.text
+        if not text or len(text) < 500:
+            return None
+        with open(out_path, "w", encoding="utf-8", errors="replace") as f:
+            f.write(text)
+        return out_path
+    except Exception as e:
+        logger.debug(f"XML fetch failed for {pmcid}: {e}")
+        return None
+
+
+def _extract_text_from_xml(xml_path: str) -> str:
+    """Very simple XML -> plain text extraction."""
+    import xml.etree.ElementTree as ET
+
+    try:
+        tree = ET.parse(xml_path)
+        root = tree.getroot()
+    except Exception:
+        return ""
+
+    parts: List[str] = []
+    for elem in root.iter():
+        if elem.text and elem.text.strip():
+            parts.append(elem.text.strip())
+    return "\n".join(parts)
+
+
+def _extract_text_from_pdf(pdf_path: str) -> str:
+    """
+    Extract plain text from a PDF using pypdf, if installed.
+
+    Returns empty string on failure.
+    """
+    try:
+        import pypdf  # type: ignore
+    except Exception:
+        logger.debug("pypdf not installed; skipping PDF text extraction")
+        return ""
+
+    try:
+        reader = pypdf.PdfReader(pdf_path)
+    except Exception as e:
+        logger.debug(f"Failed to open PDF {pdf_path}: {e}")
+        return ""
+
+    texts: List[str] = []
+    for page in reader.pages:
+        try:
+            t = page.extract_text() or ""
+        except Exception:
+            t = ""
+        if t.strip():
+            texts.append(t.strip())
+    return "\n\n".join(texts)
+
+
+def _iter_paper_ids_from_search_df(df: pd.DataFrame) -> Iterable[Tuple[str, str]]:
+    """
+    Yield (paper_id, source) from search results DataFrame.
+
+    Expects columns:
+        - query_paper_dois
+        - target_paper_dois
+    which contain JSON-encoded lists of IDs.
+    """
+    for _, row in df.iterrows():
+        for col, source in (
+            ("query_paper_dois", "query"),
+            ("target_paper_dois", "target"),
+        ):
+            if col not in row:
+                continue
+            val = row[col]
+            if isinstance(val, str):
+                try:
+                    ids = json.loads(val) if val else []
+                except Exception:
+                    ids = []
+            else:
+                ids = val or []
+            if not isinstance(ids, list):
+                continue
+            for pid in ids:
+                norm = _normalize_paper_id(pid)
+                if not norm:
+                    continue
+                yield norm, source
 
 
 def run(
     df_or_path,
-    query_id_col: str = "query",
-    target_id_col: str = "target",
-    output_dir: str = ".",
-    verify_side: str = "both",
+    data_root: str = "/private/groups/corbettlab/gabe/auto_lit_eval_data",
+    batch_size: int = 500,
+    max_papers: Optional[int] = None,
+    delete_pdf_after_text: bool = False,
     no_cache: bool = False,
-    litotar_min_score: float = 0.5,
-    pubtator_batch_size: int = PUBTATOR_BATCH_SIZE,
-    output_llm_queue_path: Optional[str] = None,
 ) -> pd.DataFrame:
     """
-    Load search results, validate papers via Europe PMC Annotations (gene-in-paper)
-    and PubTator, output high-confidence list and optional LLM queue for unvalidated papers.
-
-    Gene-in-paper validation is paper-centric: for each PMID we fetch all gene/protein
-    annotations from Europe PMC; if the row's UniProt ID appears, we treat it as
-    validated (litotar_score=1.0). No Ensembl IDs required; works for non-model organisms.
+    Bulk full-text downloader for papers discovered in the search module.
 
     Args:
-        df_or_path: DataFrame or path to search output CSV/JSON.
-        query_id_col: Column name for query UniProt ID.
-        target_id_col: Column name for target UniProt ID.
-        output_dir: Directory for logs and caches.
-        verify_side: 'query_only', 'target_only', or 'both'.
-        no_cache: If True, do not use file caches.
-        litotar_min_score: Currently unused (score is 1.0 when gene is annotated in the paper).
-        pubtator_batch_size: Max PMIDs per PubTator request (default 100).
-        output_llm_queue_path: If set, write papers needing LLM evaluation here (JSON).
+        df_or_path: DataFrame or path to CSV/JSON produced by the search module.
+        data_root: Shared data root (contains pdf/, text/, llm_queue/, logs/, etc.).
+        batch_size: Number of papers per manifest batch file.
+        max_papers: Optional cap on number of unique papers to process.
+        delete_pdf_after_text: If True, delete PDFs after successful text extraction.
+        no_cache: If True, ignore any previously downloaded files.
 
     Returns:
-        DataFrame with paper_id, query_uniprot_id, target_uniprot_id, side,
-        pmids (resolved), litotar_score, validated_by_litotar, validated_by_pubtator,
-        verification_method, needs_llm_evaluation.
+        DataFrame of DownloadRecord rows.
     """
-    _configure_file_logging(output_dir)
-    cache_dir = output_dir
-    os.makedirs(cache_dir, exist_ok=True)
-    pmid_cache_path = None if no_cache else os.path.join(cache_dir, "collect_pmid_cache.json")
-    pmid_cache: Dict[str, Optional[str]] = {}
-    if pmid_cache_path and os.path.exists(pmid_cache_path):
-        try:
-            with open(pmid_cache_path, "r", encoding="utf-8") as f:
-                pmid_cache = json.load(f)
-            logger.info(f"Loaded PMID cache: {len(pmid_cache)} entries")
-        except Exception as e:
-            logger.warning(f"Could not load PMID cache: {e}")
-    annotations_cache: Dict[str, List[Dict[str, Any]]] = {}
-    annotations_cache_path = None if no_cache else os.path.join(cache_dir, "collect_annotations_cache.json")
-    if annotations_cache_path and os.path.exists(annotations_cache_path):
-        try:
-            with open(annotations_cache_path, "r", encoding="utf-8") as f:
-                annotations_cache = json.load(f)
-            logger.info(f"Loaded annotations cache: {len(annotations_cache)} articles")
-        except Exception as e:
-            logger.warning(f"Could not load annotations cache: {e}")
-    pubtator_cache_dir = None if no_cache else os.path.join(cache_dir, "pubtator_biocjson")
+    os.makedirs(data_root, exist_ok=True)
+    pdf_dir = os.path.join(data_root, "pdf")
+    text_dir = os.path.join(data_root, "text")
+    xml_dir = os.path.join(data_root, "text_xml")
+    llm_queue_dir = os.path.join(data_root, "llm_queue")
+    logs_dir = os.path.join(data_root, "logs")
+    for d in (pdf_dir, text_dir, xml_dir, llm_queue_dir, logs_dir):
+        os.makedirs(d, exist_ok=True)
+
+    _configure_file_logging(logs_dir)
 
     if isinstance(df_or_path, str):
         path = df_or_path
@@ -452,249 +335,285 @@ def run(
             rows = []
             for query_id, alignments in data.items():
                 for al in alignments:
-                    for pid in al.get("query_paper_dois", []):
-                        rows.append({
-                            **{query_id_col: query_id, target_id_col: al.get("target", "")},
-                            "paper_id": pid,
-                            "side": "query",
-                        })
-                    for pid in al.get("target_paper_dois", []):
-                        rows.append({
-                            **{query_id_col: query_id, target_id_col: al.get("target", "")},
-                            "paper_id": pid,
-                            "side": "target",
-                        })
+                    q_ids = al.get("query_paper_dois", [])
+                    t_ids = al.get("target_paper_dois", [])
+                    rows.append(
+                        {
+                            "query": query_id,
+                            "target": al.get("target", ""),
+                            "query_paper_dois": json.dumps(q_ids),
+                            "target_paper_dois": json.dumps(t_ids),
+                        }
+                    )
             df = pd.DataFrame(rows)
         else:
             df = pd.read_csv(path)
     else:
         df = df_or_path.copy()
 
-    if "paper_id" not in df.columns:
-        rows_flat = []
-        for _, row in df.iterrows():
-            q = row.get(query_id_col)
-            t = row.get(target_id_col)
-            q_dois = row.get("query_paper_dois")
-            t_dois = row.get("target_paper_dois")
-            if isinstance(q_dois, str):
-                q_dois = json.loads(q_dois) if q_dois else []
-            if isinstance(t_dois, str):
-                t_dois = json.loads(t_dois) if t_dois else []
-            for pid in q_dois or []:
-                rows_flat.append({**row.to_dict(), "paper_id": pid, "side": "query"})
-            for pid in t_dois or []:
-                rows_flat.append({**row.to_dict(), "paper_id": pid, "side": "target"})
-        df = pd.DataFrame(rows_flat)
-
     if df.empty:
-        logger.warning("No papers to validate")
-        out_df = pd.DataFrame(columns=[
-            "paper_id", "query_uniprot_id", "target_uniprot_id", "side", "pmid",
-            "litotar_score", "validated_by_litotar", "validated_by_pubtator",
-            "verification_method", "needs_llm_evaluation", "pubtator_relation_types",
-        ])
-        return out_df
+        logger.warning("Collect (download): no papers found in input")
+        return pd.DataFrame(
+            columns=[
+                "paper_id",
+                "source",
+                "pmcid",
+                "pdf_path",
+                "text_path",
+                "status",
+                "message",
+            ]
+        )
 
     session = requests.Session()
-    unique_paper_ids = df["paper_id"].dropna().unique().tolist()
-    paper_to_pmid: Dict[str, Optional[str]] = {}
-    for pid in unique_paper_ids:
-        if pid in paper_to_pmid:
-            continue
-        pmid = paper_id_to_pmid(
-            str(pid),
-            session,
-            pmid_cache,
-            cache_path=pmid_cache_path,
+    pmcid_cache: Dict[str, Optional[str]] = {}
+
+    # Build unique paper list.
+    unique: Dict[str, str] = {}
+    for pid, src in _iter_paper_ids_from_search_df(df):
+        if pid not in unique:
+            unique[pid] = src
+
+    paper_items: List[Tuple[str, str]] = list(unique.items())
+    if max_papers is not None:
+        paper_items = paper_items[:max_papers]
+
+    logger.info(
+        f"Collect (download): preparing to process {len(paper_items)} unique papers "
+        f"(batch_size={batch_size})"
+    )
+
+    records: List[DownloadRecord] = []
+    batch: List[DownloadRecord] = []
+    batch_index = 0
+
+    def flush_batch() -> None:
+        nonlocal batch, batch_index
+        if not batch:
+            return
+        batch_index += 1
+        manifest_path = os.path.join(
+            llm_queue_dir, f"batch_{batch_index:04d}.jsonl"
         )
-        paper_to_pmid[str(pid)] = pmid
-
-    df = df.copy()
-    df["pmid"] = df["paper_id"].map(lambda x: paper_to_pmid.get(str(x)))
-    pmids_for_pubtator = [p for p in df["pmid"].dropna().unique().tolist() if str(p).strip().isdigit()]
-    pubtator_docs = fetch_pubtator_biocjson(
-        pmids_for_pubtator,
-        session,
-        pubtator_cache_dir,
-    )
-    pmid_to_doc = {}
-    for pmid, doc in pubtator_docs.items():
-        pid = _bioc_doc_pmid(doc)
-        if pid:
-            pmid_to_doc[pid] = doc
-
-    unique_pmids = list(dict.fromkeys(
-        str(r.get("pmid")).strip() for _, r in df.iterrows()
-        if pd.notna(r.get("pmid")) and str(r.get("pmid")).strip().isdigit()
-    ))
-    pmid_to_uniprot_set: Dict[str, Set[str]] = build_paper_uniprot_sets(
-        unique_pmids,
-        session,
-        annotations_cache,
-        annotations_cache_path,
-    )
-    if annotations_cache_path and annotations_cache:
         try:
-            with open(annotations_cache_path, "w", encoding="utf-8") as f:
-                json.dump(annotations_cache, f, indent=2)
-            logger.info(f"Saved annotations cache: {len(annotations_cache)} articles")
+            with open(manifest_path, "w", encoding="utf-8") as f:
+                for rec in batch:
+                    f.write(
+                        json.dumps(
+                            {
+                                "paper_id": rec.paper_id,
+                                "source": rec.source,
+                                "pmcid": rec.pmcid,
+                                "pdf_path": rec.pdf_path,
+                                "text_path": rec.text_path,
+                                "status": rec.status,
+                            }
+                        )
+                        + "\n"
+                    )
+            logger.info(
+                f"Wrote manifest {manifest_path} ({len(batch)} papers, batch={batch_index})"
+            )
         except Exception as e:
-            logger.warning(f"Could not save annotations cache: {e}")
+            logger.warning(f"Could not write manifest {manifest_path}: {e}")
+        batch = []
 
-    results: List[Dict[str, Any]] = []
-    llm_queue: List[Dict[str, Any]] = []
-    seen: Set[Tuple[str, str, str, str]] = set()
-
-    for idx, row in df.iterrows():
-        paper_id = row.get("paper_id")
-        side = row.get("side", "query")
-        if verify_side != "both" and verify_side != side:
-            continue
-        q_acc = str(row.get(query_id_col, "")).strip() or None
-        t_acc = str(row.get(target_id_col, "")).strip() or None
-        if not q_acc and not t_acc:
-            continue
-        uniprot_acc = q_acc if side == "query" else t_acc
-        pmid = row.get("pmid")
-        if isinstance(pmid, float) and pd.isna(pmid):
-            pmid = None
-        pmid_str = str(pmid).strip() if pmid else None
-        if pmid_str and not pmid_str.isdigit():
-            pmid_str = None
-
-        q_entrez = row.get("query_entrez_id")
-        t_entrez = row.get("target_entrez_id")
-        if pd.isna(q_entrez):
-            q_entrez = None
-        if pd.isna(t_entrez):
-            t_entrez = None
-        entrez_id = (q_entrez if side == "query" else t_entrez)
-        if entrez_id is not None:
-            try:
-                entrez_id = str(int(float(entrez_id)))
-            except (ValueError, TypeError):
-                entrez_id = None
-
-        uniprot_upper = str(uniprot_acc).strip().upper() if uniprot_acc else ""
-        validated_by_litotar = bool(
-            uniprot_upper and pmid_str and uniprot_upper in pmid_to_uniprot_set.get(pmid_str, set())
-        )
-        litotar_score = 1.0 if validated_by_litotar else None
-
-        validated_by_pubtator = False
-        pubtator_relation_types: List[str] = []
-        if pmid_str and entrez_id:
-            doc = pmid_to_doc.get(pmid_str)
-            if doc is not None:
-                found, rel_types = gene_in_pubtator_relations(doc, entrez_id)
-                if found:
-                    validated_by_pubtator = True
-                    pubtator_relation_types = rel_types
-
-        verified = validated_by_litotar or validated_by_pubtator
-        if validated_by_litotar and validated_by_pubtator:
-            method = "both"
-        elif validated_by_litotar:
-            method = "litotar"
-        elif validated_by_pubtator:
-            method = "pubtator"
+    for idx, (paper_id, source) in enumerate(paper_items, start=1):
+        pmcid = _resolve_to_pmcid(paper_id, session, pmcid_cache)
+        if not pmcid:
+            msg = "no PMCID / no full text in Europe PMC"
+            rec = DownloadRecord(
+                paper_id=paper_id,
+                source=source,
+                pmcid=None,
+                pdf_path=None,
+                text_path=None,
+                status="skipped",
+                message=msg,
+            )
+            records.append(rec)
+            batch.append(rec)
         else:
-            method = "none"
+            pdf_path = None
+            text_path = None
+            status = "ok"
+            message = None
 
-        key = (str(paper_id), q_acc or "", t_acc or "", side)
-        if key in seen:
-            continue
-        seen.add(key)
+            if not no_cache:
+                # Reuse existing files if present.
+                safe = pmcid.replace("/", "_").replace(":", "_")
+                candidate_pdf = os.path.join(pdf_dir, f"{safe}.pdf")
+                candidate_text = os.path.join(text_dir, f"{safe}.txt")
+                if os.path.exists(candidate_pdf):
+                    pdf_path = candidate_pdf
+                if os.path.exists(candidate_text):
+                    text_path = candidate_text
 
-        needs_llm = not verified
-        results.append({
-            "paper_id": paper_id,
-            "query_uniprot_id": q_acc,
-            "target_uniprot_id": t_acc,
-            "side": side,
-            "pmid": pmid_str,
-            "litotar_score": litotar_score,
-            "validated_by_litotar": validated_by_litotar,
-            "validated_by_pubtator": validated_by_pubtator,
-            "verification_method": method,
-            "needs_llm_evaluation": needs_llm,
-            "pubtator_relation_types": pubtator_relation_types if pubtator_relation_types else None,
-        })
-        if needs_llm:
-            llm_queue.append({
-                "paper_id": paper_id,
-                "query_uniprot_id": q_acc,
-                "target_uniprot_id": t_acc,
-                "side": side,
-                "pmid": pmid_str,
-            })
+            if not text_path:
+                # Try XML, then PDF, then cache-only.
+                xml_path = _fetch_fulltext_xml(pmcid, session, xml_dir)
+                if xml_path:
+                    extracted = _extract_text_from_xml(xml_path)
+                    if extracted.strip():
+                        safe = pmcid.replace("/", "_").replace(":", "_")
+                        text_path = os.path.join(text_dir, f"{safe}.txt")
+                        try:
+                            with open(
+                                text_path, "w", encoding="utf-8", errors="replace"
+                            ) as f:
+                                f.write(extracted)
+                        except Exception as e:
+                            logger.warning(
+                                f"Failed to write extracted XML text for {pmcid}: {e}"
+                            )
+                            text_path = None
 
-    out_df = pd.DataFrame(results)
-    if pmid_cache_path and pmid_cache:
-        try:
-            with open(pmid_cache_path, "w", encoding="utf-8") as f:
-                json.dump(pmid_cache, f, indent=2)
-        except Exception as e:
-            logger.warning(f"Could not save PMID cache: {e}")
+                if not text_path:
+                    pdf_path = pdf_path or _fetch_fulltext_pdf(
+                        pmcid, session, pdf_dir
+                    )
+                    if pdf_path:
+                        extracted = _extract_text_from_pdf(pdf_path)
+                        if extracted.strip():
+                            safe = pmcid.replace("/", "_").replace(":", "_")
+                            text_path = os.path.join(text_dir, f"{safe}.txt")
+                            try:
+                                with open(
+                                    text_path,
+                                    "w",
+                                    encoding="utf-8",
+                                    errors="replace",
+                                ) as f:
+                                    f.write(extracted)
+                            except Exception as e:
+                                logger.warning(
+                                    f"Failed to write extracted PDF text for {pmcid}: {e}"
+                                )
+                                text_path = None
 
-    if output_llm_queue_path and llm_queue:
-        try:
-            out_dir = os.path.dirname(os.path.abspath(output_llm_queue_path))
-            if out_dir:
-                os.makedirs(out_dir, exist_ok=True)
-            with open(output_llm_queue_path, "w", encoding="utf-8") as f:
-                json.dump(llm_queue, f, indent=2)
-            logger.info(f"LLM queue: {output_llm_queue_path} ({len(llm_queue)} papers)")
-        except Exception as e:
-            logger.warning(f"Could not write LLM queue: {e}")
+            if text_path is None:
+                status = "partial" if pdf_path else "failed"
+                message = "no text extracted"
 
-    n_high = (out_df["validated_by_litotar"] | out_df["validated_by_pubtator"]).sum()
-    logger.info(f"Collect: {n_high} high-confidence papers, {len(llm_queue)} need LLM evaluation, from {len(df)} candidate rows")
+            if delete_pdf_after_text and pdf_path and text_path:
+                try:
+                    os.remove(pdf_path)
+                    logger.debug(f"Deleted PDF after extraction: {pdf_path}")
+                    pdf_path = None
+                except Exception as e:
+                    logger.warning(f"Could not delete PDF {pdf_path}: {e}")
+
+            rec = DownloadRecord(
+                paper_id=paper_id,
+                source=source,
+                pmcid=pmcid,
+                pdf_path=pdf_path,
+                text_path=text_path,
+                status=status,
+                message=message,
+            )
+            records.append(rec)
+            batch.append(rec)
+
+        if idx % batch_size == 0:
+            flush_batch()
+
+        if idx % 50 == 0:
+            logger.info(
+                f"Collect (download): processed {idx}/{len(paper_items)} papers "
+                f"({(idx/len(paper_items))*100:.1f}%)"
+            )
+
+    flush_batch()
+
+    out_df = pd.DataFrame(
+        [
+            {
+                "paper_id": r.paper_id,
+                "source": r.source,
+                "pmcid": r.pmcid,
+                "pdf_path": r.pdf_path,
+                "text_path": r.text_path,
+                "status": r.status,
+                "message": r.message,
+            }
+            for r in records
+        ]
+    )
+
+    n_ok = (out_df["status"] == "ok").sum() if not out_df.empty else 0
+    logger.info(
+        f"Collect (download): {n_ok}/{len(out_df)} papers with extracted text "
+        f"({data_root})"
+    )
     return out_df
 
 
 def main() -> int:
     parser = argparse.ArgumentParser(
-        description="Module 3: Validate papers via Europe PMC Annotations and PubTator, output high-confidence list"
-    )
-    parser.add_argument("-i", "--input", required=True, help="Search output CSV or JSON")
-    parser.add_argument("-o", "--output", required=True, help="Output CSV (high-confidence + needs_llm column)")
-    parser.add_argument("--query-id-col", default="query")
-    parser.add_argument("--target-id-col", default="target")
-    parser.add_argument("--output-dir", default=None)
-    parser.add_argument("--verify", choices=["query_only", "target_only", "both"], default="both")
-    parser.add_argument("--no-cache", action="store_true")
-    parser.add_argument(
-        "--litotar-min-score",
-        type=float,
-        default=0.5,
-        metavar="FLOAT",
-        help="Unused; litotar_score is 1.0 when gene is annotated in the paper.",
+        description=(
+            "Module 3 (new): Download full texts for all papers discovered by the "
+            "search module and write text files + batch manifests for LLM analysis."
+        )
     )
     parser.add_argument(
-        "--output-llm-queue",
+        "-i",
+        "--input",
+        required=True,
+        help="Search output CSV/JSON containing query_paper_dois/target_paper_dois.",
+    )
+    parser.add_argument(
+        "-o",
+        "--output",
+        required=True,
+        help="Output CSV path summarizing download/text extraction status.",
+    )
+    parser.add_argument(
+        "--data-root",
+        default="/private/groups/corbettlab/gabe/auto_lit_eval_data",
+        help="Shared data root with pdf/, text/, llm_queue/, logs/ (default: %(default)s).",
+    )
+    parser.add_argument(
+        "--batch-size",
+        type=int,
+        default=500,
+        help="Number of papers per manifest batch (default: 500).",
+    )
+    parser.add_argument(
+        "--max-papers",
+        type=int,
         default=None,
-        metavar="PATH",
-        help="Write papers needing LLM evaluation to this JSON file.",
+        help="Optional cap on number of unique papers to process.",
+    )
+    parser.add_argument(
+        "--delete-pdf-after-text",
+        action="store_true",
+        help="Delete PDFs after successful text extraction to save space.",
+    )
+    parser.add_argument(
+        "--no-cache",
+        action="store_true",
+        help="Ignore any previously downloaded files (re-download everything).",
     )
     args = parser.parse_args()
-    output_dir = args.output_dir or os.path.dirname(os.path.abspath(args.output))
-    logger.info(f"Reading: {args.input}")
+
+    output_dir = os.path.dirname(os.path.abspath(args.output))
+    os.makedirs(output_dir, exist_ok=True)
+
+    logger.info(f"Collect (download) reading search results: {args.input}")
     result = run(
         args.input,
-        query_id_col=args.query_id_col,
-        target_id_col=args.target_id_col,
-        output_dir=output_dir,
-        verify_side=args.verify,
+        data_root=args.data_root,
+        batch_size=args.batch_size,
+        max_papers=args.max_papers,
+        delete_pdf_after_text=args.delete_pdf_after_text,
         no_cache=args.no_cache,
-        litotar_min_score=args.litotar_min_score,
-        output_llm_queue_path=args.output_llm_queue,
     )
     result.to_csv(args.output, index=False)
-    logger.info(f"Wrote {len(result)} rows to {args.output}")
+    logger.info(f"Collect (download) wrote summary CSV: {args.output}")
     return 0
 
 
 if __name__ == "__main__":
     sys.exit(main())
+
