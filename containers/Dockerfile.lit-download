@@ -1,0 +1,29 @@
+FROM python:3.11-slim
+
+LABEL maintainer="gabe" \
+      description="CPU-only image for bulk literature download (auto_lit_search.collect)"
+
+RUN set -e && \
+    apt-get update && \
+    DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+        git \
+        curl \
+        ca-certificates \
+        build-essential && \
+    apt-get clean && rm -rf /var/lib/apt/lists/*
+
+RUN python -m pip install --no-cache-dir --upgrade pip && \
+    python -m pip install --no-cache-dir \
+        pandas \
+        requests \
+        loguru \
+        pypdf
+
+ENV PYTHONUNBUFFERED=1 \
+    PIP_NO_CACHE_DIR=1
+
+WORKDIR /app
+
+# Repo code will be bind-mounted at runtime on the cluster; no COPY here by default.
+CMD ["bash", "-lc", "echo 'Use lit-download image with auto_lit_search.collect'"]
+
