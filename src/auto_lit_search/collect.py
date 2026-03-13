@@ -261,6 +261,96 @@ def _extract_text_from_pdf(pdf_path: str) -> str:
     return "\n\n".join(texts)
 
 
+def download_papers_to_dir(
+    paper_ids_with_source: List[Tuple[str, str]],
+    output_dir: str,
+    session: Optional[requests.Session] = None,
+    pmcid_cache: Optional[Dict[str, Optional[str]]] = None,
+    no_cache: bool = False,
+) -> List[DownloadRecord]:
+    """
+    Download full-text for a list of (paper_id, source) into output_dir.
+    Writes output_dir/<safe_id>.txt (and optionally pdf/xml subdirs).
+    Returns list of DownloadRecord. Use output_dir as papers_dir for GPU API.
+    """
+    session = session or requests.Session()
+    pmcid_cache = pmcid_cache if pmcid_cache is not None else {}
+    os.makedirs(output_dir, exist_ok=True)
+    pdf_dir = os.path.join(output_dir, "pdf")
+    xml_dir = os.path.join(output_dir, "text_xml")
+    text_dir = output_dir
+
+    records: List[DownloadRecord] = []
+    for paper_id, source in paper_ids_with_source:
+        pmcid = _resolve_to_pmcid(paper_id, session, pmcid_cache)
+        if not pmcid:
+            records.append(
+                DownloadRecord(
+                    paper_id=paper_id,
+                    source=source,
+                    pmcid=None,
+                    pdf_path=None,
+                    text_path=None,
+                    status="skipped",
+                    message="no PMCID",
+                )
+            )
+            continue
+
+        pdf_path = None
+        text_path = None
+        safe = pmcid.replace("/", "_").replace(":", "_")
+        if not no_cache:
+            candidate_text = os.path.join(text_dir, f"{safe}.txt")
+            if os.path.exists(candidate_text) and os.path.getsize(candidate_text) > 0:
+                text_path = candidate_text
+                records.append(
+                    DownloadRecord(
+                        paper_id=paper_id,
+                        source=source,
+                        pmcid=pmcid,
+                        pdf_path=None,
+                        text_path=text_path,
+                        status="ok",
+                        message=None,
+                    )
+                )
+                continue
+
+        if not text_path:
+            xml_path = _fetch_fulltext_xml(pmcid, session, xml_dir)
+            if xml_path:
+                extracted = _extract_text_from_xml(xml_path)
+                if extracted.strip():
+                    text_path = os.path.join(text_dir, f"{safe}.txt")
+                    with open(text_path, "w", encoding="utf-8", errors="replace") as f:
+                        f.write(extracted)
+            if not text_path:
+                pdf_path = _fetch_fulltext_pdf(pmcid, session, pdf_dir)
+                if pdf_path:
+                    extracted = _extract_text_from_pdf(pdf_path)
+                    if extracted.strip():
+                        text_path = os.path.join(text_dir, f"{safe}.txt")
+                        with open(
+                            text_path, "w", encoding="utf-8", errors="replace"
+                        ) as f:
+                            f.write(extracted)
+
+        status = "ok" if text_path else ("partial" if pdf_path else "failed")
+        records.append(
+            DownloadRecord(
+                paper_id=paper_id,
+                source=source,
+                pmcid=pmcid,
+                pdf_path=pdf_path,
+                text_path=text_path,
+                status=status,
+                message=None if text_path else "no text extracted",
+            )
+        )
+    return records
+
+
 def _iter_paper_ids_from_search_df(df: pd.DataFrame) -> Iterable[Tuple[str, str]]:
     """
     Yield (paper_id, source) from search results DataFrame.
