@@ -332,6 +332,7 @@ def run(
     target_id_col: str = "target",
     taxid_col: Optional[str] = None,
     default_taxid: Optional[int] = None,
+    query_taxid: Optional[int] = None,
     target_taxid: Optional[int] = None,
     output_dir: str = ".",
     use_cache: bool = True,
@@ -351,6 +352,8 @@ def run(
             get empty target_paper_dois/titles.
         taxid_col: Optional column giving per-row taxon ID (used only for text fallback).
         default_taxid: Optional fallback taxon ID when taxid_col is missing/None.
+        query_taxid: Optional fixed taxon ID for query organism; if provided,
+            query text searches use this instead of per-row taxid.
         target_taxid: Optional fixed taxon ID for target organism; if provided,
             target text searches use this instead of any per-row taxid.
         output_dir: Directory for logs and cache file (search_cache.json).
@@ -423,8 +426,9 @@ def run(
             if query_res["dois"]:
                 rows_query_from_uniprot += 1
 
+        query_text_taxid: Optional[int] = query_taxid if query_taxid is not None else row_taxid
         text_res_query = run_europepmc_search_for_row(
-            row, row_taxid, session, text_cache, prefix="query"
+            row, query_text_taxid, session, text_cache, prefix="query"
         )
         if text_res_query["dois"]:
             rows_query_from_text += 1
@@ -632,6 +636,12 @@ def main() -> int:
         help="Optional default taxon ID to use when no per-row taxid is provided.",
     )
     parser.add_argument(
+        "--query-taxid",
+        type=int,
+        default=None,
+        help="Optional fixed taxon ID for query organism; overrides per-row taxid for query text searches.",
+    )
+    parser.add_argument(
         "--target-taxid",
         type=int,
         default=None,
@@ -675,6 +685,7 @@ def main() -> int:
         target_id_col=args.target_id_col,
         taxid_col=args.taxid_col,
         default_taxid=args.default_taxid,
+        query_taxid=args.query_taxid,
         target_taxid=args.target_taxid,
         output_dir=output_dir,
         use_cache=not args.no_cache,
