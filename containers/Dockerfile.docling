@@ -1,0 +1,26 @@
+FROM nvidia/cuda:12.1.0-runtime-ubuntu22.04
+
+LABEL maintainer="gabe" \
+      description="GPU image for auto_lit_search: Docling v2 PDF-to-text + FastAPI server (slim)"
+
+RUN set -e && \
+    apt-get update && \
+    DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+        python3 python3-pip python3-venv git curl ca-certificates build-essential && \
+    apt-get clean && rm -rf /var/lib/apt/lists/*
+
+RUN python3 -m pip install --no-cache-dir --upgrade pip && \
+    python3 -m pip install --no-cache-dir \
+        docling \
+        loguru \
+        fastapi \
+        uvicorn[standard] \
+        requests
+
+ENV PYTHONUNBUFFERED=1
+
+WORKDIR /app
+
+# Repo code will be bind-mounted at runtime on the cluster; no COPY here by default.
+CMD ["bash", "-lc", "echo 'Use gpu_docling_node.slurm to start docling_server'"]
+
