@@ -166,11 +166,20 @@ def run(
                 session=session,
                 pmcid_cache=pmcid_cache,
                 no_cache=no_cache,
+                force_pdfs=bool(docling_url_base),
             )
-            with_text = [r for r in recs if r.text_path]
-            if not with_text:
-                logger.warning(f"Alignment {alignment_id}: no text extracted")
-                continue
+            has_text = any(r.text_path for r in recs)
+            has_pdf = any(r.pdf_path for r in recs)
+            if docling_url_base:
+                if not has_text and not has_pdf:
+                    logger.warning(
+                        f"Alignment {alignment_id}: no usable text and no PDFs downloaded"
+                    )
+                    continue
+            else:
+                if not has_text:
+                    logger.warning(f"Alignment {alignment_id}: no text extracted")
+                    continue
 
             gene_context: Dict[str, Any] | None = None
             # Prefer inline meta if present, otherwise fall back to ID map env.
@@ -211,23 +220,63 @@ def run(
                     "analysis_host": gpu_host,
                     "analysis_port": gpu_port,
                 }
+                if not has_pdf:
+                    logger.warning(
+                        f"Alignment {alignment_id}: no PDFs downloaded; falling back to GPU text mode"
+                    )
+                else:
+                    try:
+                        r = session.post(
+                            f"{docling_url_base}/convert_alignment",
+                            json=docling_payload,
+                            timeout=request_timeout,
+                        )
+                        r.raise_for_status()
+                        out = r.json()
+                        logger.info(
+                            f"Alignment {alignment_id}: docling_status={out.get('status')} "
+                            f"papers_dir={out.get('papers_dir')} results_path={out.get('results_path')}"
+                        )
+                        total += 1
+                        continue
+                    except requests.RequestException as e:
+                        logger.error(
+                            f"Alignment {alignment_id}: Docling request failed: {e}"
+                        )
+                        if not has_text:
+                            raise
+
+                # GPU fallback path (either no PDFs, or docling failed).
+                payload: Dict[str, Any] = {
+                    "alignment_id": alignment_id,
+                    "papers_dir": papers_dir,
+                    "query": query_id,
+                    "target_id": target,
+                    "constraints": {
+                        "max_tokens": max_tokens,
+                        "temperature": temperature,
+                    },
+                    "instructions": instructions_text
+                    or "Summarize relevance to the query and target.",
+                    "output_root": output_root,
+                }
+                if gene_context is not None:
+                    payload["gene_context"] = gene_context
+
                 try:
                     r = session.post(
-                        f"{docling_url_base}/convert_alignment",
-                        json=docling_payload,
+                        f"{gpu_url_base}/run_alignment",
+                        json=payload,
                         timeout=request_timeout,
                     )
                     r.raise_for_status()
                     out = r.json()
                     logger.info(
-                        f"Alignment {alignment_id}: docling_status={out.get('status')} "
-                        f"papers_dir={out.get('papers_dir')} results_path={out.get('results_path')}"
+                        f"Alignment {alignment_id}: {out.get('status')} -> {out.get('results_path')}"
                     )
                     total += 1
                 except requests.RequestException as e:
-                    logger.error(
-                        f"Alignment {alignment_id}: Docling request failed: {e}"
-                    )
+                    logger.error(f"Alignment {alignment_id}: GPU request failed: {e}")
                     raise
             else:
                 # Backward-compatible path: call LLM node directly with text already present.

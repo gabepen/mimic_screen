@@ -68,6 +68,34 @@ def _normalize_paper_id(pid: Any) -> Optional[str]:
     return s
 
 
+_EXCLUDED_PUBTYPE_SUBSTRINGS: List[str] = [
+    # Notices/corrections that are not the underlying research article.
+    "expression-of-concern",
+    "retraction",
+    "correction",
+    "erratum",
+    "corrigendum",
+    "withdrawn",
+    # Editorial-ish / non-research pieces.
+    "comment",
+    "editorial",
+    "letter",
+    "abstract",
+    "review",
+]
+
+
+def _pubtype_is_excluded(pubtypes: List[Any]) -> bool:
+    for pt in pubtypes:
+        norm = str(pt).strip().lower().replace(" ", "-")
+        if not norm:
+            continue
+        for sub in _EXCLUDED_PUBTYPE_SUBSTRINGS:
+            if sub in norm:
+                return True
+    return False
+
+
 def _resolve_to_pmcid(
     paper_id: str,
     session: requests.Session,
@@ -88,32 +116,36 @@ def _resolve_to_pmcid(
 
     pid = paper_id.strip()
     u = pid.upper()
+    search_query: str
 
-    # Already a PMC id.
+    # If the input is already a PMC id, still resolve it through the Europe PMC
+    # search API so we can filter out notices (e.g. expression of concern).
     if u.startswith("PMC:"):
         pmcid = u[4:].strip()
         pmcid = f"PMC{pmcid}" if not pmcid.upper().startswith("PMC") else pmcid
-        cache[paper_id] = pmcid
-        return pmcid
-    if u.startswith("PMC"):
-        cache[paper_id] = u
-        return u
-
-    # Try to resolve via EXT_ID search.
-    if u.startswith("PMID:"):
-        ext_id = u[5:].strip()
+        search_query = pmcid
+    elif u.startswith("PMC"):
+        search_query = u
     else:
-        ext_id = pid
+        # Try to resolve via EXT_ID search.
+        if u.startswith("PMID:"):
+            ext_id = u[5:].strip()
+        else:
+            ext_id = pid
+        search_query = f"EXT_ID:{ext_id}"
 
     time.sleep(delay)
     try:
         resp = session.get(
             EUROPEPMC_SEARCH_URL,
             params={
-                "query": f"EXT_ID:{ext_id}",
+                "query": search_query,
                 "format": "json",
                 "resultType": "core",
-                "pageSize": 1,
+                # Some DOIs map to multiple PMCID versions/records
+                # (e.g. notice + underlying research). We filter the results by
+                # pubTypeList to prefer real research articles.
+                "pageSize": 20,
             },
             timeout=30,
         )
@@ -125,20 +157,24 @@ def _resolve_to_pmcid(
         return None
 
     results = (data.get("resultList") or {}).get("result") or []
-    if not results:
-        cache[paper_id] = None
-        return None
-    rec = results[0]
-    pmcid = rec.get("pmcid")
-    if not pmcid:
-        cache[paper_id] = None
-        return None
+    for rec in results:
+        pmcid = rec.get("pmcid")
+        if not pmcid:
+            continue
 
-    pmcid = str(pmcid).strip()
-    if not pmcid.upper().startswith("PMC"):
-        pmcid = f"PMC{pmcid}"
-    cache[paper_id] = pmcid
-    return pmcid
+        pubtypes = (rec.get("pubTypeList") or {}).get("pubType") or []
+        if pubtypes and _pubtype_is_excluded(pubtypes):
+            logger.debug(f"Skipping non-research pubType={pubtypes} for {paper_id} -> {pmcid}")
+            continue
+
+        pmcid = str(pmcid).strip()
+        if not pmcid.upper().startswith("PMC"):
+            pmcid = f"PMC{pmcid}"
+        cache[paper_id] = pmcid
+        return pmcid
+
+    cache[paper_id] = None
+    return None
 
 
 def _fetch_fulltext_pdf(
@@ -267,6 +303,7 @@ def download_papers_to_dir(
     session: Optional[requests.Session] = None,
     pmcid_cache: Optional[Dict[str, Optional[str]]] = None,
     no_cache: bool = False,
+    force_pdfs: bool = False,
 ) -> List[DownloadRecord]:
     """
     Download full-text for a list of (paper_id, source) into output_dir.
@@ -300,23 +337,15 @@ def download_papers_to_dir(
         pdf_path = None
         text_path = None
         safe = pmcid.replace("/", "_").replace(":", "_")
+
+        # If cached text exists and caching is allowed, use it as a quick path.
+        # When force_pdfs=True we still prefer PDFs for downstream Docling.
         if not no_cache:
             candidate_text = os.path.join(text_dir, f"{safe}.txt")
             if os.path.exists(candidate_text) and os.path.getsize(candidate_text) > 0:
                 text_path = candidate_text
-                records.append(
-                    DownloadRecord(
-                        paper_id=paper_id,
-                        source=source,
-                        pmcid=pmcid,
-                        pdf_path=None,
-                        text_path=text_path,
-                        status="ok",
-                        message=None,
-                    )
-                )
-                continue
 
+        # XML extraction is used as a fallback text source (but may be noisy).
         if not text_path:
             xml_path = _fetch_fulltext_xml(pmcid, session, xml_dir)
             if xml_path:
@@ -325,16 +354,19 @@ def download_papers_to_dir(
                     text_path = os.path.join(text_dir, f"{safe}.txt")
                     with open(text_path, "w", encoding="utf-8", errors="replace") as f:
                         f.write(extracted)
-            if not text_path:
-                pdf_path = _fetch_fulltext_pdf(pmcid, session, pdf_dir)
-                if pdf_path:
-                    extracted = _extract_text_from_pdf(pdf_path)
-                    if extracted.strip():
-                        text_path = os.path.join(text_dir, f"{safe}.txt")
-                        with open(
-                            text_path, "w", encoding="utf-8", errors="replace"
-                        ) as f:
-                            f.write(extracted)
+
+        # PDF fetching is either the normal "no text" path, or always when
+        # force_pdfs=True (so Docling can convert PDFs reliably).
+        if force_pdfs or not text_path:
+            pdf_path = _fetch_fulltext_pdf(pmcid, session, pdf_dir)
+
+            # Only extract PDF text if we still don't have any text_path.
+            if pdf_path and not text_path:
+                extracted = _extract_text_from_pdf(pdf_path)
+                if extracted.strip():
+                    text_path = os.path.join(text_dir, f"{safe}.txt")
+                    with open(text_path, "w", encoding="utf-8", errors="replace") as f:
+                        f.write(extracted)
 
         status = "ok" if text_path else ("partial" if pdf_path else "failed")
         records.append(
