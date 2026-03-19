@@ -182,6 +182,7 @@ def _fetch_fulltext_pdf(
     session: requests.Session,
     pdf_dir: str,
     timeout: int = 120,
+    file_stem: Optional[str] = None,
 ) -> Optional[str]:
     """
     Download full-text PDF for a given PMCID from Europe PMC, if available.
@@ -189,8 +190,8 @@ def _fetch_fulltext_pdf(
     Saves to pdf_dir and returns local path, or None if not available.
     """
     os.makedirs(pdf_dir, exist_ok=True)
-    safe = pmcid.replace("/", "_").replace(":", "_")
-    out_path = os.path.join(pdf_dir, f"{safe}.pdf")
+    stem = file_stem or pmcid.replace("/", "_").replace(":", "_")
+    out_path = os.path.join(pdf_dir, f"{stem}.pdf")
     if os.path.exists(out_path) and os.path.getsize(out_path) > 0:
         logger.debug(f"PDF cache hit: {out_path}")
         return out_path
@@ -203,13 +204,17 @@ def _fetch_fulltext_pdf(
         # Some responses may be HTML if PDF is not available.
         resp.raise_for_status()
         content_type = resp.headers.get("Content-Type", "").lower()
-        if "pdf" not in content_type:
+        # Europe PMC sometimes returns PDFs with a non-standard/misleading
+        # Content-Type header, so also detect by magic header.
+        content_bytes = resp.content or b""
+        is_pdf_by_magic = content_bytes.startswith(b"%PDF")
+        if (("pdf" not in content_type) and not is_pdf_by_magic):
             logger.debug(
                 f"PDF not available for {pmcid} (content-type={content_type!r})"
             )
             return None
         with open(out_path, "wb") as f:
-            f.write(resp.content)
+            f.write(content_bytes)
         return out_path
     except Exception as e:
         logger.debug(f"PDF fetch failed for {pmcid}: {e}")
@@ -221,6 +226,7 @@ def _fetch_fulltext_xml(
     session: requests.Session,
     xml_dir: str,
     timeout: int = 120,
+    file_stem: Optional[str] = None,
 ) -> Optional[str]:
     """
     Download full-text XML for a given PMCID from Europe PMC, if available.
@@ -228,8 +234,8 @@ def _fetch_fulltext_xml(
     Saves to xml_dir and returns local path, or None if not available.
     """
     os.makedirs(xml_dir, exist_ok=True)
-    safe = pmcid.replace("/", "_").replace(":", "_")
-    out_path = os.path.join(xml_dir, f"{safe}.xml")
+    stem = file_stem or pmcid.replace("/", "_").replace(":", "_")
+    out_path = os.path.join(xml_dir, f"{stem}.xml")
     if os.path.exists(out_path) and os.path.getsize(out_path) > 0:
         logger.debug(f"XML cache hit: {out_path}")
         return out_path
@@ -304,6 +310,7 @@ def download_papers_to_dir(
     pmcid_cache: Optional[Dict[str, Optional[str]]] = None,
     no_cache: bool = False,
     force_pdfs: bool = False,
+    prefer_pdf_text: bool = False,
 ) -> List[DownloadRecord]:
     """
     Download full-text for a list of (paper_id, source) into output_dir.
@@ -336,7 +343,13 @@ def download_papers_to_dir(
 
         pdf_path = None
         text_path = None
-        safe = pmcid.replace("/", "_").replace(":", "_")
+        # Keep query/target evidence separate (and label it in the filename).
+        safe = (
+            f"{pmcid}__{source}"
+            .replace("/", "_")
+            .replace(":", "_")
+            .replace(" ", "_")
+        )
 
         # If cached text exists and caching is allowed, use it as a quick path.
         # When force_pdfs=True we still prefer PDFs for downstream Docling.
@@ -347,7 +360,9 @@ def download_papers_to_dir(
 
         # XML extraction is used as a fallback text source (but may be noisy).
         if not text_path:
-            xml_path = _fetch_fulltext_xml(pmcid, session, xml_dir)
+            xml_path = _fetch_fulltext_xml(
+                pmcid, session, xml_dir, file_stem=safe
+            )
             if xml_path:
                 extracted = _extract_text_from_xml(xml_path)
                 if extracted.strip():
@@ -358,10 +373,12 @@ def download_papers_to_dir(
         # PDF fetching is either the normal "no text" path, or always when
         # force_pdfs=True (so Docling can convert PDFs reliably).
         if force_pdfs or not text_path:
-            pdf_path = _fetch_fulltext_pdf(pmcid, session, pdf_dir)
+            pdf_path = _fetch_fulltext_pdf(
+                pmcid, session, pdf_dir, file_stem=safe
+            )
 
             # Only extract PDF text if we still don't have any text_path.
-            if pdf_path and not text_path:
+            if pdf_path and (prefer_pdf_text or not text_path):
                 extracted = _extract_text_from_pdf(pdf_path)
                 if extracted.strip():
                     text_path = os.path.join(text_dir, f"{safe}.txt")

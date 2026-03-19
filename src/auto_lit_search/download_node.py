@@ -167,9 +167,18 @@ def run(
                 pmcid_cache=pmcid_cache,
                 no_cache=no_cache,
                 force_pdfs=bool(docling_url_base),
+                prefer_pdf_text=bool(docling_url_base),
             )
             has_text = any(r.text_path for r in recs)
             has_pdf = any(r.pdf_path for r in recs)
+            n_text = sum(1 for r in recs if r.text_path)
+            n_pdf = sum(1 for r in recs if r.pdf_path)
+            n_ok = sum(1 for r in recs if r.status == "ok")
+            n_failed = sum(1 for r in recs if r.status == "failed")
+            logger.info(
+                f"Alignment {alignment_id}: downloaded_papers={len(recs)} "
+                f"text_files={n_text} pdf_files={n_pdf} ok={n_ok} failed={n_failed}"
+            )
             if docling_url_base:
                 if not has_text and not has_pdf:
                     logger.warning(
@@ -214,7 +223,11 @@ def run(
                         "temperature": temperature,
                     },
                     "instructions": instructions_text
-                    or "Summarize relevance to the query and target.",
+                    or (
+                        "Analyze the paper excerpt for relevance to the genes in this alignment. "
+                        "First give a brief justification (2-4 sentences). "
+                        "Then output a single line: relevance_score=<float between 0 and 1>."
+                    ),
                     "output_root": output_root,
                     "gene_context": gene_context,
                     "analysis_host": gpu_host,
@@ -243,8 +256,20 @@ def run(
                         logger.error(
                             f"Alignment {alignment_id}: Docling request failed: {e}"
                         )
+                        resp = getattr(e, "response", None)
+                        if resp is not None:
+                            try:
+                                logger.error(
+                                    f"Alignment {alignment_id}: Docling response: {resp.text[:800]}"
+                                )
+                            except Exception:
+                                pass
                         if not has_text:
-                            raise
+                            # Can't do GPU text-mode without any .txt files.
+                            logger.warning(
+                                f"Alignment {alignment_id}: no text available for GPU fallback; skipping"
+                            )
+                            continue
 
                 # GPU fallback path (either no PDFs, or docling failed).
                 payload: Dict[str, Any] = {
@@ -257,7 +282,11 @@ def run(
                         "temperature": temperature,
                     },
                     "instructions": instructions_text
-                    or "Summarize relevance to the query and target.",
+                    or (
+                        "Analyze the paper excerpt for relevance to the genes in this alignment. "
+                        "First give a brief justification (2-4 sentences). "
+                        "Then output a single line: relevance_score=<float between 0 and 1>."
+                    ),
                     "output_root": output_root,
                 }
                 if gene_context is not None:
