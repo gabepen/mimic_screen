@@ -23,6 +23,8 @@ import requests
 from loguru import logger
 
 from ucsc_paper_collection_tools import (
+    get_arxiv_pdf_url,
+    get_semantic_scholar_pdf_url,
     get_unpaywall_pdf_url,
     is_ucsc_email,
 )
@@ -50,6 +52,7 @@ class DownloadRecord:
     text_path: Optional[str]
     status: str
     message: Optional[str] = None
+    details: Optional[Dict[str, Any]] = None
 
 
 @dataclass
@@ -97,33 +100,22 @@ class UCSCEmailOnlyProvider(BaseCollectionProvider):
     def resolve_and_fetch(
         self, paper_id: str, source: str, context: CollectionContext
     ) -> DownloadRecord:
-        pmcid = _resolve_to_pmcid(paper_id, context.session, context.pmcid_cache)
-        if not pmcid:
-            doi = _extract_doi_from_identifier(paper_id)
-            unpaywall_url = (
-                get_unpaywall_pdf_url(doi, self.collector_email, context.session)
-                if doi
-                else None
-            )
-            msg = (
-                f"no PMCID / no Europe PMC full text; unpaywall_url={unpaywall_url}"
-                if unpaywall_url
-                else "no PMCID / no full text in Europe PMC"
-            )
-            return DownloadRecord(
-                paper_id=paper_id,
-                source=source,
-                pmcid=None,
-                pdf_path=None,
-                text_path=None,
-                status="skipped",
-                message=msg,
-            )
+        doi = _extract_doi_from_identifier(paper_id)
+        title = _extract_title_from_identifier(paper_id)
+        source_attempts: Dict[str, Dict[str, Any]] = {
+            "europe_pmc": {"attempted": True, "success": False, "artifact": None, "error": None},
+            "unpaywall": {"attempted": bool(doi), "success": False, "artifact": None, "error": None},
+            "arxiv": {"attempted": bool(doi or title), "success": False, "artifact": None, "error": None},
+            "semantic_scholar": {"attempted": bool(doi or title), "success": False, "artifact": None, "error": None},
+        }
 
-        pdf_path = None
-        text_path = None
+        pmcid = _resolve_to_pmcid(paper_id, context.session, context.pmcid_cache)
+        xml_text = ""
+        xml_path: Optional[str] = None
+        pdf_path: Optional[str] = None
+        text_path: Optional[str] = None
         safe = (
-            f"{pmcid}__{source}"
+            f"{(pmcid or paper_id)}__{source}"
             .replace("/", "_")
             .replace(":", "_")
             .replace(" ", "_")
@@ -137,30 +129,97 @@ class UCSCEmailOnlyProvider(BaseCollectionProvider):
             if os.path.exists(candidate_text) and os.path.getsize(candidate_text) > 0:
                 text_path = candidate_text
 
-        if not text_path:
+        if pmcid and not text_path:
             xml_path = _fetch_fulltext_xml(
                 pmcid, context.session, context.xml_dir, file_stem=safe
             )
             if xml_path:
-                extracted = _extract_text_from_xml(xml_path)
-                if extracted.strip():
-                    text_path = os.path.join(context.text_dir, f"{safe}.txt")
-                    with open(text_path, "w", encoding="utf-8", errors="replace") as f:
-                        f.write(extracted)
+                xml_text = _extract_text_from_xml(xml_path)
+            source_attempts["europe_pmc"]["success"] = bool(xml_path)
+            source_attempts["europe_pmc"]["artifact"] = (
+                "xml" if xml_path else None
+            )
 
-        if context.force_pdfs or not text_path:
-            pdf_path = pdf_path or _fetch_fulltext_pdf(
+        if pmcid and (context.force_pdfs or not text_path):
+            epmc_pdf = _fetch_fulltext_pdf(
                 pmcid, context.session, context.pdf_dir, file_stem=safe
             )
-            if pdf_path and (context.prefer_pdf_text or not text_path):
-                extracted = _extract_text_from_pdf(pdf_path)
-                if extracted.strip():
-                    text_path = os.path.join(context.text_dir, f"{safe}.txt")
-                    with open(text_path, "w", encoding="utf-8", errors="replace") as f:
-                        f.write(extracted)
+            if epmc_pdf:
+                pdf_path = epmc_pdf
+                source_attempts["europe_pmc"]["success"] = True
+                source_attempts["europe_pmc"]["artifact"] = "pdf"
+
+        unpaywall_url = get_unpaywall_pdf_url(doi, self.collector_email, context.session) if doi else None
+        if unpaywall_url:
+            source_attempts["unpaywall"]["artifact"] = "url"
+            up_pdf = _download_pdf_from_url(
+                unpaywall_url, context.session, context.pdf_dir, f"{safe}__unpaywall"
+            )
+            if up_pdf:
+                source_attempts["unpaywall"]["success"] = True
+                source_attempts["unpaywall"]["artifact"] = "pdf"
+                pdf_path = pdf_path or up_pdf
+
+        arxiv_url = get_arxiv_pdf_url(doi, title, context.session)
+        if arxiv_url:
+            source_attempts["arxiv"]["artifact"] = "url"
+            arxiv_pdf = _download_pdf_from_url(
+                arxiv_url, context.session, context.pdf_dir, f"{safe}__arxiv"
+            )
+            if arxiv_pdf:
+                source_attempts["arxiv"]["success"] = True
+                source_attempts["arxiv"]["artifact"] = "pdf"
+                pdf_path = pdf_path or arxiv_pdf
+
+        s2_url = get_semantic_scholar_pdf_url(doi, title, context.session)
+        if s2_url:
+            source_attempts["semantic_scholar"]["artifact"] = "url"
+            s2_pdf = _download_pdf_from_url(
+                s2_url, context.session, context.pdf_dir, f"{safe}__semantic_scholar"
+            )
+            if s2_pdf:
+                source_attempts["semantic_scholar"]["success"] = True
+                source_attempts["semantic_scholar"]["artifact"] = "pdf"
+                pdf_path = pdf_path or s2_pdf
+
+        xml_stats = _xml_quality_stats(xml_text)
+        xml_pass = bool(xml_stats["quality_pass"])
+        selected_text_source = "none"
+        pdf_docling_required = False
+
+        if xml_pass and xml_text.strip():
+            text_path = os.path.join(context.text_dir, f"{safe}.txt")
+            with open(text_path, "w", encoding="utf-8", errors="replace") as f:
+                f.write(xml_text)
+            selected_text_source = "xml"
+        elif pdf_path:
+            # XML didn't pass minimum quality; leave conversion for Docling stage.
+            selected_text_source = "docling_pdf"
+            pdf_docling_required = True
+        elif text_path:
+            selected_text_source = "cached_text"
+
+        if text_path is None and pdf_path and not pdf_docling_required:
+            extracted = _extract_text_from_pdf(pdf_path)
+            if extracted.strip():
+                text_path = os.path.join(context.text_dir, f"{safe}.txt")
+                with open(text_path, "w", encoding="utf-8", errors="replace") as f:
+                    f.write(extracted)
+                selected_text_source = "pdf_extract"
 
         status = "ok" if text_path else ("partial" if pdf_path else "failed")
+        successful_sources = sorted(
+            [k for k, v in source_attempts.items() if v.get("success")]
+        )
+        overlap_pairs: List[str] = []
+        for i in range(len(successful_sources)):
+            for j in range(i + 1, len(successful_sources)):
+                overlap_pairs.append(
+                    f"{successful_sources[i]}__{successful_sources[j]}"
+                )
         message = None if text_path else "no text extracted"
+        if pdf_docling_required:
+            message = "xml below quality threshold; docling conversion required"
 
         if context.delete_pdf_after_text and pdf_path and text_path:
             try:
@@ -177,6 +236,20 @@ class UCSCEmailOnlyProvider(BaseCollectionProvider):
             text_path=text_path,
             status=status,
             message=message,
+            details={
+                "source_attempts": source_attempts,
+                "successful_sources": successful_sources,
+                "n_successful_sources": len(successful_sources),
+                "source_overlap_pairs": overlap_pairs,
+                "xml_stats": xml_stats,
+                "xml_path": xml_path,
+                "selected_text_source": selected_text_source,
+                "pdf_docling_required": pdf_docling_required,
+                "doi": doi,
+                "unpaywall_url": unpaywall_url,
+                "arxiv_url": arxiv_url,
+                "semantic_scholar_url": s2_url,
+            },
         )
 
 
@@ -189,6 +262,84 @@ def _extract_doi_from_identifier(paper_id: str) -> Optional[str]:
     if pid.startswith("10."):
         return pid
     return None
+
+
+def _extract_title_from_identifier(paper_id: str) -> Optional[str]:
+    # Placeholder: collect currently receives IDs only from search output.
+    return None
+
+
+def _download_pdf_from_url(
+    pdf_url: str,
+    session: requests.Session,
+    pdf_dir: str,
+    file_stem: str,
+    timeout: int = 120,
+) -> Optional[str]:
+    os.makedirs(pdf_dir, exist_ok=True)
+    out_path = os.path.join(pdf_dir, f"{file_stem}.pdf")
+    if os.path.exists(out_path) and os.path.getsize(out_path) > 0:
+        return out_path
+    try:
+        resp = session.get(pdf_url, timeout=timeout, headers={"Connection": "close"})
+        resp.raise_for_status()
+        content = resp.content or b""
+        ctype = (resp.headers.get("Content-Type") or "").lower()
+        if (not content.startswith(b"%PDF")) and ("pdf" not in ctype):
+            return None
+        with open(out_path, "wb") as f:
+            f.write(content)
+        return out_path
+    except Exception as e:
+        logger.debug(f"PDF download failed from url={pdf_url!r}: {e}")
+        return None
+
+
+def _xml_quality_stats(text: str) -> Dict[str, Any]:
+    cleaned = (text or "").strip()
+    if not cleaned:
+        return {
+            "char_count": 0,
+            "line_count": 0,
+            "section_hits": 0,
+            "noise_ratio": 1.0,
+            "quality_score": 0.0,
+            "quality_pass": False,
+        }
+    lower = cleaned.lower()
+    section_keywords = [
+        "abstract",
+        "introduction",
+        "method",
+        "result",
+        "discussion",
+        "conclusion",
+    ]
+    noise_keywords = [
+        "expression of concern",
+        "retraction",
+        "copyright",
+        "rights reserved",
+    ]
+    section_hits = sum(1 for k in section_keywords if k in lower)
+    noise_hits = sum(1 for k in noise_keywords if k in lower)
+    char_count = len(cleaned)
+    line_count = cleaned.count("\n") + 1
+    noise_ratio = min(1.0, noise_hits / max(1, section_hits + noise_hits))
+    score = (
+        min(1.0, char_count / 15000.0) * 0.5
+        + min(1.0, section_hits / 4.0) * 0.35
+        + max(0.0, 1.0 - noise_ratio) * 0.15
+    )
+    quality_pass = (char_count >= 2500) and (section_hits >= 2) and (noise_ratio < 0.7)
+    return {
+        "char_count": char_count,
+        "line_count": line_count,
+        "section_hits": section_hits,
+        "noise_ratio": round(noise_ratio, 4),
+        "quality_score": round(score, 4),
+        "quality_pass": bool(quality_pass),
+    }
 
 
 def _build_collection_provider(
@@ -701,6 +852,7 @@ def run(
                 "text_path",
                 "status",
                 "message",
+                "details",
             ]
         )
 
@@ -768,6 +920,7 @@ def run(
                                 "pdf_path": rec.pdf_path,
                                 "text_path": rec.text_path,
                                 "status": rec.status,
+                                "details": rec.details or {},
                             }
                         )
                         + "\n"
@@ -781,6 +934,23 @@ def run(
 
     for idx, (paper_id, source) in enumerate(paper_items, start=1):
         rec = provider.resolve_and_fetch(paper_id, source, context)
+        d = rec.details or {}
+        xml_stats = d.get("xml_stats") or {}
+        logger.debug(
+            json.dumps(
+                {
+                    "event": "paper_eval",
+                    "paper_id": rec.paper_id,
+                    "role": rec.source,
+                    "status": rec.status,
+                    "selected_text_source": d.get("selected_text_source"),
+                    "pdf_docling_required": d.get("pdf_docling_required"),
+                    "successful_sources": d.get("successful_sources", []),
+                    "xml_stats": xml_stats,
+                },
+                ensure_ascii=False,
+            )
+        )
         records.append(rec)
         batch.append(rec)
 
@@ -805,6 +975,7 @@ def run(
                 "text_path": r.text_path,
                 "status": r.status,
                 "message": r.message,
+                "details": r.details or {},
             }
             for r in records
         ]
@@ -815,6 +986,70 @@ def run(
         f"Collect (download): {n_ok}/{len(out_df)} papers with extracted text "
         f"({data_root})"
     )
+    for role in ("query", "target"):
+        role_rows = out_df[out_df["source"] == role] if not out_df.empty else out_df
+        if role_rows.empty:
+            continue
+        source_success_counts: Dict[str, int] = {
+            "europe_pmc": 0,
+            "unpaywall": 0,
+            "arxiv": 0,
+            "semantic_scholar": 0,
+        }
+        xml_pass_n = 0
+        docling_required_n = 0
+        for _, rr in role_rows.iterrows():
+            details = rr.get("details") or {}
+            attempts = details.get("source_attempts") or {}
+            for sname in source_success_counts:
+                if (attempts.get(sname) or {}).get("success"):
+                    source_success_counts[sname] += 1
+            if (details.get("xml_stats") or {}).get("quality_pass"):
+                xml_pass_n += 1
+            if details.get("pdf_docling_required"):
+                docling_required_n += 1
+        logger.info(
+            f"Collect summary role={role}: n={len(role_rows)} "
+            f"source_success={source_success_counts} "
+            f"xml_quality_pass={xml_pass_n} "
+            f"docling_required={docling_required_n}"
+        )
+    try:
+        summary_by_role: Dict[str, Any] = {}
+        for role in ("query", "target"):
+            role_rows = out_df[out_df["source"] == role] if not out_df.empty else out_df
+            if role_rows.empty:
+                continue
+            source_success_counts: Dict[str, int] = {
+                "europe_pmc": 0,
+                "unpaywall": 0,
+                "arxiv": 0,
+                "semantic_scholar": 0,
+            }
+            xml_pass_n = 0
+            docling_required_n = 0
+            for _, rr in role_rows.iterrows():
+                details = rr.get("details") or {}
+                attempts = details.get("source_attempts") or {}
+                for sname in source_success_counts:
+                    if (attempts.get(sname) or {}).get("success"):
+                        source_success_counts[sname] += 1
+                if (details.get("xml_stats") or {}).get("quality_pass"):
+                    xml_pass_n += 1
+                if details.get("pdf_docling_required"):
+                    docling_required_n += 1
+            summary_by_role[role] = {
+                "n_papers": int(len(role_rows)),
+                "source_success_counts": source_success_counts,
+                "xml_quality_pass_n": int(xml_pass_n),
+                "docling_required_n": int(docling_required_n),
+            }
+        summary_path = os.path.join(logs_dir, "collect_source_eval_summary.json")
+        with open(summary_path, "w", encoding="utf-8") as f:
+            json.dump(summary_by_role, f, indent=2)
+        logger.info(f"Wrote source evaluation summary: {summary_path}")
+    except Exception as e:
+        logger.warning(f"Could not write source evaluation summary: {e}")
     return out_df
 
 
