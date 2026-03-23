@@ -659,6 +659,10 @@ def download_papers_to_dir(
     no_cache: bool = False,
     force_pdfs: bool = False,
     prefer_pdf_text: bool = False,
+    collection_org: str = "ucsc",
+    auth_scope: str = "email_only",
+    collector_email: Optional[str] = None,
+    delete_pdf_after_text: bool = False,
 ) -> List[DownloadRecord]:
     """
     Download full-text for a list of (paper_id, source) into output_dir.
@@ -672,79 +676,32 @@ def download_papers_to_dir(
     xml_dir = os.path.join(output_dir, "text_xml")
     text_dir = output_dir
 
+    env_org = os.environ.get("COLLECTION_ORG", "").strip()
+    env_scope = os.environ.get("COLLECTION_AUTH_SCOPE", "").strip()
+    env_email = os.environ.get("COLLECTOR_EMAIL", "").strip()
+    selected_org = env_org or collection_org
+    selected_scope = env_scope or auth_scope
+    selected_email = env_email or (collector_email or "")
+
+    provider = _build_collection_provider(
+        collection_org=selected_org,
+        auth_scope=selected_scope,
+        collector_email=selected_email or None,
+    )
+    context = CollectionContext(
+        session=session,
+        pmcid_cache=pmcid_cache,
+        pdf_dir=pdf_dir,
+        text_dir=text_dir,
+        xml_dir=xml_dir,
+        no_cache=no_cache,
+        delete_pdf_after_text=delete_pdf_after_text,
+        force_pdfs=force_pdfs,
+        prefer_pdf_text=prefer_pdf_text,
+    )
     records: List[DownloadRecord] = []
     for paper_id, source in paper_ids_with_source:
-        pmcid = _resolve_to_pmcid(paper_id, session, pmcid_cache)
-        if not pmcid:
-            records.append(
-                DownloadRecord(
-                    paper_id=paper_id,
-                    source=source,
-                    pmcid=None,
-                    pdf_path=None,
-                    text_path=None,
-                    status="skipped",
-                    message="no PMCID",
-                )
-            )
-            continue
-
-        pdf_path = None
-        text_path = None
-        # Keep query/target evidence separate (and label it in the filename).
-        safe = (
-            f"{pmcid}__{source}"
-            .replace("/", "_")
-            .replace(":", "_")
-            .replace(" ", "_")
-        )
-
-        # If cached text exists and caching is allowed, use it as a quick path.
-        # When force_pdfs=True we still prefer PDFs for downstream Docling.
-        if not no_cache:
-            candidate_text = os.path.join(text_dir, f"{safe}.txt")
-            if os.path.exists(candidate_text) and os.path.getsize(candidate_text) > 0:
-                text_path = candidate_text
-
-        # XML extraction is used as a fallback text source (but may be noisy).
-        if not text_path:
-            xml_path = _fetch_fulltext_xml(
-                pmcid, session, xml_dir, file_stem=safe
-            )
-            if xml_path:
-                extracted = _extract_text_from_xml(xml_path)
-                if extracted.strip():
-                    text_path = os.path.join(text_dir, f"{safe}.txt")
-                    with open(text_path, "w", encoding="utf-8", errors="replace") as f:
-                        f.write(extracted)
-
-        # PDF fetching is either the normal "no text" path, or always when
-        # force_pdfs=True (so Docling can convert PDFs reliably).
-        if force_pdfs or not text_path:
-            pdf_path = _fetch_fulltext_pdf(
-                pmcid, session, pdf_dir, file_stem=safe
-            )
-
-            # Only extract PDF text if we still don't have any text_path.
-            if pdf_path and (prefer_pdf_text or not text_path):
-                extracted = _extract_text_from_pdf(pdf_path)
-                if extracted.strip():
-                    text_path = os.path.join(text_dir, f"{safe}.txt")
-                    with open(text_path, "w", encoding="utf-8", errors="replace") as f:
-                        f.write(extracted)
-
-        status = "ok" if text_path else ("partial" if pdf_path else "failed")
-        records.append(
-            DownloadRecord(
-                paper_id=paper_id,
-                source=source,
-                pmcid=pmcid,
-                pdf_path=pdf_path,
-                text_path=text_path,
-                status=status,
-                message=None if text_path else "no text extracted",
-            )
-        )
+        records.append(provider.resolve_and_fetch(paper_id, source, context))
     return records
 
 

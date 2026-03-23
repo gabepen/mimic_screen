@@ -39,6 +39,7 @@ def _scontrol_show_job(job_id: str) -> str:
 
 
 def _get_node_name(job_id: str, max_wait: int = 12 * 60 * 60) -> str | None:
+    invalid_nodes = {"", "none", "(null)", "null", "n/a", "unknown"}
     start = time.monotonic()
     while time.monotonic() - start < max_wait:
         try:
@@ -46,7 +47,7 @@ def _get_node_name(job_id: str, max_wait: int = 12 * 60 * 60) -> str | None:
             for line in raw.splitlines():
                 if line.strip().startswith("NodeList="):
                     node = line.split("=", 1)[1].strip()
-                    if node and node != "None":
+                    if node and node.lower() not in invalid_nodes:
                         return node
             st = subprocess.run(
                 ["squeue", "-j", job_id, "-h", "-o", "%T"],
@@ -134,6 +135,22 @@ def main() -> int:
         "--idmap-csv",
         default="",
         help="Path to id mapping CSV (query/target identifiers for prompts)",
+    )
+    p.add_argument(
+        "--collection-org",
+        default=os.environ.get("COLLECTION_ORG", "ucsc"),
+        help="Collection org routing key (default: %(default)s).",
+    )
+    p.add_argument(
+        "--collection-auth-scope",
+        default=os.environ.get("COLLECTION_AUTH_SCOPE", "email_only"),
+        choices=["email_only", "email_password"],
+        help="Collection auth scope (default: %(default)s).",
+    )
+    p.add_argument(
+        "--collector-email",
+        default=os.environ.get("COLLECTOR_EMAIL", ""),
+        help="Collector identity email (required for UCSC email_only mode).",
     )
     p.add_argument(
         "--no-wait",
@@ -237,6 +254,17 @@ def main() -> int:
             "submitting CPU job manually."
         )
 
+    if (
+        args.collection_org.strip().lower() == "ucsc"
+        and args.collection_auth_scope.strip().lower() == "email_only"
+        and not args.collector_email.strip()
+    ):
+        print(
+            "COLLECTOR_EMAIL is required for UCSC email_only collection mode.",
+            file=sys.stderr,
+        )
+        return 2
+
     cpu_env = {
         "DATA_ROOT": args.data_root,
         "PAPER_IDS_PATH": os.path.abspath(args.paper_ids),
@@ -247,6 +275,9 @@ def main() -> int:
         "GPU_HOST": gpu_host or "",
         "DOCLING_HOST": docling_host or "",
         "DOCLING_API_PORT": str(args.docling_port),
+        "COLLECTION_ORG": args.collection_org,
+        "COLLECTION_AUTH_SCOPE": args.collection_auth_scope,
+        "COLLECTOR_EMAIL": args.collector_email,
     }
     if args.instructions_file and os.path.isfile(args.instructions_file):
         cpu_env["INSTRUCTIONS_FILE"] = os.path.abspath(args.instructions_file)
@@ -272,6 +303,9 @@ def main() -> int:
             f"GPU_API_PORT={args.gpu_port},"
             f"DOCLING_HOST=<DOCLING_NODELIST>,"
             f"DOCLING_API_PORT={args.docling_port},"
+            f"COLLECTION_ORG={args.collection_org},"
+            f"COLLECTION_AUTH_SCOPE={args.collection_auth_scope},"
+            f"COLLECTOR_EMAIL={args.collector_email},"
             f"CPU_IMAGE={cpu_image},"
             f"REPO_ROOT={repo_root}"
         )
@@ -279,7 +313,10 @@ def main() -> int:
             export_str += f",INSTRUCTIONS_FILE={os.path.abspath(args.instructions_file)}"
         if args.idmap_csv:
             export_str += f",IDMAP_CSV={os.path.abspath(args.idmap_csv)}"
-        print(f"  sbatch --dependency=afterok:{gpu_job_id} --export=ALL,{export_str} {cpu_script}")
+        print(
+            f"  sbatch --dependency=afterok:{gpu_job_id}:{docling_job_id} "
+            f"--export=ALL,{export_str} {cpu_script}"
+        )
 
     return 0
 

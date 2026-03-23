@@ -133,6 +133,27 @@ def run(
             instructions_text = f.read().strip()
 
     data = _load_search_json(paper_ids_path)
+    collection_org = os.environ.get("COLLECTION_ORG", "ucsc").strip() or "ucsc"
+    collection_auth_scope = (
+        os.environ.get("COLLECTION_AUTH_SCOPE", "email_only").strip() or "email_only"
+    )
+    collector_email = os.environ.get("COLLECTOR_EMAIL", "").strip()
+    if (
+        collection_org.lower() == "ucsc"
+        and collection_auth_scope.lower() == "email_only"
+        and not collector_email
+    ):
+        raise RuntimeError(
+            "COLLECTOR_EMAIL is required for UCSC email_only collection mode."
+        )
+
+    logger.info(
+        "Collection mode org={} scope={} collector_email_set={}",
+        collection_org,
+        collection_auth_scope,
+        "yes" if bool(collector_email) else "no",
+    )
+
     # Optional: mapping CSV for richer gene identifiers; provided via env.
     idmap_path = os.environ.get("IDMAP_CSV", "")
     idmap: Dict[str, Dict[str, Any]] = {}
@@ -168,6 +189,9 @@ def run(
                 no_cache=no_cache,
                 force_pdfs=True,
                 prefer_pdf_text=False,
+                collection_org=collection_org,
+                auth_scope=collection_auth_scope,
+                collector_email=collector_email or None,
             )
             has_text = any(r.text_path for r in recs)
             has_pdf = any(r.pdf_path for r in recs)
