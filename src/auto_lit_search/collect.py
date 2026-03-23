@@ -22,6 +22,11 @@ import pandas as pd
 import requests
 from loguru import logger
 
+from ucsc_paper_collection_tools import (
+    get_unpaywall_pdf_url,
+    is_ucsc_email,
+)
+
 
 logger.remove()
 logger.add(
@@ -45,6 +50,169 @@ class DownloadRecord:
     text_path: Optional[str]
     status: str
     message: Optional[str] = None
+
+
+@dataclass
+class CollectionContext:
+    session: requests.Session
+    pmcid_cache: Dict[str, Optional[str]]
+    pdf_dir: str
+    text_dir: str
+    xml_dir: str
+    no_cache: bool = False
+    delete_pdf_after_text: bool = False
+    force_pdfs: bool = True
+    prefer_pdf_text: bool = True
+
+
+class BaseCollectionProvider:
+    def resolve_and_fetch(
+        self, paper_id: str, source: str, context: CollectionContext
+    ) -> DownloadRecord:
+        raise NotImplementedError
+
+
+class NotImplementedScopeProvider(BaseCollectionProvider):
+    def __init__(self, reason: str):
+        self.reason = reason
+
+    def resolve_and_fetch(
+        self, paper_id: str, source: str, context: CollectionContext
+    ) -> DownloadRecord:
+        return DownloadRecord(
+            paper_id=paper_id,
+            source=source,
+            pmcid=None,
+            pdf_path=None,
+            text_path=None,
+            status="skipped",
+            message=self.reason,
+        )
+
+
+class UCSCEmailOnlyProvider(BaseCollectionProvider):
+    def __init__(self, collector_email: str):
+        self.collector_email = collector_email
+
+    def resolve_and_fetch(
+        self, paper_id: str, source: str, context: CollectionContext
+    ) -> DownloadRecord:
+        pmcid = _resolve_to_pmcid(paper_id, context.session, context.pmcid_cache)
+        if not pmcid:
+            doi = _extract_doi_from_identifier(paper_id)
+            unpaywall_url = (
+                get_unpaywall_pdf_url(doi, self.collector_email, context.session)
+                if doi
+                else None
+            )
+            msg = (
+                f"no PMCID / no Europe PMC full text; unpaywall_url={unpaywall_url}"
+                if unpaywall_url
+                else "no PMCID / no full text in Europe PMC"
+            )
+            return DownloadRecord(
+                paper_id=paper_id,
+                source=source,
+                pmcid=None,
+                pdf_path=None,
+                text_path=None,
+                status="skipped",
+                message=msg,
+            )
+
+        pdf_path = None
+        text_path = None
+        safe = (
+            f"{pmcid}__{source}"
+            .replace("/", "_")
+            .replace(":", "_")
+            .replace(" ", "_")
+        )
+
+        if not context.no_cache:
+            candidate_pdf = os.path.join(context.pdf_dir, f"{safe}.pdf")
+            candidate_text = os.path.join(context.text_dir, f"{safe}.txt")
+            if os.path.exists(candidate_pdf):
+                pdf_path = candidate_pdf
+            if os.path.exists(candidate_text) and os.path.getsize(candidate_text) > 0:
+                text_path = candidate_text
+
+        if not text_path:
+            xml_path = _fetch_fulltext_xml(
+                pmcid, context.session, context.xml_dir, file_stem=safe
+            )
+            if xml_path:
+                extracted = _extract_text_from_xml(xml_path)
+                if extracted.strip():
+                    text_path = os.path.join(context.text_dir, f"{safe}.txt")
+                    with open(text_path, "w", encoding="utf-8", errors="replace") as f:
+                        f.write(extracted)
+
+        if context.force_pdfs or not text_path:
+            pdf_path = pdf_path or _fetch_fulltext_pdf(
+                pmcid, context.session, context.pdf_dir, file_stem=safe
+            )
+            if pdf_path and (context.prefer_pdf_text or not text_path):
+                extracted = _extract_text_from_pdf(pdf_path)
+                if extracted.strip():
+                    text_path = os.path.join(context.text_dir, f"{safe}.txt")
+                    with open(text_path, "w", encoding="utf-8", errors="replace") as f:
+                        f.write(extracted)
+
+        status = "ok" if text_path else ("partial" if pdf_path else "failed")
+        message = None if text_path else "no text extracted"
+
+        if context.delete_pdf_after_text and pdf_path and text_path:
+            try:
+                os.remove(pdf_path)
+                pdf_path = None
+            except Exception as e:
+                logger.warning(f"Could not delete PDF {pdf_path}: {e}")
+
+        return DownloadRecord(
+            paper_id=paper_id,
+            source=source,
+            pmcid=pmcid,
+            pdf_path=pdf_path,
+            text_path=text_path,
+            status=status,
+            message=message,
+        )
+
+
+def _extract_doi_from_identifier(paper_id: str) -> Optional[str]:
+    pid = (paper_id or "").strip()
+    if not pid:
+        return None
+    if pid.upper().startswith("DOI:"):
+        return pid[4:].strip() or None
+    if pid.startswith("10."):
+        return pid
+    return None
+
+
+def _build_collection_provider(
+    collection_org: str,
+    auth_scope: str,
+    collector_email: Optional[str],
+) -> BaseCollectionProvider:
+    org = (collection_org or "ucsc").strip().lower()
+    scope = (auth_scope or "email_only").strip().lower()
+    if scope == "email_password":
+        return NotImplementedScopeProvider(
+            "auth_scope=email_password not implemented yet"
+        )
+    if org == "ucsc":
+        if not collector_email:
+            raise ValueError(
+                "collector_email is required for UCSC email_only collection mode"
+            )
+        if not is_ucsc_email(collector_email):
+            logger.warning(
+                f"collector_email={collector_email!r} is not @ucsc.edu; continuing in UCSC mode"
+            )
+        return UCSCEmailOnlyProvider(collector_email=collector_email)
+    return NotImplementedScopeProvider(f"collection_org={org!r} not implemented")
 
 
 def _configure_file_logging(output_dir: str) -> None:
@@ -82,7 +250,29 @@ _EXCLUDED_PUBTYPE_SUBSTRINGS: List[str] = [
     "letter",
     "abstract",
     "review",
+    # Non-research program/meeting records.
+    "meeting-report",
+    "conference-abstract",
+    "proceedings",
 ]
+
+_ALLOWED_RESEARCH_PUBTYPE_SUBSTRINGS: List[str] = [
+    # Most research articles on Europe PMC.
+    "research-article",
+    # Some publishers show only this category.
+    "journal-article",
+]
+
+
+def _pubtypes_look_like_research(pubtypes: List[Any]) -> bool:
+    normed: List[str] = []
+    for pt in pubtypes:
+        s = str(pt).strip().lower().replace(" ", "-")
+        if s:
+            normed.append(s)
+    if not normed:
+        return False
+    return any(any(allowed in s for allowed in _ALLOWED_RESEARCH_PUBTYPE_SUBSTRINGS) for s in normed)
 
 
 def _pubtype_is_excluded(pubtypes: List[Any]) -> bool:
@@ -165,6 +355,13 @@ def _resolve_to_pmcid(
         pubtypes = (rec.get("pubTypeList") or {}).get("pubType") or []
         if pubtypes and _pubtype_is_excluded(pubtypes):
             logger.debug(f"Skipping non-research pubType={pubtypes} for {paper_id} -> {pmcid}")
+            continue
+
+        # If we have pubType information, require it to look like a research article.
+        # This filters out meeting reports / abstracts programs which otherwise
+        # produce "abstract list" text that doesn't help model reasoning.
+        if pubtypes and not _pubtypes_look_like_research(pubtypes):
+            logger.debug(f"Skipping non-research (pubType not article-like) pubType={pubtypes} for {paper_id} -> {pmcid}")
             continue
 
         pmcid = str(pmcid).strip()
@@ -440,6 +637,9 @@ def run(
     max_papers: Optional[int] = None,
     delete_pdf_after_text: bool = False,
     no_cache: bool = False,
+    collection_org: str = "ucsc",
+    auth_scope: str = "email_only",
+    collector_email: Optional[str] = None,
 ) -> pd.DataFrame:
     """
     Bulk full-text downloader for papers discovered in the search module.
@@ -506,6 +706,28 @@ def run(
 
     session = requests.Session()
     pmcid_cache: Dict[str, Optional[str]] = {}
+    env_org = os.environ.get("COLLECTION_ORG", "").strip()
+    env_scope = os.environ.get("COLLECTION_AUTH_SCOPE", "").strip()
+    env_email = os.environ.get("COLLECTOR_EMAIL", "").strip()
+    selected_org = env_org or collection_org
+    selected_scope = env_scope or auth_scope
+    selected_email = env_email or (collector_email or "")
+    provider = _build_collection_provider(
+        collection_org=selected_org,
+        auth_scope=selected_scope,
+        collector_email=selected_email or None,
+    )
+    context = CollectionContext(
+        session=session,
+        pmcid_cache=pmcid_cache,
+        pdf_dir=pdf_dir,
+        text_dir=text_dir,
+        xml_dir=xml_dir,
+        no_cache=no_cache,
+        delete_pdf_after_text=delete_pdf_after_text,
+        force_pdfs=True,
+        prefer_pdf_text=True,
+    )
 
     # Build unique paper list.
     unique: Dict[str, str] = {}
@@ -558,101 +780,9 @@ def run(
         batch = []
 
     for idx, (paper_id, source) in enumerate(paper_items, start=1):
-        pmcid = _resolve_to_pmcid(paper_id, session, pmcid_cache)
-        if not pmcid:
-            msg = "no PMCID / no full text in Europe PMC"
-            rec = DownloadRecord(
-                paper_id=paper_id,
-                source=source,
-                pmcid=None,
-                pdf_path=None,
-                text_path=None,
-                status="skipped",
-                message=msg,
-            )
-            records.append(rec)
-            batch.append(rec)
-        else:
-            pdf_path = None
-            text_path = None
-            status = "ok"
-            message = None
-
-            if not no_cache:
-                # Reuse existing files if present.
-                safe = pmcid.replace("/", "_").replace(":", "_")
-                candidate_pdf = os.path.join(pdf_dir, f"{safe}.pdf")
-                candidate_text = os.path.join(text_dir, f"{safe}.txt")
-                if os.path.exists(candidate_pdf):
-                    pdf_path = candidate_pdf
-                if os.path.exists(candidate_text):
-                    text_path = candidate_text
-
-            if not text_path:
-                # Try XML, then PDF, then cache-only.
-                xml_path = _fetch_fulltext_xml(pmcid, session, xml_dir)
-                if xml_path:
-                    extracted = _extract_text_from_xml(xml_path)
-                    if extracted.strip():
-                        safe = pmcid.replace("/", "_").replace(":", "_")
-                        text_path = os.path.join(text_dir, f"{safe}.txt")
-                        try:
-                            with open(
-                                text_path, "w", encoding="utf-8", errors="replace"
-                            ) as f:
-                                f.write(extracted)
-                        except Exception as e:
-                            logger.warning(
-                                f"Failed to write extracted XML text for {pmcid}: {e}"
-                            )
-                            text_path = None
-
-                if not text_path:
-                    pdf_path = pdf_path or _fetch_fulltext_pdf(
-                        pmcid, session, pdf_dir
-                    )
-                    if pdf_path:
-                        extracted = _extract_text_from_pdf(pdf_path)
-                        if extracted.strip():
-                            safe = pmcid.replace("/", "_").replace(":", "_")
-                            text_path = os.path.join(text_dir, f"{safe}.txt")
-                            try:
-                                with open(
-                                    text_path,
-                                    "w",
-                                    encoding="utf-8",
-                                    errors="replace",
-                                ) as f:
-                                    f.write(extracted)
-                            except Exception as e:
-                                logger.warning(
-                                    f"Failed to write extracted PDF text for {pmcid}: {e}"
-                                )
-                                text_path = None
-
-            if text_path is None:
-                status = "partial" if pdf_path else "failed"
-                message = "no text extracted"
-
-            if delete_pdf_after_text and pdf_path and text_path:
-                try:
-                    os.remove(pdf_path)
-                    logger.debug(f"Deleted PDF after extraction: {pdf_path}")
-                    pdf_path = None
-                except Exception as e:
-                    logger.warning(f"Could not delete PDF {pdf_path}: {e}")
-
-            rec = DownloadRecord(
-                paper_id=paper_id,
-                source=source,
-                pmcid=pmcid,
-                pdf_path=pdf_path,
-                text_path=text_path,
-                status=status,
-                message=message,
-            )
-            records.append(rec)
-            batch.append(rec)
+        rec = provider.resolve_and_fetch(paper_id, source, context)
+        records.append(rec)
+        batch.append(rec)
 
         if idx % batch_size == 0:
             flush_batch()
@@ -734,6 +864,22 @@ def main() -> int:
         action="store_true",
         help="Ignore any previously downloaded files (re-download everything).",
     )
+    parser.add_argument(
+        "--collection-org",
+        default="ucsc",
+        help="Collection organization routing key (default: ucsc).",
+    )
+    parser.add_argument(
+        "--auth-scope",
+        default="email_only",
+        choices=["email_only", "email_password"],
+        help="Authentication scope for collection tools (default: email_only).",
+    )
+    parser.add_argument(
+        "--collector-email",
+        default=None,
+        help="Collector email identity used by org tools (or env COLLECTOR_EMAIL).",
+    )
     args = parser.parse_args()
 
     output_dir = os.path.dirname(os.path.abspath(args.output))
@@ -747,6 +893,9 @@ def main() -> int:
         max_papers=args.max_papers,
         delete_pdf_after_text=args.delete_pdf_after_text,
         no_cache=args.no_cache,
+        collection_org=args.collection_org,
+        auth_scope=args.auth_scope,
+        collector_email=args.collector_email,
     )
     result.to_csv(args.output, index=False)
     logger.info(f"Collect (download) wrote summary CSV: {args.output}")

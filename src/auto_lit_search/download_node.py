@@ -166,29 +166,23 @@ def run(
                 session=session,
                 pmcid_cache=pmcid_cache,
                 no_cache=no_cache,
-                force_pdfs=bool(docling_url_base),
-                prefer_pdf_text=bool(docling_url_base),
+                force_pdfs=True,
+                prefer_pdf_text=False,
             )
             has_text = any(r.text_path for r in recs)
             has_pdf = any(r.pdf_path for r in recs)
+            n_docling_required = sum(
+                1 for r in recs if ((r.details or {}).get("pdf_docling_required"))
+            )
             n_text = sum(1 for r in recs if r.text_path)
             n_pdf = sum(1 for r in recs if r.pdf_path)
             n_ok = sum(1 for r in recs if r.status == "ok")
             n_failed = sum(1 for r in recs if r.status == "failed")
             logger.info(
                 f"Alignment {alignment_id}: downloaded_papers={len(recs)} "
-                f"text_files={n_text} pdf_files={n_pdf} ok={n_ok} failed={n_failed}"
+                f"text_files={n_text} pdf_files={n_pdf} "
+                f"docling_required={n_docling_required} ok={n_ok} failed={n_failed}"
             )
-            if docling_url_base:
-                if not has_text and not has_pdf:
-                    logger.warning(
-                        f"Alignment {alignment_id}: no usable text and no PDFs downloaded"
-                    )
-                    continue
-            else:
-                if not has_text:
-                    logger.warning(f"Alignment {alignment_id}: no text extracted")
-                    continue
 
             gene_context: Dict[str, Any] | None = None
             # Prefer inline meta if present, otherwise fall back to ID map env.
@@ -208,10 +202,31 @@ def run(
                         "target": meta.get("target_meta") or {},
                     }
 
-            if docling_url_base:
-                # Send PDFs to Docling node, which will convert to text and
-                # then call the LLM analysis node.
+            # Convert only PDFs selected over XML through Docling.
+            if docling_url_base and n_docling_required > 0 and has_pdf:
                 pdf_dir = os.path.join(papers_dir, "pdf")
+                eval_manifest_path = os.path.join(
+                    papers_dir, "docling_eval_manifest.jsonl"
+                )
+                try:
+                    with open(eval_manifest_path, "w", encoding="utf-8") as mf:
+                        for rrec in recs:
+                            mf.write(
+                                json.dumps(
+                                    {
+                                        "paper_id": rrec.paper_id,
+                                        "pdf_path": rrec.pdf_path,
+                                        "details": rrec.details or {},
+                                    }
+                                )
+                                + "\n"
+                            )
+                except Exception as e:
+                    logger.warning(
+                        f"Alignment {alignment_id}: could not write docling manifest: {e}"
+                    )
+                    eval_manifest_path = ""
+
                 docling_payload: Dict[str, Any] = {
                     "alignment_id": alignment_id,
                     "pdf_dir": pdf_dir,
@@ -232,114 +247,78 @@ def run(
                     "gene_context": gene_context,
                     "analysis_host": gpu_host,
                     "analysis_port": gpu_port,
+                    "evaluation_manifest_path": eval_manifest_path or None,
+                    "call_analysis": False,
                 }
-                if not has_pdf:
-                    logger.warning(
-                        f"Alignment {alignment_id}: no PDFs downloaded; falling back to GPU text mode"
+                try:
+                    r = session.post(
+                        f"{docling_url_base}/convert_alignment",
+                        json=docling_payload,
+                        timeout=request_timeout,
                     )
-                else:
-                    try:
-                        r = session.post(
-                            f"{docling_url_base}/convert_alignment",
-                            json=docling_payload,
-                            timeout=request_timeout,
-                        )
-                        r.raise_for_status()
-                        out = r.json()
-                        logger.info(
-                            f"Alignment {alignment_id}: docling_status={out.get('status')} "
-                            f"papers_dir={out.get('papers_dir')} results_path={out.get('results_path')}"
-                        )
-                        total += 1
-                        continue
-                    except requests.RequestException as e:
-                        logger.error(
-                            f"Alignment {alignment_id}: Docling request failed: {e}"
-                        )
-                        resp = getattr(e, "response", None)
-                        if resp is not None:
-                            try:
-                                logger.error(
-                                    f"Alignment {alignment_id}: Docling response: {resp.text[:800]}"
-                                )
-                            except Exception:
-                                pass
-                        if not has_text:
-                            # Can't do GPU text-mode without any .txt files.
-                            logger.warning(
-                                f"Alignment {alignment_id}: no text available for GPU fallback; skipping"
+                    r.raise_for_status()
+                    out = r.json()
+                    logger.info(
+                        f"Alignment {alignment_id}: docling_status={out.get('status')} "
+                        f"papers_dir={out.get('papers_dir')} (analysis deferred to GPU step)"
+                    )
+                except requests.RequestException as e:
+                    logger.error(f"Alignment {alignment_id}: Docling request failed: {e}")
+                    resp = getattr(e, "response", None)
+                    if resp is not None:
+                        try:
+                            logger.error(
+                                f"Alignment {alignment_id}: Docling response: {resp.text[:800]}"
                             )
-                            continue
+                        except Exception:
+                            pass
 
-                # GPU fallback path (either no PDFs, or docling failed).
-                payload: Dict[str, Any] = {
-                    "alignment_id": alignment_id,
-                    "papers_dir": papers_dir,
-                    "query": query_id,
-                    "target_id": target,
-                    "constraints": {
-                        "max_tokens": max_tokens,
-                        "temperature": temperature,
-                    },
-                    "instructions": instructions_text
-                    or (
-                        "Analyze the paper excerpt for relevance to the genes in this alignment. "
-                        "First give a brief justification (2-4 sentences). "
-                        "Then output a single line: relevance_score=<float between 0 and 1>."
-                    ),
-                    "output_root": output_root,
-                }
-                if gene_context is not None:
-                    payload["gene_context"] = gene_context
+            if not any(
+                fname.endswith(".txt")
+                for fname in os.listdir(papers_dir)
+                if os.path.isfile(os.path.join(papers_dir, fname))
+            ):
+                logger.warning(
+                    f"Alignment {alignment_id}: no text files available after collection/conversion; skipping GPU"
+                )
+                continue
 
-                try:
-                    r = session.post(
-                        f"{gpu_url_base}/run_alignment",
-                        json=payload,
-                        timeout=request_timeout,
-                    )
-                    r.raise_for_status()
-                    out = r.json()
-                    logger.info(
-                        f"Alignment {alignment_id}: {out.get('status')} -> {out.get('results_path')}"
-                    )
-                    total += 1
-                except requests.RequestException as e:
-                    logger.error(f"Alignment {alignment_id}: GPU request failed: {e}")
-                    raise
-            else:
-                # Backward-compatible path: call LLM node directly with text already present.
-                payload: Dict[str, Any] = {
-                    "alignment_id": alignment_id,
-                    "papers_dir": papers_dir,
-                    "query": query_id,
-                    "target_id": target,
-                    "constraints": {
-                        "max_tokens": max_tokens,
-                        "temperature": temperature,
-                    },
-                    "instructions": instructions_text
-                    or "Summarize relevance to the query and target.",
-                    "output_root": output_root,
-                }
-                if gene_context is not None:
-                    payload["gene_context"] = gene_context
+            # Final handoff: post completed alignment set directly to GPU.
+            payload: Dict[str, Any] = {
+                "alignment_id": alignment_id,
+                "papers_dir": papers_dir,
+                "query": query_id,
+                "target_id": target,
+                "constraints": {
+                    "max_tokens": max_tokens,
+                    "temperature": temperature,
+                },
+                "instructions": instructions_text
+                or (
+                    "Analyze the paper excerpt for relevance to the genes in this alignment. "
+                    "First give a brief justification (2-4 sentences). "
+                    "Then output a single line: relevance_score=<float between 0 and 1>."
+                ),
+                "output_root": output_root,
+            }
+            if gene_context is not None:
+                payload["gene_context"] = gene_context
 
-                try:
-                    r = session.post(
-                        f"{gpu_url_base}/run_alignment",
-                        json=payload,
-                        timeout=request_timeout,
-                    )
-                    r.raise_for_status()
-                    out = r.json()
-                    logger.info(
-                        f"Alignment {alignment_id}: {out.get('status')} -> {out.get('results_path')}"
-                    )
-                    total += 1
-                except requests.RequestException as e:
-                    logger.error(f"Alignment {alignment_id}: GPU request failed: {e}")
-                    raise
+            try:
+                r = session.post(
+                    f"{gpu_url_base}/run_alignment",
+                    json=payload,
+                    timeout=request_timeout,
+                )
+                r.raise_for_status()
+                out = r.json()
+                logger.info(
+                    f"Alignment {alignment_id}: {out.get('status')} -> {out.get('results_path')}"
+                )
+                total += 1
+            except requests.RequestException as e:
+                logger.error(f"Alignment {alignment_id}: GPU request failed: {e}")
+                raise
 
     logger.info(f"Submitted {total} alignments to GPU node.")
 

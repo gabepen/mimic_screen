@@ -1,4 +1,5 @@
 import os
+import json
 from typing import Any, Dict, List, Optional
 
 import requests
@@ -30,6 +31,8 @@ class ConvertAlignmentRequest(BaseModel):
     gene_context: Optional[Dict[str, Any]] = None
     analysis_host: str
     analysis_port: int
+    evaluation_manifest_path: Optional[str] = None
+    call_analysis: bool = True
 
 
 class ConvertAlignmentResponse(BaseModel):
@@ -50,7 +53,48 @@ _DOC_CONVERTER = DocumentConverter(
 )
 
 
-def _convert_pdfs_to_text(pdf_dir: str, papers_dir: str) -> List[str]:
+def _load_docling_required_pdf_basenames(
+    manifest_path: Optional[str],
+) -> Optional[set[str]]:
+    if not manifest_path:
+        return None
+    if not os.path.isfile(manifest_path):
+        logger.warning(
+            f"evaluation_manifest_path does not exist, ignoring filter: {manifest_path}"
+        )
+        return None
+    out: set[str] = set()
+    try:
+        with open(manifest_path, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    rec = json.loads(line)
+                except Exception:
+                    continue
+                details = rec.get("details") or {}
+                if not details.get("pdf_docling_required"):
+                    continue
+                p = rec.get("pdf_path")
+                if not p:
+                    continue
+                base = os.path.splitext(os.path.basename(str(p)))[0]
+                if base:
+                    out.add(base)
+    except Exception as e:
+        logger.warning(f"Could not parse evaluation manifest {manifest_path}: {e}")
+        return None
+    logger.info(
+        f"Loaded {len(out)} docling-required PDFs from manifest {manifest_path}"
+    )
+    return out
+
+
+def _convert_pdfs_to_text(
+    pdf_dir: str, papers_dir: str, allowed_pdf_basenames: Optional[set[str]] = None
+) -> List[str]:
     if not os.path.isdir(pdf_dir):
         raise HTTPException(
             status_code=400,
@@ -60,12 +104,17 @@ def _convert_pdfs_to_text(pdf_dir: str, papers_dir: str) -> List[str]:
     _ensure_dir(papers_dir)
 
     txt_paths: List[str] = []
+    attempted = 0
     for name in sorted(os.listdir(pdf_dir)):
         if not name.lower().endswith(".pdf"):
+            continue
+        base = os.path.splitext(name)[0]
+        if allowed_pdf_basenames is not None and base not in allowed_pdf_basenames:
             continue
         pdf_path = os.path.join(pdf_dir, name)
         if not os.path.isfile(pdf_path):
             continue
+        attempted += 1
         try:
             result = _DOC_CONVERTER.convert(source=pdf_path)
             doc = result.document
@@ -73,7 +122,6 @@ def _convert_pdfs_to_text(pdf_dir: str, papers_dir: str) -> List[str]:
         except Exception as e:
             logger.warning(f"Docling failed for {pdf_path}: {e}")
             continue
-        base = os.path.splitext(name)[0]
         txt_path = os.path.join(papers_dir, f"{base}.txt")
         try:
             with open(txt_path, "w", encoding="utf-8", errors="replace") as f:
@@ -82,6 +130,10 @@ def _convert_pdfs_to_text(pdf_dir: str, papers_dir: str) -> List[str]:
             logger.warning(f"Could not write text for {pdf_path} -> {txt_path}: {e}")
             continue
         txt_paths.append(txt_path)
+
+    if allowed_pdf_basenames is not None and attempted == 0:
+        logger.info("No PDFs selected for Docling conversion from manifest filter")
+        return []
 
     if not txt_paths:
         raise HTTPException(
@@ -118,12 +170,15 @@ def _call_analysis_node(
 
 @app.post("/convert_alignment", response_model=ConvertAlignmentResponse)
 def convert_alignment(req: ConvertAlignmentRequest) -> ConvertAlignmentResponse:
-    txt_paths = _convert_pdfs_to_text(req.pdf_dir, req.papers_dir)
+    allowed = _load_docling_required_pdf_basenames(req.evaluation_manifest_path)
+    txt_paths = _convert_pdfs_to_text(req.pdf_dir, req.papers_dir, allowed)
     logger.info(
         f"Docling node converted {len(txt_paths)} PDFs for {req.alignment_id} "
         f"into {req.papers_dir}"
     )
-    results_path = _call_analysis_node(req)
+    results_path = ""
+    if req.call_analysis:
+        results_path = _call_analysis_node(req)
     return ConvertAlignmentResponse(
         status="ok",
         alignment_id=req.alignment_id,
