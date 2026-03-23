@@ -14,20 +14,31 @@ import argparse
 import json
 import os
 import sys
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
+from functools import partial
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 import pandas as pd
 import requests
 from loguru import logger
 
-from ucsc_paper_collection_tools import (
-    get_arxiv_pdf_url,
-    get_semantic_scholar_pdf_url,
-    get_unpaywall_pdf_url,
-    is_ucsc_email,
-)
+try:
+    from .ucsc_paper_collection_tools import (
+        get_arxiv_pdf_url,
+        get_semantic_scholar_pdf_url,
+        get_unpaywall_pdf_url,
+        is_ucsc_email,
+    )
+except ImportError:
+    from ucsc_paper_collection_tools import (
+        get_arxiv_pdf_url,
+        get_semantic_scholar_pdf_url,
+        get_unpaywall_pdf_url,
+        is_ucsc_email,
+    )
 
 
 logger.remove()
@@ -41,6 +52,43 @@ logger.add(
 EUROPEPMC_SEARCH_URL = "https://www.ebi.ac.uk/europepmc/webservices/rest/search"
 EUROPEPMC_FULLTEXT_BASE = "https://www.ebi.ac.uk/europepmc/webservices/rest"
 API_DELAY = 0.35
+
+# Minimum spacing between outbound calls per channel (shared across threads).
+_DEFAULT_THROTTLE_INTERVALS_S: Dict[str, float] = {
+    "europe_pmc": 0.35,
+    "unpaywall": 0.55,
+    "arxiv": 3.0,
+    "semantic_scholar": 3.5,
+    "publisher_pdf": 0.2,
+}
+
+
+class CollectThrottle:
+    """
+    Per-channel rate limiter: ensures at least `interval` seconds between
+    successive waits on the same channel (process-wide for that CollectThrottle).
+    """
+
+    def __init__(self, intervals: Optional[Dict[str, float]] = None):
+        self._intervals = dict(intervals or _DEFAULT_THROTTLE_INTERVALS_S)
+        self._locks: Dict[str, threading.Lock] = {
+            k: threading.Lock() for k in self._intervals
+        }
+        self._next_ok: Dict[str, float] = {k: 0.0 for k in self._intervals}
+
+    def wait(self, channel: str) -> None:
+        interval = self._intervals.get(channel)
+        if interval is None or interval <= 0:
+            return
+        lock = self._locks.get(channel)
+        if lock is None:
+            return
+        with lock:
+            now = time.monotonic()
+            wait_s = self._next_ok[channel] - now
+            if wait_s > 0:
+                time.sleep(wait_s)
+            self._next_ok[channel] = time.monotonic() + interval
 
 
 @dataclass
@@ -66,6 +114,9 @@ class CollectionContext:
     delete_pdf_after_text: bool = False
     force_pdfs: bool = True
     prefer_pdf_text: bool = True
+    throttle: Optional[CollectThrottle] = None
+    cache_lock: Optional[threading.Lock] = None
+    disable_semantic_scholar: bool = False
 
 
 class BaseCollectionProvider:
@@ -73,6 +124,40 @@ class BaseCollectionProvider:
         self, paper_id: str, source: str, context: CollectionContext
     ) -> DownloadRecord:
         raise NotImplementedError
+
+
+def _collect_single_record(
+    item: Tuple[str, str],
+    provider: BaseCollectionProvider,
+    pdf_dir: str,
+    text_dir: str,
+    xml_dir: str,
+    pmcid_cache: Dict[str, Optional[str]],
+    no_cache: bool,
+    delete_pdf_after_text: bool,
+    force_pdfs: bool,
+    prefer_pdf_text: bool,
+    throttle: CollectThrottle,
+    cache_lock: Optional[threading.Lock],
+    disable_semantic_scholar: bool,
+) -> DownloadRecord:
+    paper_id, source = item
+    session = requests.Session()
+    ctx = CollectionContext(
+        session=session,
+        pmcid_cache=pmcid_cache,
+        pdf_dir=pdf_dir,
+        text_dir=text_dir,
+        xml_dir=xml_dir,
+        no_cache=no_cache,
+        delete_pdf_after_text=delete_pdf_after_text,
+        force_pdfs=force_pdfs,
+        prefer_pdf_text=prefer_pdf_text,
+        throttle=throttle,
+        cache_lock=cache_lock,
+        disable_semantic_scholar=disable_semantic_scholar,
+    )
+    return provider.resolve_and_fetch(paper_id, source, ctx)
 
 
 class NotImplementedScopeProvider(BaseCollectionProvider):
@@ -109,7 +194,13 @@ class UCSCEmailOnlyProvider(BaseCollectionProvider):
             "semantic_scholar": {"attempted": bool(doi or title), "success": False, "artifact": None, "error": None},
         }
 
-        pmcid = _resolve_to_pmcid(paper_id, context.session, context.pmcid_cache)
+        pmcid = _resolve_to_pmcid(
+            paper_id,
+            context.session,
+            context.pmcid_cache,
+            throttle=context.throttle,
+            cache_lock=context.cache_lock,
+        )
         xml_text = ""
         xml_path: Optional[str] = None
         pdf_path: Optional[str] = None
@@ -131,7 +222,11 @@ class UCSCEmailOnlyProvider(BaseCollectionProvider):
 
         if pmcid and not text_path:
             xml_path = _fetch_fulltext_xml(
-                pmcid, context.session, context.xml_dir, file_stem=safe
+                pmcid,
+                context.session,
+                context.xml_dir,
+                file_stem=safe,
+                throttle=context.throttle,
             )
             if xml_path:
                 xml_text = _extract_text_from_xml(xml_path)
@@ -142,40 +237,72 @@ class UCSCEmailOnlyProvider(BaseCollectionProvider):
 
         if pmcid and (context.force_pdfs or not text_path):
             epmc_pdf = _fetch_fulltext_pdf(
-                pmcid, context.session, context.pdf_dir, file_stem=safe
+                pmcid,
+                context.session,
+                context.pdf_dir,
+                file_stem=safe,
+                throttle=context.throttle,
             )
             if epmc_pdf:
                 pdf_path = epmc_pdf
                 source_attempts["europe_pmc"]["success"] = True
                 source_attempts["europe_pmc"]["artifact"] = "pdf"
 
-        unpaywall_url = get_unpaywall_pdf_url(doi, self.collector_email, context.session) if doi else None
+        unpaywall_url = None
+        if doi:
+            if context.throttle:
+                context.throttle.wait("unpaywall")
+            unpaywall_url = get_unpaywall_pdf_url(
+                doi, self.collector_email, context.session
+            )
         if unpaywall_url:
             source_attempts["unpaywall"]["artifact"] = "url"
             up_pdf = _download_pdf_from_url(
-                unpaywall_url, context.session, context.pdf_dir, f"{safe}__unpaywall"
+                unpaywall_url,
+                context.session,
+                context.pdf_dir,
+                f"{safe}__unpaywall",
+                throttle=context.throttle,
             )
             if up_pdf:
                 source_attempts["unpaywall"]["success"] = True
                 source_attempts["unpaywall"]["artifact"] = "pdf"
                 pdf_path = pdf_path or up_pdf
 
-        arxiv_url = get_arxiv_pdf_url(doi, title, context.session)
+        arxiv_url = None
+        if doi or title:
+            if context.throttle:
+                context.throttle.wait("arxiv")
+            arxiv_url = get_arxiv_pdf_url(doi, title, context.session)
         if arxiv_url:
             source_attempts["arxiv"]["artifact"] = "url"
             arxiv_pdf = _download_pdf_from_url(
-                arxiv_url, context.session, context.pdf_dir, f"{safe}__arxiv"
+                arxiv_url,
+                context.session,
+                context.pdf_dir,
+                f"{safe}__arxiv",
+                throttle=context.throttle,
             )
             if arxiv_pdf:
                 source_attempts["arxiv"]["success"] = True
                 source_attempts["arxiv"]["artifact"] = "pdf"
                 pdf_path = pdf_path or arxiv_pdf
 
-        s2_url = get_semantic_scholar_pdf_url(doi, title, context.session)
+        s2_url = None
+        if context.disable_semantic_scholar:
+            source_attempts["semantic_scholar"]["attempted"] = False
+        elif doi or title:
+            if context.throttle:
+                context.throttle.wait("semantic_scholar")
+            s2_url = get_semantic_scholar_pdf_url(doi, title, context.session)
         if s2_url:
             source_attempts["semantic_scholar"]["artifact"] = "url"
             s2_pdf = _download_pdf_from_url(
-                s2_url, context.session, context.pdf_dir, f"{safe}__semantic_scholar"
+                s2_url,
+                context.session,
+                context.pdf_dir,
+                f"{safe}__semantic_scholar",
+                throttle=context.throttle,
             )
             if s2_pdf:
                 source_attempts["semantic_scholar"]["success"] = True
@@ -275,12 +402,15 @@ def _download_pdf_from_url(
     pdf_dir: str,
     file_stem: str,
     timeout: int = 120,
+    throttle: Optional[CollectThrottle] = None,
 ) -> Optional[str]:
     os.makedirs(pdf_dir, exist_ok=True)
     out_path = os.path.join(pdf_dir, f"{file_stem}.pdf")
     if os.path.exists(out_path) and os.path.getsize(out_path) > 0:
         return out_path
     try:
+        if throttle:
+            throttle.wait("publisher_pdf")
         resp = session.get(pdf_url, timeout=timeout, headers={"Connection": "close"})
         resp.raise_for_status()
         content = resp.content or b""
@@ -442,6 +572,8 @@ def _resolve_to_pmcid(
     session: requests.Session,
     cache: Dict[str, Optional[str]],
     delay: float = API_DELAY,
+    throttle: Optional[CollectThrottle] = None,
+    cache_lock: Optional[threading.Lock] = None,
 ) -> Optional[str]:
     """
     Resolve an arbitrary paper identifier to a Europe PMC PMCID, if possible.
@@ -452,7 +584,11 @@ def _resolve_to_pmcid(
         - DOI (10.xxxx/...)
         - Other IDs resolvable via EXT_ID search.
     """
-    if paper_id in cache:
+    if cache_lock:
+        with cache_lock:
+            if paper_id in cache:
+                return cache[paper_id]
+    elif paper_id in cache:
         return cache[paper_id]
 
     pid = paper_id.strip()
@@ -475,7 +611,10 @@ def _resolve_to_pmcid(
             ext_id = pid
         search_query = f"EXT_ID:{ext_id}"
 
-    time.sleep(delay)
+    if throttle:
+        throttle.wait("europe_pmc")
+    else:
+        time.sleep(delay)
     try:
         resp = session.get(
             EUROPEPMC_SEARCH_URL,
@@ -494,7 +633,11 @@ def _resolve_to_pmcid(
         data = resp.json()
     except Exception as e:
         logger.debug(f"EXT_ID lookup failed for {paper_id}: {e}")
-        cache[paper_id] = None
+        if cache_lock:
+            with cache_lock:
+                cache[paper_id] = None
+        else:
+            cache[paper_id] = None
         return None
 
     results = (data.get("resultList") or {}).get("result") or []
@@ -518,10 +661,18 @@ def _resolve_to_pmcid(
         pmcid = str(pmcid).strip()
         if not pmcid.upper().startswith("PMC"):
             pmcid = f"PMC{pmcid}"
-        cache[paper_id] = pmcid
+        if cache_lock:
+            with cache_lock:
+                cache[paper_id] = pmcid
+        else:
+            cache[paper_id] = pmcid
         return pmcid
 
-    cache[paper_id] = None
+    if cache_lock:
+        with cache_lock:
+            cache[paper_id] = None
+    else:
+        cache[paper_id] = None
     return None
 
 
@@ -531,6 +682,7 @@ def _fetch_fulltext_pdf(
     pdf_dir: str,
     timeout: int = 120,
     file_stem: Optional[str] = None,
+    throttle: Optional[CollectThrottle] = None,
 ) -> Optional[str]:
     """
     Download full-text PDF for a given PMCID from Europe PMC, if available.
@@ -546,7 +698,10 @@ def _fetch_fulltext_pdf(
 
     url = f"{EUROPEPMC_FULLTEXT_BASE}/{pmcid}/fullTextPDF"
     logger.debug(f"Fetching PDF for {pmcid} -> {url}")
-    time.sleep(API_DELAY)
+    if throttle:
+        throttle.wait("europe_pmc")
+    else:
+        time.sleep(API_DELAY)
     try:
         resp = session.get(url, timeout=timeout)
         # Some responses may be HTML if PDF is not available.
@@ -575,6 +730,7 @@ def _fetch_fulltext_xml(
     xml_dir: str,
     timeout: int = 120,
     file_stem: Optional[str] = None,
+    throttle: Optional[CollectThrottle] = None,
 ) -> Optional[str]:
     """
     Download full-text XML for a given PMCID from Europe PMC, if available.
@@ -590,7 +746,10 @@ def _fetch_fulltext_xml(
 
     url = f"{EUROPEPMC_FULLTEXT_BASE}/{pmcid}/fullTextXML"
     logger.debug(f"Fetching XML for {pmcid} -> {url}")
-    time.sleep(API_DELAY)
+    if throttle:
+        throttle.wait("europe_pmc")
+    else:
+        time.sleep(API_DELAY)
     try:
         resp = session.get(url, timeout=timeout)
         resp.raise_for_status()
@@ -663,6 +822,8 @@ def download_papers_to_dir(
     auth_scope: str = "email_only",
     collector_email: Optional[str] = None,
     delete_pdf_after_text: bool = False,
+    max_workers: int = 2,
+    disable_semantic_scholar: bool = False,
 ) -> List[DownloadRecord]:
     """
     Download full-text for a list of (paper_id, source) into output_dir.
@@ -688,21 +849,62 @@ def download_papers_to_dir(
         auth_scope=selected_scope,
         collector_email=selected_email or None,
     )
-    context = CollectionContext(
-        session=session,
-        pmcid_cache=pmcid_cache,
+    throttle = CollectThrottle()
+    workers = max(1, int(max_workers))
+    cache_lock = threading.Lock() if workers > 1 else None
+
+    if workers <= 1:
+        context = CollectionContext(
+            session=session,
+            pmcid_cache=pmcid_cache,
+            pdf_dir=pdf_dir,
+            text_dir=text_dir,
+            xml_dir=xml_dir,
+            no_cache=no_cache,
+            delete_pdf_after_text=delete_pdf_after_text,
+            force_pdfs=force_pdfs,
+            prefer_pdf_text=prefer_pdf_text,
+            throttle=throttle,
+            cache_lock=cache_lock,
+            disable_semantic_scholar=disable_semantic_scholar,
+        )
+        return [
+            provider.resolve_and_fetch(pid, src, context)
+            for pid, src in paper_ids_with_source
+        ]
+
+    worker = partial(
+        _collect_single_record,
+        provider=provider,
         pdf_dir=pdf_dir,
         text_dir=text_dir,
         xml_dir=xml_dir,
+        pmcid_cache=pmcid_cache,
         no_cache=no_cache,
         delete_pdf_after_text=delete_pdf_after_text,
         force_pdfs=force_pdfs,
         prefer_pdf_text=prefer_pdf_text,
+        throttle=throttle,
+        cache_lock=cache_lock,
+        disable_semantic_scholar=disable_semantic_scholar,
     )
-    records: List[DownloadRecord] = []
-    for paper_id, source in paper_ids_with_source:
-        records.append(provider.resolve_and_fetch(paper_id, source, context))
-    return records
+    n = len(paper_ids_with_source)
+    records: List[Optional[DownloadRecord]] = [None] * n
+    with ThreadPoolExecutor(max_workers=workers) as ex:
+        future_to_i = {
+            ex.submit(worker, paper_ids_with_source[i]): i for i in range(n)
+        }
+        done = 0
+        for fut in as_completed(future_to_i):
+            i = future_to_i[fut]
+            records[i] = fut.result()
+            done += 1
+            if done % 50 == 0:
+                logger.info(
+                    f"Collect (download dir): finished {done}/{n} papers "
+                    f"({100.0 * done / n:.1f}%)"
+                )
+    return [r for r in records if r is not None]
 
 
 def _iter_paper_ids_from_search_df(df: pd.DataFrame) -> Iterable[Tuple[str, str]]:
@@ -748,6 +950,8 @@ def run(
     collection_org: str = "ucsc",
     auth_scope: str = "email_only",
     collector_email: Optional[str] = None,
+    max_workers: int = 2,
+    disable_semantic_scholar: bool = False,
 ) -> pd.DataFrame:
     """
     Bulk full-text downloader for papers discovered in the search module.
@@ -813,7 +1017,6 @@ def run(
             ]
         )
 
-    session = requests.Session()
     pmcid_cache: Dict[str, Optional[str]] = {}
     env_org = os.environ.get("COLLECTION_ORG", "").strip()
     env_scope = os.environ.get("COLLECTION_AUTH_SCOPE", "").strip()
@@ -826,16 +1029,18 @@ def run(
         auth_scope=selected_scope,
         collector_email=selected_email or None,
     )
-    context = CollectionContext(
-        session=session,
-        pmcid_cache=pmcid_cache,
-        pdf_dir=pdf_dir,
-        text_dir=text_dir,
-        xml_dir=xml_dir,
-        no_cache=no_cache,
-        delete_pdf_after_text=delete_pdf_after_text,
-        force_pdfs=True,
-        prefer_pdf_text=True,
+    ew = os.environ.get("COLLECT_MAX_WORKERS", "").strip()
+    if ew.isdigit():
+        max_workers = max(1, min(16, int(ew)))
+    workers = max(1, int(max_workers))
+    ess = os.environ.get("COLLECT_DISABLE_SEMANTIC_SCHOLAR", "").strip().lower()
+    if ess in ("1", "true", "yes"):
+        disable_semantic_scholar = True
+    throttle = CollectThrottle()
+    cache_lock = threading.Lock() if workers > 1 else None
+    logger.info(
+        f"Collect (download): max_workers={workers} "
+        f"semantic_scholar={'off' if disable_semantic_scholar else 'on'}"
     )
 
     # Build unique paper list.
@@ -889,8 +1094,7 @@ def run(
             logger.warning(f"Could not write manifest {manifest_path}: {e}")
         batch = []
 
-    for idx, (paper_id, source) in enumerate(paper_items, start=1):
-        rec = provider.resolve_and_fetch(paper_id, source, context)
+    def _log_paper_eval(rec: DownloadRecord) -> None:
         d = rec.details or {}
         xml_stats = d.get("xml_stats") or {}
         logger.debug(
@@ -908,17 +1112,72 @@ def run(
                 ensure_ascii=False,
             )
         )
-        records.append(rec)
-        batch.append(rec)
 
-        if idx % batch_size == 0:
-            flush_batch()
-
-        if idx % 50 == 0:
-            logger.info(
-                f"Collect (download): processed {idx}/{len(paper_items)} papers "
-                f"({(idx/len(paper_items))*100:.1f}%)"
-            )
+    n_items = len(paper_items)
+    if workers <= 1:
+        session = requests.Session()
+        context = CollectionContext(
+            session=session,
+            pmcid_cache=pmcid_cache,
+            pdf_dir=pdf_dir,
+            text_dir=text_dir,
+            xml_dir=xml_dir,
+            no_cache=no_cache,
+            delete_pdf_after_text=delete_pdf_after_text,
+            force_pdfs=True,
+            prefer_pdf_text=True,
+            throttle=throttle,
+            cache_lock=cache_lock,
+            disable_semantic_scholar=disable_semantic_scholar,
+        )
+        for idx, (paper_id, source) in enumerate(paper_items, start=1):
+            rec = provider.resolve_and_fetch(paper_id, source, context)
+            _log_paper_eval(rec)
+            records.append(rec)
+            batch.append(rec)
+            if idx % batch_size == 0:
+                flush_batch()
+            if idx % 50 == 0:
+                logger.info(
+                    f"Collect (download): processed {idx}/{n_items} papers "
+                    f"({(idx / n_items) * 100:.1f}%)"
+                )
+    else:
+        worker = partial(
+            _collect_single_record,
+            provider=provider,
+            pdf_dir=pdf_dir,
+            text_dir=text_dir,
+            xml_dir=xml_dir,
+            pmcid_cache=pmcid_cache,
+            no_cache=no_cache,
+            delete_pdf_after_text=delete_pdf_after_text,
+            force_pdfs=True,
+            prefer_pdf_text=True,
+            throttle=throttle,
+            cache_lock=cache_lock,
+            disable_semantic_scholar=disable_semantic_scholar,
+        )
+        slot: List[Optional[DownloadRecord]] = [None] * n_items
+        with ThreadPoolExecutor(max_workers=workers) as ex:
+            future_to_i = {ex.submit(worker, paper_items[i]): i for i in range(n_items)}
+            done = 0
+            for fut in as_completed(future_to_i):
+                i = future_to_i[fut]
+                rec = fut.result()
+                slot[i] = rec
+                _log_paper_eval(rec)
+                done += 1
+                if done % 50 == 0:
+                    logger.info(
+                        f"Collect (download): processed {done}/{n_items} papers "
+                        f"({(done / n_items) * 100:.1f}%)"
+                    )
+        records = [slot[i] for i in range(n_items) if slot[i] is not None]
+        for rec in records:
+            batch.append(rec)
+            if len(batch) >= batch_size:
+                flush_batch()
 
     flush_batch()
 
@@ -1072,6 +1331,17 @@ def main() -> int:
         default=None,
         help="Collector email identity used by org tools (or env COLLECTOR_EMAIL).",
     )
+    parser.add_argument(
+        "--max-workers",
+        type=int,
+        default=2,
+        help="Parallel download threads (1=sequential). Capped at 16. Env COLLECT_MAX_WORKERS overrides.",
+    )
+    parser.add_argument(
+        "--disable-semantic-scholar",
+        action="store_true",
+        help="Skip Semantic Scholar lookups (reduces 429s). Env COLLECT_DISABLE_SEMANTIC_SCHOLAR=1 also sets this.",
+    )
     args = parser.parse_args()
 
     output_dir = os.path.dirname(os.path.abspath(args.output))
@@ -1088,6 +1358,8 @@ def main() -> int:
         collection_org=args.collection_org,
         auth_scope=args.auth_scope,
         collector_email=args.collector_email,
+        max_workers=max(1, args.max_workers),
+        disable_semantic_scholar=args.disable_semantic_scholar,
     )
     result.to_csv(args.output, index=False)
     logger.info(f"Collect (download) wrote summary CSV: {args.output}")

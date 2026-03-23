@@ -154,6 +154,20 @@ def run(
         "yes" if bool(collector_email) else "no",
     )
 
+    _mw_raw = os.environ.get("COLLECT_MAX_WORKERS", "2").strip() or "2"
+    try:
+        collect_max_workers = max(1, min(16, int(_mw_raw)))
+    except ValueError:
+        collect_max_workers = 2
+    collect_disable_s2 = os.environ.get(
+        "COLLECT_DISABLE_SEMANTIC_SCHOLAR", ""
+    ).strip().lower() in ("1", "true", "yes")
+    logger.info(
+        "Collect parallelism max_workers={} semantic_scholar={}",
+        collect_max_workers,
+        "off" if collect_disable_s2 else "on",
+    )
+
     # Optional: mapping CSV for richer gene identifiers; provided via env.
     idmap_path = os.environ.get("IDMAP_CSV", "")
     idmap: Dict[str, Dict[str, Any]] = {}
@@ -192,6 +206,8 @@ def run(
                 collection_org=collection_org,
                 auth_scope=collection_auth_scope,
                 collector_email=collector_email or None,
+                max_workers=collect_max_workers,
+                disable_semantic_scholar=collect_disable_s2,
             )
             has_text = any(r.text_path for r in recs)
             has_pdf = any(r.pdf_path for r in recs)

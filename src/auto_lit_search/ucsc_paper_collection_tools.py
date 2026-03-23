@@ -6,6 +6,7 @@ Small, dependency-light utilities for collection routing in collect.py.
 
 from __future__ import annotations
 
+import time
 from typing import Optional
 from xml.etree import ElementTree as ET
 
@@ -109,22 +110,37 @@ def get_semantic_scholar_pdf_url(
     query = (doi or "").strip() or (title or "").strip()
     if not query:
         return None
-    try:
-        resp = session.get(
-            "https://api.semanticscholar.org/graph/v1/paper/search",
-            params={
-                "query": query[:150],
-                "fields": "openAccessPdf,title,externalIds",
-                "limit": 3,
-            },
-            timeout=timeout_s,
-        )
-        resp.raise_for_status()
-        data = resp.json()
-        for paper in data.get("data") or []:
-            pdf = (paper.get("openAccessPdf") or {}).get("url")
-            if pdf:
-                return str(pdf).strip()
-    except Exception as e:
-        logger.debug(f"Semantic Scholar lookup failed for query={query!r}: {e}")
+    url = "https://api.semanticscholar.org/graph/v1/paper/search"
+    params = {
+        "query": query[:150],
+        "fields": "openAccessPdf,title,externalIds",
+        "limit": 3,
+    }
+    max_attempts = 4
+    for attempt in range(max_attempts):
+        try:
+            resp = session.get(url, params=params, timeout=timeout_s)
+            if resp.status_code == 429:
+                ra = resp.headers.get("Retry-After")
+                try:
+                    delay = min(120.0, float(ra)) if ra else None
+                except (TypeError, ValueError):
+                    delay = None
+                if delay is None:
+                    delay = min(60.0, 2.0 ** (attempt + 1))
+                logger.debug(
+                    f"Semantic Scholar 429 for query={query!r}; sleeping {delay:.1f}s"
+                )
+                time.sleep(delay)
+                continue
+            resp.raise_for_status()
+            data = resp.json()
+            for paper in data.get("data") or []:
+                pdf = (paper.get("openAccessPdf") or {}).get("url")
+                if pdf:
+                    return str(pdf).strip()
+            return None
+        except Exception as e:
+            logger.debug(f"Semantic Scholar lookup failed for query={query!r}: {e}")
+            return None
     return None
