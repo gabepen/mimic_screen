@@ -2,6 +2,9 @@ import os
 import json
 from typing import Any, Dict, List, Optional
 
+# Headless-friendly defaults for PDF stacks that touch Qt/XCB in some builds.
+os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+
 import requests
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
@@ -51,6 +54,26 @@ _DOC_CONVERTER = DocumentConverter(
         InputFormat.PDF: PdfFormatOption(),
     }
 )
+
+
+def _extract_text_pypdf(pdf_path: str) -> str:
+    try:
+        import pypdf  # type: ignore
+    except ImportError:
+        return ""
+    try:
+        reader = pypdf.PdfReader(pdf_path)
+    except Exception:
+        return ""
+    parts: List[str] = []
+    for page in reader.pages:
+        try:
+            t = page.extract_text() or ""
+        except Exception:
+            t = ""
+        if t.strip():
+            parts.append(t.strip())
+    return "\n\n".join(parts)
 
 
 def _load_docling_required_pdf_basenames(
@@ -115,13 +138,23 @@ def _convert_pdfs_to_text(
         if not os.path.isfile(pdf_path):
             continue
         attempted += 1
+        text = ""
         try:
             result = _DOC_CONVERTER.convert(source=pdf_path)
             doc = result.document
             text = doc.export_to_markdown()
         except Exception as e:
             logger.warning(f"Docling failed for {pdf_path}: {e}")
-            continue
+            text = ""
+        if not (text or "").strip():
+            fallback = _extract_text_pypdf(pdf_path)
+            if fallback.strip():
+                text = fallback
+                logger.info(
+                    f"Used pypdf fallback for {pdf_path} ({len(fallback)} chars)"
+                )
+            else:
+                continue
         txt_path = os.path.join(papers_dir, f"{base}.txt")
         try:
             with open(txt_path, "w", encoding="utf-8", errors="replace") as f:

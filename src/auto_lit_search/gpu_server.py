@@ -4,36 +4,19 @@ import time
 from typing import Any, Dict, List, Optional
 
 from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel
 from loguru import logger
+
+from auto_lit_search.analysis_packet import (
+    Constraints,
+    RunAlignmentGradedRequest,
+    RunAlignmentRequest,
+    RunAlignmentResponse,
+)
 
 app = FastAPI(title="auto_lit_search GPU node")
 
 TEXT_EXTENSIONS = (".txt",)
 MAX_PAPER_CHARS = 120000
-
-
-class Constraints(BaseModel):
-    max_tokens: Optional[int] = None
-    temperature: Optional[float] = None
-
-
-class RunAlignmentRequest(BaseModel):
-    alignment_id: str
-    papers_dir: str
-    query: str
-    target_id: str
-    constraints: Optional[Constraints] = None
-    instructions: str
-    output_root: str
-    # Optional gene metadata for improving prompts (gene_context["query"], gene_context["target"])
-    gene_context: Optional[Dict[str, Any]] = None
-
-
-class RunAlignmentResponse(BaseModel):
-    status: str
-    alignment_id: str
-    results_path: str
 
 
 def _ensure_dir(path: str) -> None:
@@ -222,6 +205,25 @@ def _analyze_paper(
     }
 
 
+def _write_alignment_results(
+    req: RunAlignmentRequest,
+    payload: Dict[str, Any],
+) -> RunAlignmentResponse:
+    _ensure_dir(req.output_root)
+    result_path = os.path.join(req.output_root, f"{req.alignment_id}_results.json")
+    with open(result_path, "w", encoding="utf-8") as f:
+        json.dump(payload, f, indent=2)
+    logger.info(
+        f"GPU node wrote results for {req.alignment_id} "
+        f"({len(payload.get('papers', []))} papers) -> {result_path}"
+    )
+    return RunAlignmentResponse(
+        status="ok",
+        alignment_id=req.alignment_id,
+        results_path=result_path,
+    )
+
+
 def _run_alignment_impl(req: RunAlignmentRequest) -> RunAlignmentResponse:
     if not os.path.isdir(req.papers_dir):
         raise HTTPException(
@@ -230,7 +232,6 @@ def _run_alignment_impl(req: RunAlignmentRequest) -> RunAlignmentResponse:
         )
 
     _ensure_dir(req.output_root)
-    result_path = os.path.join(req.output_root, f"{req.alignment_id}_results.json")
     log_dir = os.path.join(req.output_root, "logs")
     log_path = os.path.join(log_dir, f"{req.alignment_id}.log")
 
@@ -292,19 +293,96 @@ def _run_alignment_impl(req: RunAlignmentRequest) -> RunAlignmentResponse:
         },
     }
 
-    with open(result_path, "w", encoding="utf-8") as f:
-        json.dump(payload, f, indent=2)
+    return _write_alignment_results(req, payload)
 
-    logger.info(
-        f"GPU node wrote results for {req.alignment_id} "
-        f"({len(papers)} papers) -> {result_path}"
-    )
 
-    return RunAlignmentResponse(
-        status="ok",
-        alignment_id=req.alignment_id,
-        results_path=result_path,
+def _run_alignment_graded_impl(
+    req: RunAlignmentGradedRequest,
+) -> RunAlignmentResponse:
+    if not os.path.isdir(req.papers_dir):
+        raise HTTPException(
+            status_code=400,
+            detail=f"papers_dir does not exist or is not a directory: {req.papers_dir}",
+        )
+    _ensure_dir(req.output_root)
+    log_dir = os.path.join(req.output_root, "logs")
+    log_path = os.path.join(log_dir, f"{req.alignment_id}_synthesis.log")
+    llm_base_url = os.environ.get("VLLM_BASE_URL")
+    max_tokens = (req.constraints and req.constraints.max_tokens) or 4096
+    temperature = (
+        (req.constraints and req.constraints.temperature)
+        if req.constraints is not None
+        else 0.0
     )
+    if temperature is None:
+        temperature = 0.0
+
+    # Keep synthesis packet compact: include grades + concise rationales.
+    graded_lines: List[str] = []
+    for gp in req.graded_papers:
+        dscore = ", ".join(
+            f"{k}:{v:.3f}" for k, v in (gp.rubric_dimension_scores or {}).items()
+        )
+        graded_lines.append(
+            f"- {gp.file_name} role={gp.paper_role or 'unknown'} "
+            f"grade={gp.relevance_grade:.3f} dims=[{dscore}] "
+            f"rationale={gp.rationale[:350]}"
+        )
+    grading_meta = req.grading_meta or {}
+    synth_prompt = (
+        f"{req.instructions}\n\n"
+        f"Use the graded evidence below to synthesize a final alignment analysis.\n"
+        f"Prioritize high-grade papers and explain any conflicts with low-grade papers.\n"
+        f"Return concise, evidence-grounded conclusions.\n\n"
+        f"Alignment: {req.alignment_id}\n"
+        f"Query={req.query}\n"
+        f"Target={req.target_id}\n"
+        f"Grading meta: {json.dumps(grading_meta, ensure_ascii=False)}\n\n"
+        f"Graded papers:\n" + "\n".join(graded_lines[:500])
+    )
+    synthesis_text = ""
+    notes = ""
+    if llm_base_url:
+        try:
+            synthesis_text = _call_llm(
+                synth_prompt,
+                llm_base_url,
+                max_tokens=max_tokens,
+                temperature=temperature,
+            )
+        except Exception as e:
+            notes = str(e)
+            logger.warning(f"Synthesis LLM call failed for {req.alignment_id}: {e}")
+    if log_path:
+        _ensure_dir(os.path.dirname(log_path))
+        with open(log_path, "a", encoding="utf-8") as f:
+            f.write(f"alignment={req.alignment_id}\n")
+            f.write(f"n_graded={len(req.graded_papers)}\n")
+            f.write(
+                f"prompt_preview={synth_prompt[:3500]}"
+                + ("\n...[truncated]\n" if len(synth_prompt) > 3500 else "\n")
+            )
+            f.write(f"synthesis_len={len(synthesis_text)} notes={notes}\n")
+
+    payload: Dict[str, Any] = {
+        "alignment_id": req.alignment_id,
+        "query": req.query,
+        "target_id": req.target_id,
+        "papers_dir": req.papers_dir,
+        "graded_papers": [gp.dict() for gp in req.graded_papers],
+        "grading_meta": grading_meta,
+        "synthesis": {
+            "text": synthesis_text,
+            "notes": notes,
+            "llm_model": os.environ.get("VLLM_MODEL_NAME", "unknown"),
+            "constraints": req.constraints.dict() if req.constraints else None,
+        },
+        "meta": {
+            "finished_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            "mode": "graded_synthesis",
+        },
+    }
+    return _write_alignment_results(req, payload)
 
 
 @app.get("/healthz")
@@ -315,6 +393,11 @@ def healthz() -> Dict[str, str]:
 @app.post("/run_alignment", response_model=RunAlignmentResponse)
 def run_alignment(req: RunAlignmentRequest) -> RunAlignmentResponse:
     return _run_alignment_impl(req)
+
+
+@app.post("/run_alignment_graded", response_model=RunAlignmentResponse)
+def run_alignment_graded(req: RunAlignmentGradedRequest) -> RunAlignmentResponse:
+    return _run_alignment_graded_impl(req)
 
 
 if __name__ == "__main__":

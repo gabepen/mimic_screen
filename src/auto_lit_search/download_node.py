@@ -88,17 +88,46 @@ def _load_idmap(csv_path: str) -> Dict[str, Dict[str, Any]]:
     return out
 
 
-def _wait_health(gpu_url_base: str, timeout: int = 300, interval: int = 5) -> bool:
+def _wait_health(
+    service: str,
+    gpu_url_base: str,
+    timeout: int = 300,
+    interval: int = 5,
+) -> bool:
     url = f"{gpu_url_base.rstrip('/')}/healthz"
     deadline = time.monotonic() + timeout
+    started = time.monotonic()
+    attempt = 0
     while time.monotonic() < deadline:
+        attempt += 1
         try:
             r = requests.get(url, timeout=10)
             if r.status_code == 200:
+                logger.info(
+                    "{} health OK at {} (after {:.0f}s, {} tries)",
+                    service,
+                    url,
+                    time.monotonic() - started,
+                    attempt,
+                )
                 return True
-        except Exception:
-            pass
+        except Exception as e:
+            if attempt == 1 or attempt % 6 == 0:
+                logger.info(
+                    "Waiting for {} at {} ({:.0f}s / {}s) last_error={!r}",
+                    service,
+                    url,
+                    time.monotonic() - started,
+                    timeout,
+                    e,
+                )
         time.sleep(interval)
+    logger.error(
+        "Timed out waiting for {} at {} after {}s",
+        service,
+        url,
+        timeout,
+    )
     return False
 
 
@@ -116,16 +145,43 @@ def run(
     no_cache: bool = False,
     docling_host: str = "",
     docling_port: int = 9100,
+    grader_host: str = "",
+    grader_port: int = 9200,
+    host_rubric_path: str = "",
+    microbe_rubric_path: str = "",
 ) -> None:
     gpu_url_base = f"http://{gpu_host}:{gpu_port}"
-    if not _wait_health(gpu_url_base, timeout=300):
+    logger.info(
+        "download_node: probing LLM GPU health at {}/healthz",
+        gpu_url_base.rstrip("/"),
+    )
+    sys.stdout.flush()
+    if not _wait_health("LLM GPU", gpu_url_base, timeout=300):
         raise RuntimeError(f"GPU node not healthy at {gpu_url_base}")
 
     docling_url_base = ""
     if docling_host:
         docling_url_base = f"http://{docling_host}:{docling_port}"
-        if not _wait_health(docling_url_base, timeout=300):
+        logger.info(
+            "download_node: probing Docling health at {}/healthz",
+            docling_url_base.rstrip("/"),
+        )
+        sys.stdout.flush()
+        if not _wait_health("Docling", docling_url_base, timeout=300):
             raise RuntimeError(f"Docling node not healthy at {docling_url_base}")
+    if not grader_host:
+        raise RuntimeError("GRADER_HOST is required for two-stage analysis flow")
+    if not host_rubric_path or not microbe_rubric_path:
+        raise RuntimeError(
+            "HOST_RUBRIC_PATH and MICROBE_RUBRIC_PATH are required for grading"
+        )
+    grader_url_base = f"http://{grader_host}:{grader_port}"
+    logger.info(
+        "download_node: probing Grader health at {}/healthz",
+        grader_url_base.rstrip("/"),
+    )
+    if not _wait_health("Grader", grader_url_base, timeout=300):
+        raise RuntimeError(f"Grader node not healthy at {grader_url_base}")
 
     instructions_text = instructions
     if instructions_file and os.path.isfile(instructions_file):
@@ -323,7 +379,7 @@ def run(
                 )
                 continue
 
-            # Final handoff: post completed alignment set directly to GPU.
+            # Final handoff: CPU -> grader -> synthesis GPU.
             payload: Dict[str, Any] = {
                 "alignment_id": alignment_id,
                 "papers_dir": papers_dir,
@@ -340,24 +396,28 @@ def run(
                     "Then output a single line: relevance_score=<float between 0 and 1>."
                 ),
                 "output_root": output_root,
+                "host_rubric_path": host_rubric_path,
+                "microbe_rubric_path": microbe_rubric_path,
+                "synthesis_host": gpu_host,
+                "synthesis_port": gpu_port,
             }
             if gene_context is not None:
                 payload["gene_context"] = gene_context
 
             try:
                 r = session.post(
-                    f"{gpu_url_base}/run_alignment",
+                    f"{grader_url_base}/grade_alignment",
                     json=payload,
                     timeout=request_timeout,
                 )
                 r.raise_for_status()
                 out = r.json()
                 logger.info(
-                    f"Alignment {alignment_id}: {out.get('status')} -> {out.get('results_path')}"
+                    f"Alignment {alignment_id}: graded+synthesis {out.get('status')} -> {out.get('results_path')}"
                 )
                 total += 1
             except requests.RequestException as e:
-                logger.error(f"Alignment {alignment_id}: GPU request failed: {e}")
+                logger.error(f"Alignment {alignment_id}: grader request failed: {e}")
                 raise
 
     logger.info(f"Submitted {total} alignments to GPU node.")
@@ -377,6 +437,10 @@ def main() -> int:
     p.add_argument("--gpu-port", type=int, default=9000)
     p.add_argument("--docling-host", default="", help="Docling node hostname")
     p.add_argument("--docling-port", type=int, default=9100)
+    p.add_argument("--grader-host", default=os.environ.get("GRADER_HOST", ""))
+    p.add_argument("--grader-port", type=int, default=int(os.environ.get("GRADER_API_PORT", "9200")))
+    p.add_argument("--host-rubric-path", default=os.environ.get("HOST_RUBRIC_PATH", ""))
+    p.add_argument("--microbe-rubric-path", default=os.environ.get("MICROBE_RUBRIC_PATH", ""))
     p.add_argument("--output-root", required=True, help="Results output root")
     p.add_argument("--instructions", default="", help="Inline prompt/instructions")
     p.add_argument("--instructions-file", default="", help="Path to prompt/instructions file")
@@ -400,6 +464,10 @@ def main() -> int:
         no_cache=args.no_cache,
         docling_host=args.docling_host,
         docling_port=args.docling_port,
+        grader_host=args.grader_host,
+        grader_port=args.grader_port,
+        host_rubric_path=args.host_rubric_path,
+        microbe_rubric_path=args.microbe_rubric_path,
     )
     return 0
 
