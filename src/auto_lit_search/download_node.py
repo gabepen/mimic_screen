@@ -70,7 +70,14 @@ def _load_idmap(csv_path: str) -> Dict[str, Dict[str, Any]]:
             if not query or not target:
                 continue
 
-            def _meta(prefix: str) -> Dict[str, str]:
+            def _meta(prefix: str) -> Dict[str, Any]:
+                syn_raw = (
+                    row.get(f"{prefix}_synonyms")
+                    or row.get(f"{prefix}_gene_synonyms")
+                    or row.get(f"{prefix}_aliases")
+                    or ""
+                )
+                syns = [s.strip() for s in str(syn_raw).split(",") if s.strip()]
                 return {
                     "uniprot_id": (row.get(prefix) or "").strip(),
                     "entrez_id": (row.get(f"{prefix}_entrez_id") or "").strip(),
@@ -78,6 +85,7 @@ def _load_idmap(csv_path: str) -> Dict[str, Dict[str, Any]]:
                     "locus_tag": (row.get(f"{prefix}_locus_tag") or "").strip(),
                     "genbank_acc": (row.get(f"{prefix}_genbank_acc") or "").strip(),
                     "common_name": (row.get(f"{prefix}_common_name") or "").strip(),
+                    "synonyms": syns,
                 }
 
             key = f"{query}|{target}"

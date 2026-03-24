@@ -68,6 +68,75 @@ def _call_llm(
     return ""
 
 
+def _dedupe_keep_order(items: List[str]) -> List[str]:
+    seen = set()
+    out: List[str] = []
+    for x in items:
+        k = x.strip()
+        if not k:
+            continue
+        lk = k.lower()
+        if lk in seen:
+            continue
+        seen.add(lk)
+        out.append(k)
+    return out
+
+
+def _as_list(v: Any) -> List[str]:
+    if v is None:
+        return []
+    if isinstance(v, list):
+        return [str(x).strip() for x in v if str(x).strip()]
+    s = str(v).strip()
+    if not s:
+        return []
+    if "," in s:
+        return [p.strip() for p in s.split(",") if p.strip()]
+    return [s]
+
+
+def _gene_terms(meta: Dict[str, Any], fallback_id: str) -> Dict[str, Any]:
+    symbol = str(meta.get("gene_name") or "").strip() or fallback_id
+    common_name = str(meta.get("common_name") or "").strip()
+    syn_keys = [
+        "synonyms",
+        "gene_synonyms",
+        "aliases",
+        "alias",
+        "name_synonyms",
+    ]
+    syns: List[str] = []
+    for k in syn_keys:
+        syns.extend(_as_list(meta.get(k)))
+    syns = _dedupe_keep_order(syns)
+    syns = [s for s in syns if s.lower() not in {symbol.lower(), common_name.lower()}]
+    return {
+        "symbol": symbol,
+        "common_name": common_name or "none",
+        "synonyms": syns,
+    }
+
+
+def _identification_terms_block(
+    query: str,
+    target_id: str,
+    gene_context: Optional[Dict[str, Any]],
+) -> str:
+    query_meta = (gene_context or {}).get("query") or {}
+    target_meta = (gene_context or {}).get("target") or {}
+    q = _gene_terms(query_meta, query)
+    t = _gene_terms(target_meta, target_id)
+    q_syn = ", ".join(q["synonyms"]) if q["synonyms"] else "none"
+    t_syn = ", ".join(t["synonyms"]) if t["synonyms"] else "none"
+    return (
+        "Paper identification terms used in retrieval (prioritize symbol/common name; "
+        "use synonyms as alternate mentions):\n"
+        f"- Query gene ({query}): symbol={q['symbol']}; common_name={q['common_name']}; synonyms={q_syn}\n"
+        f"- Target gene ({target_id}): symbol={t['symbol']}; common_name={t['common_name']}; synonyms={t_syn}\n"
+    )
+
+
 def _analyze_paper(
     file_path: str,
     query: str,
@@ -95,6 +164,7 @@ def _analyze_paper(
 
     query_meta = (gene_context or {}).get("query") or {}
     target_meta = (gene_context or {}).get("target") or {}
+    term_block = _identification_terms_block(query, target_id, gene_context)
     query_gene_name = (query_meta.get("gene_name") or "").strip() or query
     target_gene_name = (target_meta.get("gene_name") or "").strip() or target_id
 
@@ -145,6 +215,7 @@ def _analyze_paper(
 
     user_content = (
         f"{instructions}\n\n"
+        f"{term_block}\n"
         f"Alignment genes:\n"
         f"- Focus gene: {focus_gene_name} ({focus_gene_id})\n"
         f"- Focus gene identifiers: {focus_id_str}\n"
@@ -329,8 +400,10 @@ def _run_alignment_graded_impl(
             f"rationale={gp.rationale[:350]}"
         )
     grading_meta = req.grading_meta or {}
+    term_block = _identification_terms_block(req.query, req.target_id, req.gene_context)
     synth_prompt = (
         f"{req.instructions}\n\n"
+        f"{term_block}\n"
         f"Use the graded evidence below to synthesize a final alignment analysis.\n"
         f"Prioritize high-grade papers and explain any conflicts with low-grade papers.\n"
         f"Return concise, evidence-grounded conclusions.\n\n"

@@ -117,6 +117,71 @@ def _extract_paper_role(fname: str) -> Optional[str]:
     return None
 
 
+def _dedupe_keep_order(items: List[str]) -> List[str]:
+    seen = set()
+    out: List[str] = []
+    for x in items:
+        k = x.strip()
+        if not k:
+            continue
+        lk = k.lower()
+        if lk in seen:
+            continue
+        seen.add(lk)
+        out.append(k)
+    return out
+
+
+def _as_list(v: Any) -> List[str]:
+    if v is None:
+        return []
+    if isinstance(v, list):
+        return [str(x).strip() for x in v if str(x).strip()]
+    s = str(v).strip()
+    if not s:
+        return []
+    if "," in s:
+        return [p.strip() for p in s.split(",") if p.strip()]
+    return [s]
+
+
+def _gene_terms(meta: Dict[str, Any], fallback_id: str) -> Dict[str, Any]:
+    symbol = str(meta.get("gene_name") or "").strip() or fallback_id
+    common_name = str(meta.get("common_name") or "").strip()
+    syn_keys = [
+        "synonyms",
+        "gene_synonyms",
+        "aliases",
+        "alias",
+        "name_synonyms",
+    ]
+    syns: List[str] = []
+    for k in syn_keys:
+        syns.extend(_as_list(meta.get(k)))
+    syns = _dedupe_keep_order(syns)
+    syns = [s for s in syns if s.lower() not in {symbol.lower(), common_name.lower()}]
+    return {
+        "symbol": symbol,
+        "common_name": common_name or "none",
+        "synonyms": syns,
+    }
+
+
+def _identification_terms_block(req: GradeAlignmentRequest) -> str:
+    query_meta = (req.gene_context or {}).get("query") or {}
+    target_meta = (req.gene_context or {}).get("target") or {}
+    q = _gene_terms(query_meta, req.query)
+    t = _gene_terms(target_meta, req.target_id)
+    q_syn = ", ".join(q["synonyms"]) if q["synonyms"] else "none"
+    t_syn = ", ".join(t["synonyms"]) if t["synonyms"] else "none"
+    return (
+        "Paper identification terms used in retrieval (prioritize symbol/common name; "
+        "use synonyms as alternate mentions):\n"
+        f"- Query gene ({req.query}): symbol={q['symbol']}; common_name={q['common_name']}; synonyms={q_syn}\n"
+        f"- Target gene ({req.target_id}): symbol={t['symbol']}; common_name={t['common_name']}; synonyms={t_syn}\n"
+    )
+
+
 def _safe_float(v: Any, default: float = 0.0) -> float:
     try:
         x = float(v)
@@ -163,6 +228,7 @@ def _grade_single_paper(
     role = _extract_paper_role(fname)
     text = _read_text(file_path)
     dims = _rubric_dimensions(rubric)
+    term_block = _identification_terms_block(req)
     dim_lines = "\n".join(
         f"- {d['name']}: {d['description']} (weight={d['weight']})" for d in dims
     )
@@ -174,6 +240,7 @@ def _grade_single_paper(
         f"Query={req.query}\n"
         f"Target={req.target_id}\n"
         f"Paper role={role or 'unknown'}\n"
+        f"{term_block}\n"
         f"Rubric:\n{json.dumps(rubric, ensure_ascii=False)}\n"
         f"Dimensions:\n{dim_lines}\n\n"
         f"Paper excerpt:\n{text[:80000]}"
