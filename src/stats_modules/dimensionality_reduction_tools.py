@@ -13,6 +13,38 @@ try:
 except ImportError:
     UMAP_AVAILABLE = False
 
+
+class FixedRangeScaler:
+    """
+    Scales each feature from [observed_min, 1.0] -> [0.0, 1.0].
+    Uses the per-feature minimum from the data with a fixed max of 1.0.
+    This is a simple linear stretch that equalizes feature contribution
+    without the distribution-dependent distortion of RobustScaler.
+    """
+    def __init__(self):
+        self.mins_ = None
+        self.ranges_ = None
+    
+    def fit(self, X, y=None):
+        X = np.asarray(X, dtype=np.float64)
+        self.mins_ = X.min(axis=0)
+        self.ranges_ = 1.0 - self.mins_
+        # Avoid division by zero for constant features
+        self.ranges_[self.ranges_ == 0] = 1.0
+        return self
+    
+    def transform(self, X):
+        X = np.asarray(X, dtype=np.float64)
+        return (X - self.mins_) / self.ranges_
+    
+    def fit_transform(self, X, y=None):
+        self.fit(X, y)
+        return self.transform(X)
+    
+    def inverse_transform(self, X):
+        X = np.asarray(X, dtype=np.float64)
+        return X * self.ranges_ + self.mins_
+
 try:
     from sklearn.manifold import SpectralEmbedding
     from scipy.sparse import csgraph
@@ -994,34 +1026,37 @@ def apply_mimic_cloud_to_dataset(scaled_data, cloud_definition, data_frame=None,
     """
     from scipy.spatial.distance import cdist
     
-    # Check if we should use raw features (better for cross-system transfer)
-    use_raw_features = (
+    # Check if raw features are available in cloud definition
+    has_raw_features = (
         'core_mimic_features_raw' in cloud_definition and 
         cloud_definition['core_mimic_features_raw'] is not None and
         'feature_columns' in cloud_definition and
         cloud_definition['feature_columns'] is not None and
-        scaler is not None and
         data_frame is not None
     )
     
-    if use_raw_features:
-        # Use raw features and scale with target system's scaler
-        print("  Using raw features from cloud definition, scaling with target system's scaler")
+    use_raw_features = False
+    
+    if has_raw_features:
         feature_columns = cloud_definition['feature_columns']
-        
-        # Check that feature columns exist in target data_frame
         missing_cols = [col for col in feature_columns if col not in data_frame.columns]
         if missing_cols:
             print(f"  Warning: Missing feature columns in target data: {missing_cols}")
             print(f"  Falling back to pre-scaled features (may not transfer well)")
-            use_raw_features = False
         else:
-            # Extract raw features from cloud definition and scale with target scaler
+            use_raw_features = True
             core_mimic_features_raw = cloud_definition['core_mimic_features_raw']
-            core_mimic_features = scaler.transform(core_mimic_features_raw)
             
-            # Recalculate thresholds in the target system's scaled space
-            # This is approximate - we scale the raw features and recompute distances
+            if scaler is not None:
+                # Scale raw features with target system's scaler
+                print("  Using raw features from cloud definition, scaling with target system's scaler")
+                core_mimic_features = scaler.transform(core_mimic_features_raw)
+            else:
+                # No scaler - use raw features directly (all features already on same 0-1 scale)
+                print("  No scaler used - using raw features directly (features already on 0-1 scale)")
+                core_mimic_features = core_mimic_features_raw
+            
+            # Recalculate thresholds in the target system's feature space
             core_pairwise_distances = cdist(core_mimic_features, core_mimic_features, metric='euclidean')
             upper_triangle = np.triu(core_pairwise_distances, k=1)
             core_pairwise_flat = upper_triangle[upper_triangle > 0]
@@ -1035,7 +1070,7 @@ def apply_mimic_cloud_to_dataset(scaled_data, cloud_definition, data_frame=None,
                 threshold_within = cloud_definition['threshold_within']
                 threshold_around = cloud_definition['threshold_around']
             
-            print(f"  Recalculated thresholds in target system's scaled space:")
+            print(f"  Recalculated thresholds in target feature space:")
             print(f"    Within cloud: {threshold_within:.6f} (original: {cloud_definition['threshold_within']:.6f})")
             print(f"    Around cloud: {threshold_around:.6f} (original: {cloud_definition['threshold_around']:.6f})")
     
@@ -1045,7 +1080,10 @@ def apply_mimic_cloud_to_dataset(scaled_data, cloud_definition, data_frame=None,
         threshold_within = cloud_definition['threshold_within']
         threshold_around = cloud_definition['threshold_around']
         print("  Using pre-scaled features from cloud definition")
-        print("  Note: This assumes source and target systems use similar scaling")
+        if scaler is None:
+            print("  Note: No scaler and no raw features - using cloud's original scaled features")
+        else:
+            print("  Note: This assumes source and target systems use similar scaling")
     
     # Check feature dimensions match
     if scaled_data.shape[1] != core_mimic_features.shape[1]:
@@ -2451,7 +2489,7 @@ def compute_diffusion_map_analysis(scaled_data, data_frame, pca_test_dir, organi
                     plot_file_3d_dc134_cloud = os.path.join(pca_test_dir, f'diffusion_map_{organism_name}_3d_dc134_cloud_membership_{suffix}.png')
                     plt.savefig(plot_file_3d_dc134_cloud, dpi=300, bbox_inches='tight')
                     print(f"Saved 3D DC1-DC3-DC4 cloud membership plot ({suffix}) to {plot_file_3d_dc134_cloud}")
-                    plt.close()
+                plt.close()
     
     # ============================================================
     # 1D Structure Analysis: Project onto DC1 alone
@@ -4918,7 +4956,19 @@ def value_driven_pca_clustering(pca_test_dir, data_frame, organism_name, n_clust
     print(f"Using {len(selected_columns)} features for clustering: {selected_columns}")
     
     # Scale the data
-    if scaler_type == 'zscore' or scaler_type == 'standard':
+    if scaler_type == 'none':
+        scaler = None
+        scaled_data = test_data_frame.values.astype(np.float64)
+        print("No scaling applied (features already on comparable 0-1 scale)")
+    elif scaler_type == 'fixed':
+        scaler = FixedRangeScaler()
+        print("Using FixedRangeScaler (scales from [per-feature min, 1.0] -> [0.0, 1.0])")
+        # Print after fit so user sees what mins are being used
+        scaler.fit(test_data_frame)
+        for i, col in enumerate(selected_columns):
+            print(f"  {col}: min={scaler.mins_[i]:.4f}, range=[{scaler.mins_[i]:.4f}, 1.0]")
+        scaled_data = scaler.transform(test_data_frame)
+    elif scaler_type == 'zscore' or scaler_type == 'standard':
         scaler = StandardScaler()
         print("Using StandardScaler (z-score normalization: mean=0, std=1)")
     elif scaler_type == 'robust':
@@ -4929,9 +4979,10 @@ def value_driven_pca_clustering(pca_test_dir, data_frame, organism_name, n_clust
         scaler = MinMaxScaler()
         print("Using MinMaxScaler (scales to 0-1 range)")
     else:
-        raise ValueError(f"Unknown scaler type: {scaler_type}. Choose 'robust', 'zscore'/'standard', or 'minmax'")
+        raise ValueError(f"Unknown scaler type: {scaler_type}. Choose 'none', 'fixed', 'robust', 'zscore'/'standard', or 'minmax'")
     
-    scaled_data = scaler.fit_transform(test_data_frame)
+    if scaler is not None and scaler_type != 'fixed':
+        scaled_data = scaler.fit_transform(test_data_frame)
     
     # Run dimensionality reduction (unsupervised - no labels)
     # This is purely data-driven for discovering patterns, not validating known examples

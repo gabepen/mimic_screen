@@ -166,6 +166,12 @@ def main():
         help='Include pLDDT features (plddt_query_region, plddt_target_region) in clustering. These are AlphaFold confidence scores for query and target regions.'
     )
     parser.add_argument(
+        '--algn_fraction_max',
+        type=float,
+        default=None,
+        help='Optional upper threshold for algn_fraction. Alignments with algn_fraction greater than this value are filtered out before analysis.'
+    )
+    parser.add_argument(
         '--adjust_tm_score',
         action='store_true',
         help='Replace TM-score with pLDDT-weighted TM-score (score * min_plddt/100). Downweights alignments with low structure confidence. Requires pLDDT columns.'
@@ -184,8 +190,8 @@ def main():
         '--scaler',
         type=str,
         default='robust',
-        choices=['robust', 'zscore', 'standard', 'minmax'],
-        help='Scaling method: robust (default, robust to outliers), zscore/standard (mean=0, std=1), or minmax (0-1 range)'
+        choices=['none', 'fixed', 'robust', 'zscore', 'standard', 'minmax'],
+        help='Scaling method: none (no scaling), fixed (scales from [per-feature min, 1.0] -> [0,1], best for cloud transfer), robust (default, median/IQR), zscore/standard (mean=0, std=1), or minmax (0-1 range)'
     )
     parser.add_argument(
         '--use_diffusion',
@@ -296,6 +302,20 @@ def main():
     # Read input CSV
     print(f"Reading alignment data from: {args.input}")
     df = pd.read_csv(args.input)
+    
+    # Optional value-based filtering on algn_fraction
+    if args.algn_fraction_max is not None:
+        if 'algn_fraction' not in df.columns:
+            print("Warning: '--algn_fraction_max' specified but 'algn_fraction' column not found. Skipping value-based filtering.")
+        else:
+            initial_count = len(df)
+            df = df[df['algn_fraction'] <= args.algn_fraction_max]
+            filtered_count = len(df)
+            removed = initial_count - filtered_count
+            print(
+                f"Filtered out {removed} alignments with algn_fraction > {args.algn_fraction_max} "
+                f"({(removed / initial_count * 100):.1f}%). Remaining: {filtered_count}"
+            )
     
     # Filter out alignments with likely paralogs
     if 'targets_likely_paralogs' in df.columns:
