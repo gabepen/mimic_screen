@@ -42,7 +42,7 @@ vllm serve \"${MODEL_DIR}\" \
 VLLM_PID=\$!
 
 for i in \$(seq 1 60); do
-    if python3 - << 'PY' 2>/dev/null; then break; fi
+    if /usr/bin/python3 - << 'PY' 2>/dev/null; then break; fi
 import os
 import socket
 import sys
@@ -67,7 +67,7 @@ done
 export VLLM_BASE_URL=\"http://127.0.0.1:${VLLM_PORT}\"
 export GRADER_API_PORT=\"${GRADER_API_PORT}\"
 
-python3 -m uvicorn auto_lit_search.grader_server:app --host 0.0.0.0 --port \"${GRADER_API_PORT}\"
+/usr/bin/python3 -m uvicorn auto_lit_search.grader_server:app --host 0.0.0.0 --port \"${GRADER_API_PORT}\"
 
 kill \"\${VLLM_PID}\" || true
 wait \"\${VLLM_PID}\" 2>/dev/null || true

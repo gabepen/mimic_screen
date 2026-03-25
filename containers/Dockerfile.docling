@@ -16,14 +16,19 @@ RUN set -e && \
         poppler-utils && \
     apt-get clean && rm -rf /var/lib/apt/lists/*
 
-RUN python3 -m pip install --no-cache-dir --upgrade pip && \
-    python3 -m pip install --no-cache-dir \
+# Use distro Python explicitly. CUDA base images often put a different `python3`
+# in /usr/local/bin first on PATH; packages installed via `python3 -m pip` may
+# only be visible to /usr/bin/python3, causing "No module named uvicorn" at runtime.
+RUN /usr/bin/python3 -m pip install --no-cache-dir --upgrade pip && \
+    /usr/bin/python3 -m pip install --no-cache-dir \
         docling \
         pypdf \
         loguru \
         fastapi \
         uvicorn[standard] \
         requests
+
+RUN /usr/bin/python3 -c "import uvicorn; import fastapi"
 
 ENV PYTHONUNBUFFERED=1
 ENV QT_QPA_PLATFORM=offscreen

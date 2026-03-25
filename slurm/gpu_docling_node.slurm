@@ -28,6 +28,6 @@ set -euo pipefail
 export PYTHONPATH=\"${REPO_ROOT}/src:\${PYTHONPATH:-}\"
 export DOCLING_API_PORT=\"${DOCLING_API_PORT}\"
 
-python3 -m uvicorn auto_lit_search.docling_server:app --host 0.0.0.0 --port \"${DOCLING_API_PORT}\"
+/usr/bin/python3 -m uvicorn auto_lit_search.docling_server:app --host 0.0.0.0 --port \"${DOCLING_API_PORT}\"
 "
 
