@@ -16,29 +16,14 @@ RUN set -e && \
         poppler-utils && \
     apt-get clean && rm -rf /var/lib/apt/lists/*
 
-# Install into every distinct python3 on the image (CUDA bases may expose both
-# /usr/bin and /usr/local/bin). Using only one hardcoded path breaks when that
-# binary is absent or when runtime PATH picks the other interpreter.
-RUN set -e; \
-    _seen=""; \
-    install_one() { \
-      "$1" -m pip install --no-cache-dir --upgrade pip && \
-      "$1" -m pip install --no-cache-dir \
+RUN python3 -m pip install --no-cache-dir --upgrade pip && \
+    python3 -m pip install --no-cache-dir \
         docling \
         pypdf \
         loguru \
         fastapi \
         uvicorn[standard] \
-        requests; \
-    }; \
-    for cand in $(command -v python3 2>/dev/null || true) /usr/bin/python3 /usr/local/bin/python3; do \
-      [ -n "$cand" ] && [ -x "$cand" ] || continue; \
-      rp=$$(readlink -f "$$cand" 2>/dev/null || echo "$$cand"); \
-      case "$$_seen" in *"|$$rp|"*) continue ;; esac; \
-      _seen="$${_seen}|$$rp|"; \
-      install_one "$$cand"; \
-    done; \
-    [ "$$_seen" != "" ] || (echo "No python3 executable found" >&2; exit 1)
+        requests
 
 RUN python3 -c "import uvicorn; import fastapi"
 
