@@ -6,7 +6,7 @@
 #SBATCH --gres=gpu:A100:1
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=64G
-#SBATCH --time=48:00:00
+#SBATCH --time=86:00:00
 #SBATCH --output=auto_lit_grader_%j.log
 
 set -euo pipefail
