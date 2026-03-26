@@ -20,6 +20,7 @@ RUN python3 -m pip install --no-cache-dir --upgrade pip && \
         docling \
         rapidocr \
         pypdf \
+        onnxruntime \
         loguru \
         fastapi \
         "uvicorn[standard]" \
