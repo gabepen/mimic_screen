@@ -38,39 +38,41 @@ WORKDIR /app
 
 # Pre-download RapidOCR Torch PP-OCRv4 weights into a writable, image-owned dir.
 # This avoids runtime downloads into read-only site-packages.
-RUN set -e && \
-    mkdir -p "${RAPIDOCR_MODELS_DIR}" && \
-    cat > /tmp/rapidocr_torch_ppocrv4.yaml <<'YAML' && \
-Det:
-  engine_type: 'torch'
-  lang_type: 'ch'
-  model_type: 'mobile'
-  ocr_version: 'PP-OCRv4'
-  task_type: 'det'
-  model_path: null
-  model_dir: /opt/rapidocr_models
-Cls:
-  engine_type: 'torch'
-  lang_type: 'ch'
-  model_type: 'mobile'
-  ocr_version: 'PP-OCRv4'
-  task_type: 'cls'
-  model_path: null
-  model_dir: /opt/rapidocr_models
-Rec:
-  engine_type: 'torch'
-  lang_type: 'ch'
-  model_type: 'mobile'
-  ocr_version: 'PP-OCRv4'
-  task_type: 'rec'
-  model_path: null
-  model_dir: /opt/rapidocr_models
-EngineConfig:
-  torch:
-    use_cuda: false
-YAML
-    rapidocr download_models --config /tmp/rapidocr_torch_ppocrv4.yaml && \
-    python3 -c "from rapidocr import RapidOCR; RapidOCR(config_path='/tmp/rapidocr_torch_ppocrv4.yaml'); print('RapidOCR warm ok')"
+RUN bash -lc '\
+set -euo pipefail; \
+mkdir -p "${RAPIDOCR_MODELS_DIR}"; \
+cat > /tmp/rapidocr_torch_ppocrv4.yaml <<'"'"'YAML'"'"'; \
+Det: \
+  engine_type: "torch" \
+  lang_type: "ch" \
+  model_type: "mobile" \
+  ocr_version: "PP-OCRv4" \
+  task_type: "det" \
+  model_path: null \
+  model_dir: /opt/rapidocr_models \
+Cls: \
+  engine_type: "torch" \
+  lang_type: "ch" \
+  model_type: "mobile" \
+  ocr_version: "PP-OCRv4" \
+  task_type: "cls" \
+  model_path: null \
+  model_dir: /opt/rapidocr_models \
+Rec: \
+  engine_type: "torch" \
+  lang_type: "ch" \
+  model_type: "mobile" \
+  ocr_version: "PP-OCRv4" \
+  task_type: "rec" \
+  model_path: null \
+  model_dir: /opt/rapidocr_models \
+EngineConfig: \
+  torch: \
+    use_cuda: false \
+YAML \
+rapidocr download_models --config /tmp/rapidocr_torch_ppocrv4.yaml; \
+python3 -c "from rapidocr import RapidOCR; RapidOCR(config_path=\"/tmp/rapidocr_torch_ppocrv4.yaml\"); print(\"RapidOCR warm ok\")" \
+'
 
 # Repo code will be bind-mounted at runtime on the cluster; no COPY here by default.
 CMD ["bash", "-lc", "echo 'Use gpu_docling_node.slurm to start docling_server'"]
