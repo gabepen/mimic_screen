@@ -3,6 +3,8 @@ FROM nvidia/cuda:12.1.0-runtime-ubuntu22.04
 LABEL maintainer="gabe" \
       description="GPU image for auto_lit_search: Qwen3 + vLLM + FastAPI server (slim)"
 
+ARG VLLM_VERSION=">=0.18.1"
+
 RUN set -e && \
     apt-get update && \
     DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
@@ -13,13 +15,13 @@ RUN python3 -m pip install --no-cache-dir --upgrade pip && \
     python3 -m pip install --no-cache-dir \
         torch --index-url https://download.pytorch.org/whl/cu121 && \
     python3 -m pip install --no-cache-dir \
-        vllm \
+        "vllm${VLLM_VERSION}" \
         loguru \
         fastapi \
         uvicorn[standard] \
         requests
 
-RUN python3 -c "import uvicorn"
+RUN python3 -c "import uvicorn" && python3 -c "import vllm; print('vllm', vllm.__version__)"
 
 ENV PYTHONUNBUFFERED=1 \
     HF_HOME=/tmp/hf-cache
