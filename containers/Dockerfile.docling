@@ -1,79 +1,22 @@
 FROM nvidia/cuda:12.1.0-runtime-ubuntu22.04
 
-LABEL maintainer="gabe" \
-      description="GPU image for auto_lit_search: Docling v2 PDF-to-text + FastAPI server (slim)"
-
-RUN set -e && \
-    apt-get update && \
+RUN apt-get update && \
     DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
-        python3 python3-pip python3-venv git curl ca-certificates build-essential \
-        libxcb1 libxcb-render0 libxcb-shm0 libxcb-xfixes0 \
-        libx11-6 libx11-xcb1 libxkbcommon0 libxrender1 libxi6 \
-        libglib2.0-0 libgomp1 libfontconfig1 libfreetype6 \
-        libcairo2 libpango-1.0-0 libpangocairo-1.0-0 \
-        libgl1 \
-        tesseract-ocr tesseract-ocr-eng \
-        poppler-utils && \
+        python3 python3-pip git curl ca-certificates build-essential \
+        libgl1 tesseract-ocr tesseract-ocr-eng poppler-utils \
+        libglib2.0-0 libgomp1 libfontconfig1 libfreetype6 && \
     apt-get clean && rm -rf /var/lib/apt/lists/*
 
 RUN python3 -m pip install --no-cache-dir --upgrade pip && \
     python3 -m pip install --no-cache-dir \
-        docling \
-        rapidocr \
-        pypdf \
-        loguru \
-        fastapi \
-        uvicorn[standard] \
-        requests
+        docling "rapidocr[torch]" pypdf loguru fastapi "uvicorn[standard]" requests
 
-RUN python3 -c "import uvicorn; import fastapi"
-
-ENV PYTHONUNBUFFERED=1
-ENV QT_QPA_PLATFORM=offscreen
-ENV OMP_NUM_THREADS=1
 ENV RAPIDOCR_MODELS_DIR=/opt/rapidocr_models
-ENV XDG_CACHE_HOME=/tmp
+ENV PYTHONUNBUFFERED=1 QT_QPA_PLATFORM=offscreen OMP_NUM_THREADS=1
+
+# This one line downloads all models into /opt/rapidocr_models at build time
+RUN mkdir -p /opt/rapidocr_models && \
+    python3 -c "from rapidocr import RapidOCR; RapidOCR()"
 
 WORKDIR /app
-
-# Pre-download RapidOCR Torch PP-OCRv4 weights into a writable, image-owned dir.
-# This avoids runtime downloads into read-only site-packages.
-RUN bash -lc '\
-set -euo pipefail; \
-mkdir -p "${RAPIDOCR_MODELS_DIR}"; \
-cat > /tmp/rapidocr_torch_ppocrv4.yaml <<'"'"'YAML'"'"'; \
-Det: \
-  engine_type: "torch" \
-  lang_type: "ch" \
-  model_type: "mobile" \
-  ocr_version: "PP-OCRv4" \
-  task_type: "det" \
-  model_path: null \
-  model_dir: /opt/rapidocr_models \
-Cls: \
-  engine_type: "torch" \
-  lang_type: "ch" \
-  model_type: "mobile" \
-  ocr_version: "PP-OCRv4" \
-  task_type: "cls" \
-  model_path: null \
-  model_dir: /opt/rapidocr_models \
-Rec: \
-  engine_type: "torch" \
-  lang_type: "ch" \
-  model_type: "mobile" \
-  ocr_version: "PP-OCRv4" \
-  task_type: "rec" \
-  model_path: null \
-  model_dir: /opt/rapidocr_models \
-EngineConfig: \
-  torch: \
-    use_cuda: false \
-YAML \
-rapidocr download_models --config /tmp/rapidocr_torch_ppocrv4.yaml; \
-python3 -c "from rapidocr import RapidOCR; RapidOCR(config_path=\"/tmp/rapidocr_torch_ppocrv4.yaml\"); print(\"RapidOCR warm ok\")" \
-'
-
-# Repo code will be bind-mounted at runtime on the cluster; no COPY here by default.
-CMD ["bash", "-lc", "echo 'Use gpu_docling_node.slurm to start docling_server'"]
-
+CMD ["bash"]
