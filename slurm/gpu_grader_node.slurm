@@ -33,8 +33,8 @@ set -euo pipefail
 export PYTHONPATH=\"${REPO_ROOT}/src:\${PYTHONPATH:-}\"
 export VLLM_MODEL_NAME=\"\${VLLM_MODEL_NAME:-qwen3}\"
 
-# Optional AUTO_LIT_PYTHON from slurm/probe_container_python.slurm if default python3 is wrong.
-PY=\"\${AUTO_LIT_PYTHON:-python3}\"
+PY=\"\${AUTO_LIT_PYTHON:-python3.11}\"
+\"\$PY\" -c \"import sys; print('PYTHON', sys.executable, sys.version)\"
 
 vllm serve \"${MODEL_DIR}\" \
     --port \"${VLLM_PORT}\" \
