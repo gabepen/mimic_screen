@@ -1,5 +1,6 @@
 import json
 import os
+import re
 import time
 from typing import Any, Dict, List, Optional
 
@@ -17,6 +18,7 @@ app = FastAPI(title="auto_lit_search GPU node")
 
 TEXT_EXTENSIONS = (".txt",)
 MAX_PAPER_CHARS = 120000
+_MODEL_ID_CACHE: Dict[str, str] = {}
 
 
 def _ensure_dir(path: str) -> None:
@@ -42,15 +44,41 @@ def _read_text(path: str, max_chars: int = MAX_PAPER_CHARS) -> str:
 def _call_llm(
     user_content: str,
     base_url: str,
-    model: str = "default",
+    model: Optional[str] = None,
     max_tokens: int = 4096,
     temperature: float = 0.0,
 ) -> str:
     import requests
-    base_url = base_url.rstrip("/")
+
+    def _fetch_served_model_id(root: str) -> str:
+        cached = _MODEL_ID_CACHE.get(root)
+        if cached:
+            return cached
+        models_url = f"{root}/v1/models"
+        mr = requests.get(models_url, timeout=30)
+        mr.raise_for_status()
+        mdata = mr.json()
+        entries = mdata.get("data") if isinstance(mdata, dict) else None
+        if isinstance(entries, list):
+            for entry in entries:
+                if isinstance(entry, dict) and entry.get("id"):
+                    mid = str(entry["id"]).strip()
+                    if mid:
+                        _MODEL_ID_CACHE[root] = mid
+                        return mid
+        raise RuntimeError(f"Could not resolve model id from {models_url}")
+
+    root_url = base_url.rstrip("/")
+    base_url = root_url
     if not base_url.endswith("/v1"):
         base_url = f"{base_url}/v1"
     url = f"{base_url}/chat/completions"
+    configured = (os.environ.get("VLLM_MODEL_NAME") or "").strip()
+    if not model:
+        if configured:
+            model = configured
+        else:
+            model = _fetch_served_model_id(root_url)
     payload = {
         "model": model,
         "messages": [{"role": "user", "content": user_content}],
@@ -58,6 +86,12 @@ def _call_llm(
         "temperature": temperature,
     }
     r = requests.post(url, json=payload, timeout=300)
+    if r.status_code == 404 and configured:
+        # Common case: env has a friendly name (e.g. qwen3), but vLLM serves a path model id.
+        served_model = _fetch_served_model_id(root_url)
+        if served_model != model:
+            payload["model"] = served_model
+            r = requests.post(url, json=payload, timeout=300)
     r.raise_for_status()
     data = r.json()
     choices = data.get("choices") or []
@@ -153,13 +187,15 @@ def _analyze_paper(
     relevance_score = None
     notes = ""
 
-    # Infer which side of the alignment this paper supports from filename suffix.
-    # Collect.py writes files as: <pmcid>__query.txt and <pmcid>__target.txt.
+    # Infer side from filename markers.
+    # Accept both strict files (<pmcid>__query.txt / <pmcid>__target.txt) and
+    # source-tagged variants like <doi>__target__unpaywall.txt.
     fname = os.path.basename(file_path)
     paper_role: Optional[str] = None
-    if fname.endswith("__query.txt"):
+    fname_lower = fname.lower()
+    if "__query" in fname_lower:
         paper_role = "query"
-    elif fname.endswith("__target.txt"):
+    elif "__target" in fname_lower:
         paper_role = "target"
 
     query_meta = (gene_context or {}).get("query") or {}
@@ -295,6 +331,62 @@ def _write_alignment_results(
     )
 
 
+def _fallback_synthesis_text(req: RunAlignmentGradedRequest) -> str:
+    graded = req.graded_papers or []
+    if not graded:
+        return (
+            "No graded papers were available for synthesis.\n\n"
+            "Quick results summary:\n"
+            "- Likelihood of host manipulation/mimicry (0..1): 0.0\n"
+            "- Best supporting paper(s): none\n"
+            "- Main conflicts / uncertainties: No evidence was available."
+        )
+    top = sorted(graded, key=lambda g: g.relevance_grade, reverse=True)[:5]
+    best_files = ", ".join(g.file_name for g in top if g.relevance_grade > 0)
+    if not best_files:
+        best_files = "none"
+    max_grade = max(float(g.relevance_grade) for g in graded)
+    mean_grade = sum(float(g.relevance_grade) for g in graded) / max(1, len(graded))
+    likelihood = max_grade * 0.7 + mean_grade * 0.3
+    return (
+        "Synthesis fallback generated because the LLM returned empty output.\n"
+        f"Processed {len(graded)} graded papers for {req.alignment_id}. "
+        f"Max relevance grade={max_grade:.3f}, mean relevance grade={mean_grade:.3f}.\n\n"
+        "Quick results summary:\n"
+        f"- Likelihood of host manipulation/mimicry (0..1): {likelihood:.3f}\n"
+        f"- Best supporting paper(s): {best_files}\n"
+        "- Main conflicts / uncertainties: The synthesis model response was empty, "
+        "so this conclusion is a conservative heuristic from rubric grades."
+    )
+
+
+def _parse_quick_results_summary(synthesis_text: str) -> Dict[str, Any]:
+    text = synthesis_text or ""
+    likelihood = None
+    best_support = ""
+    conflicts = ""
+    m = re.search(
+        r"Likelihood of host manipulation/mimicry \(0\.\.1\):\s*([0-9]*\.?[0-9]+)",
+        text,
+    )
+    if m:
+        try:
+            likelihood = float(m.group(1))
+        except Exception:
+            likelihood = None
+    m = re.search(r"Best supporting paper\(s\):\s*(.+)", text)
+    if m:
+        best_support = m.group(1).strip()
+    m = re.search(r"Main conflicts / uncertainties:\s*(.+)", text)
+    if m:
+        conflicts = m.group(1).strip()
+    return {
+        "likelihood_host_manipulation_mimicry": likelihood,
+        "best_supporting_papers": best_support,
+        "main_conflicts_uncertainties": conflicts,
+    }
+
+
 def _run_alignment_impl(req: RunAlignmentRequest) -> RunAlignmentResponse:
     if not os.path.isdir(req.papers_dir):
         raise HTTPException(
@@ -313,12 +405,13 @@ def _run_alignment_impl(req: RunAlignmentRequest) -> RunAlignmentResponse:
             detail=f"no files found in papers_dir: {req.papers_dir}",
         )
 
-    # If we have role-labeled inputs (<pmcid>__query.txt / <pmcid>__target.txt),
+    # If we have role-labeled inputs (including source-tagged variants like
+    # <doi>__target__unpaywall.txt), prefer them over legacy unlabeled .txt files.
     # prefer them over any legacy unlabeled .txt files.
     labeled = [
         f
         for f in files
-        if f.endswith("__query.txt") or f.endswith("__target.txt")
+        if "__query" in f.lower() or "__target" in f.lower()
     ]
     if labeled:
         files = labeled
@@ -401,12 +494,21 @@ def _run_alignment_graded_impl(
         )
     grading_meta = req.grading_meta or {}
     term_block = _identification_terms_block(req.query, req.target_id, req.gene_context)
+    # Prompt structure matters: we want a running evidence discussion, then a crisp summary.
     synth_prompt = (
         f"{req.instructions}\n\n"
-        f"{term_block}\n"
-        f"Use the graded evidence below to synthesize a final alignment analysis.\n"
-        f"Prioritize high-grade papers and explain any conflicts with low-grade papers.\n"
-        f"Return concise, evidence-grounded conclusions.\n\n"
+        f"{term_block}\n\n"
+        f"Use the graded evidence below to synthesize whether the query protein "
+        f"provides credible evidence for manipulating or mimicking the target host "
+        f"protein in the Legionella-human interaction context.\n\n"
+        f"Instruction: Write a running discussion (plain text, not JSON) that references "
+        f"the graded papers. Prioritize high-grade evidence, and explicitly mention "
+        f"where low-grade or missing evidence limits confidence.\n\n"
+        f"END WITH THIS EXACT SECTION HEADER:\n"
+        f"Quick results summary:\n"
+        f"- Likelihood of host manipulation/mimicry (0..1): <float>\n"
+        f"- Best supporting paper(s): <paper file_name(s)>\n"
+        f"- Main conflicts / uncertainties: <1-3 sentences>\n\n"
         f"Alignment: {req.alignment_id}\n"
         f"Query={req.query}\n"
         f"Target={req.target_id}\n"
@@ -426,6 +528,12 @@ def _run_alignment_graded_impl(
         except Exception as e:
             notes = str(e)
             logger.warning(f"Synthesis LLM call failed for {req.alignment_id}: {e}")
+    if not synthesis_text.strip():
+        if notes:
+            notes = f"{notes}; empty synthesis output"
+        else:
+            notes = "empty synthesis output"
+        synthesis_text = _fallback_synthesis_text(req)
     if log_path:
         _ensure_dir(os.path.dirname(log_path))
         with open(log_path, "a", encoding="utf-8") as f:
@@ -437,7 +545,7 @@ def _run_alignment_graded_impl(
             )
             f.write(f"synthesis_len={len(synthesis_text)} notes={notes}\n")
 
-    payload: Dict[str, Any] = {
+    analysis_payload: Dict[str, Any] = {
         "alignment_id": req.alignment_id,
         "query": req.query,
         "target_id": req.target_id,
@@ -455,7 +563,29 @@ def _run_alignment_graded_impl(
             "mode": "graded_synthesis",
         },
     }
-    return _write_alignment_results(req, payload)
+    analysis_path = os.path.join(req.output_root, f"{req.alignment_id}_analysis.json")
+    with open(analysis_path, "w", encoding="utf-8") as f:
+        json.dump(analysis_payload, f, indent=2)
+
+    quick = _parse_quick_results_summary(synthesis_text)
+    final_payload: Dict[str, Any] = {
+        "alignment_id": req.alignment_id,
+        "query": req.query,
+        "target_id": req.target_id,
+        "papers_dir": req.papers_dir,
+        "analysis_path": analysis_path,
+        "conclusion": quick,
+        "synthesis": {
+            "text": synthesis_text,
+            "notes": notes,
+            "llm_model": os.environ.get("VLLM_MODEL_NAME", "unknown"),
+        },
+        "meta": {
+            "finished_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            "mode": "final_conclusion",
+        },
+    }
+    return _write_alignment_results(req, final_payload)
 
 
 @app.get("/healthz")
