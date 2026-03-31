@@ -403,6 +403,7 @@ def _download_pdf_from_url(
     file_stem: str,
     timeout: int = 120,
     throttle: Optional[CollectThrottle] = None,
+    request_headers: Optional[Dict[str, str]] = None,
 ) -> Optional[str]:
     os.makedirs(pdf_dir, exist_ok=True)
     out_path = os.path.join(pdf_dir, f"{file_stem}.pdf")
@@ -410,8 +411,11 @@ def _download_pdf_from_url(
         return out_path
     try:
         if throttle:
-            throttle.wait("publisher_pdf")
-        resp = session.get(pdf_url, timeout=timeout, headers={"Connection": "close"})
+            throttle.wait("pdf_url")
+        headers: Dict[str, str] = {"Connection": "close"}
+        if request_headers:
+            headers.update(request_headers)
+        resp = session.get(pdf_url, timeout=timeout, headers=headers)
         resp.raise_for_status()
         content = resp.content or b""
         ctype = (resp.headers.get("Content-Type") or "").lower()

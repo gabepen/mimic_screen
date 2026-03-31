@@ -238,12 +238,27 @@ def run(
     if idmap_path:
         idmap = _load_idmap(idmap_path)
     papers_base = os.path.join(data_root, "papers")
+    logs_base = os.path.join(data_root, "logs")
     os.makedirs(papers_base, exist_ok=True)
+    os.makedirs(logs_base, exist_ok=True)
     os.makedirs(output_root, exist_ok=True)
 
     session = requests.Session()
     pmcid_cache: Dict[str, str | None] = {}
     total = 0
+    grader_failures = 0
+    pending_grader: Dict[str, Dict[str, Any]] = {}
+    pending_attempts: Dict[str, int] = {}
+    max_grader_attempts = int(os.environ.get("GRADER_MAX_ATTEMPTS", "3"))
+    grader_attempt_timeout = int(os.environ.get("GRADER_ATTEMPT_TIMEOUT_SECONDS", "120"))
+    grader_attempt_timeout = min(grader_attempt_timeout, int(request_timeout))
+    grader_retry_sleep_seconds = int(os.environ.get("GRADER_RETRY_SLEEP_SECONDS", "15"))
+
+    def _outputs_done(alignment_id: str) -> bool:
+        # Grader writes *_graded.json and synthesis (GPU node) writes *_results.json.
+        graded_path = os.path.join(output_root, f"{alignment_id}_graded.json")
+        results_path = os.path.join(output_root, f"{alignment_id}_results.json")
+        return os.path.isfile(graded_path) and os.path.isfile(results_path)
     for query_id, alignments in data.items():
         if not isinstance(alignments, list):
             continue
@@ -282,10 +297,30 @@ def run(
             n_pdf = sum(1 for r in recs if r.pdf_path)
             n_ok = sum(1 for r in recs if r.status == "ok")
             n_failed = sum(1 for r in recs if r.status == "failed")
+            source_names = (
+                "europe_pmc",
+                "unpaywall",
+                "arxiv",
+                "semantic_scholar",
+            )
+            source_attempt_counts: Dict[str, int] = {k: 0 for k in source_names}
+            source_success_counts: Dict[str, int] = {k: 0 for k in source_names}
+            for rec in recs:
+                attempts = ((rec.details or {}).get("source_attempts") or {})
+                for sname in source_names:
+                    sat = attempts.get(sname) or {}
+                    if sat.get("attempted"):
+                        source_attempt_counts[sname] += 1
+                    if sat.get("success"):
+                        source_success_counts[sname] += 1
             logger.info(
                 f"Alignment {alignment_id}: downloaded_papers={len(recs)} "
                 f"text_files={n_text} pdf_files={n_pdf} "
                 f"docling_required={n_docling_required} ok={n_ok} failed={n_failed}"
+            )
+            logger.info(
+                f"Alignment {alignment_id}: source_attempt_counts={source_attempt_counts} "
+                f"source_success_counts={source_success_counts}"
             )
 
             gene_context: Dict[str, Any] | None = None
@@ -412,11 +447,20 @@ def run(
             if gene_context is not None:
                 payload["gene_context"] = gene_context
 
+            # If we already have both graded + synthesis outputs, skip calling the grader again.
+            if _outputs_done(alignment_id):
+                logger.info(
+                    f"Alignment {alignment_id}: outputs already exist; skipping grader call."
+                )
+                total += 1
+                continue
+
             try:
                 r = session.post(
                     f"{grader_url_base}/grade_alignment",
                     json=payload,
-                    timeout=request_timeout,
+                    # Attempt with a bounded timeout so one slow grader doesn't stall the whole CPU run.
+                    timeout=grader_attempt_timeout,
                 )
                 r.raise_for_status()
                 out = r.json()
@@ -426,9 +470,66 @@ def run(
                 total += 1
             except requests.RequestException as e:
                 logger.error(f"Alignment {alignment_id}: grader request failed: {e}")
-                raise
+                grader_failures += 1
+                # Queue for retry; CPU should keep processing other alignments.
+                prev = pending_attempts.get(alignment_id, 0)
+                if prev < max_grader_attempts:
+                    pending_grader[alignment_id] = payload
+                    pending_attempts[alignment_id] = prev + 1
+                continue
 
-    logger.info(f"Submitted {total} alignments to GPU node.")
+    # Retry any pending alignments while CPU has finished collecting.
+    if pending_grader:
+        logger.info(
+            f"Retrying {len(pending_grader)} pending alignments (max_attempts={max_grader_attempts}, attempt_timeout={grader_attempt_timeout}s)..."
+        )
+    for _ in range(max_grader_attempts):
+        if not pending_grader:
+            break
+        still_pending: Dict[str, Dict[str, Any]] = {}
+        for alignment_id, pending_payload in pending_grader.items():
+            if _outputs_done(alignment_id):
+                logger.info(
+                    f"Alignment {alignment_id}: outputs appeared after previous attempt; marking done."
+                )
+                total += 1
+                pending_attempts.pop(alignment_id, None)
+                continue
+            attempts = pending_attempts.get(alignment_id, 1)
+            if attempts > max_grader_attempts:
+                logger.error(
+                    f"Alignment {alignment_id}: exceeded GRADER_MAX_ATTEMPTS ({max_grader_attempts}); giving up for now."
+                )
+                pending_attempts.pop(alignment_id, None)
+                continue
+            try:
+                r = session.post(
+                    f"{grader_url_base}/grade_alignment",
+                    json=pending_payload,
+                    timeout=grader_attempt_timeout,
+                )
+                r.raise_for_status()
+                out = r.json()
+                logger.info(
+                    f"Alignment {alignment_id}: graded+synthesis {out.get('status')} -> {out.get('results_path')} (retry {attempts})"
+                )
+                total += 1
+                pending_attempts.pop(alignment_id, None)
+            except requests.RequestException as e:
+                logger.error(
+                    f"Alignment {alignment_id}: retry {attempts} grader request failed: {e}"
+                )
+                pending_attempts[alignment_id] = attempts + 1
+                still_pending[alignment_id] = pending_payload
+        pending_grader = still_pending
+        if pending_grader:
+            time.sleep(grader_retry_sleep_seconds)
+
+    logger.info(
+        "Submitted {} alignments to GPU node (grader failures: {}).".format(
+            total, grader_failures
+        )
+    )
 
 
 def main() -> int:
