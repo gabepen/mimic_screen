@@ -77,6 +77,33 @@ def _force_ipv4():
 
 _force_ipv4()
 
+
+def _sanitize_locus_tag(
+    locus_tag: Optional[object],
+    entrez_gene_id: Optional[int] = None,
+) -> Optional[str]:
+    """
+    Reject locus-like fields that are actually Entrez Gene IDs or other numerics.
+
+    MyGene occasionally returns the Gene ID in `locus_tag`; using that for Europe
+    PMC pass1 poisons the search (and looks like 'query mapped to target locus').
+    """
+    if locus_tag is None or (isinstance(locus_tag, float) and pd.isna(locus_tag)):
+        return None
+    s = str(locus_tag).strip()
+    if not s or s.lower() == "nan":
+        return None
+    if s.isdigit():
+        return None
+    if entrez_gene_id is not None:
+        try:
+            if s == str(int(entrez_gene_id)):
+                return None
+        except (TypeError, ValueError):
+            pass
+    return s
+
+
 def map_uniprot_to_entrez_mygene(uniprot_ids, cache_file=None, batch_size=1000):
     """
     Maps UniProt IDs to Entrez Gene IDs using MyGene.info API.
@@ -213,7 +240,7 @@ def map_mygene_fallback_identifiers(uniprot_ids, cache_file=None, batch_size=100
                     continue
 
                 gene_name = result.get("symbol") or result.get("name")
-                locus_tag = result.get("locus_tag")
+                locus_tag = _sanitize_locus_tag(result.get("locus_tag"), None)
 
                 common_name = result.get("name")
                 if not common_name:
@@ -994,8 +1021,14 @@ def run(df, query_col="query", target_col="target",
             if not mg:
                 continue
             existing = fallback_ids.get(uid, {})
+            eid_raw = id_mapping.get(uid)
+            try:
+                eid_int = int(eid_raw) if eid_raw is not None and not pd.isna(eid_raw) else None
+            except (TypeError, ValueError):
+                eid_int = None
+            mg_lt = _sanitize_locus_tag(mg.get("locus_tag"), eid_int)
             fallback_ids[uid] = {
-                "locus_tag": mg.get("locus_tag") or existing.get("locus_tag"),
+                "locus_tag": mg_lt or existing.get("locus_tag"),
                 "gene_name": mg.get("gene_name") or existing.get("gene_name"),
                 "genbank_acc": mg.get("genbank_acc") or existing.get("genbank_acc"),
                 "common_name": mg.get("common_name") or existing.get("common_name"),
@@ -1034,8 +1067,15 @@ def run(df, query_col="query", target_col="target",
             lambda uid: fallback_ids.get(uid, {}).get("locus_tag"))
         result_df["query_genbank_acc"] = result_df[query_col].map(
             lambda uid: fallback_ids.get(uid, {}).get("genbank_acc"))
-        result_df["query_common_name"] = result_df[query_col].map(
-            lambda uid: fallback_ids.get(uid, {}).get("common_name"))
+        q_desc = result_df["query_entrez_id"].map(
+            lambda eid: gene_descriptions.get(_safe_int(eid))
+            if _safe_int(eid) is not None
+            else None
+        )
+        q_fb = result_df[query_col].map(
+            lambda uid: fallback_ids.get(uid, {}).get("common_name")
+        )
+        result_df["query_common_name"] = q_desc.combine_first(q_fb)
     if target_col in result_df.columns:
         result_df["target_entrez_id"] = result_df[target_col].map(id_mapping)
         result_df["target_gene_name"] = result_df[target_col].map(
@@ -1044,9 +1084,15 @@ def run(df, query_col="query", target_col="target",
             lambda uid: fallback_ids.get(uid, {}).get("locus_tag"))
         result_df["target_genbank_acc"] = result_df[target_col].map(
             lambda uid: fallback_ids.get(uid, {}).get("genbank_acc"))
-        result_df["target_common_name"] = result_df["target_entrez_id"].map(
-            lambda eid: gene_descriptions.get(_safe_int(eid)) if _safe_int(eid) is not None else None
+        t_desc = result_df["target_entrez_id"].map(
+            lambda eid: gene_descriptions.get(_safe_int(eid))
+            if _safe_int(eid) is not None
+            else None
         )
+        t_fb = result_df[target_col].map(
+            lambda uid: fallback_ids.get(uid, {}).get("common_name")
+        )
+        result_df["target_common_name"] = t_desc.combine_first(t_fb)
 
     if query_col in result_df.columns:
         mq = result_df["query_entrez_id"].notna().sum()
