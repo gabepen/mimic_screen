@@ -3,22 +3,22 @@ Search module for automated literature search pipeline (Module 2 of 4).
 
 Two-phase search:
   1. UniProt pass: Europe PMC search by UniProt accession citations
-     (ACCESSION_ID:ACCESSION AND ACCESSION_TYPE:uniprot) for both query and target
-     proteins. Uses resultType=core.
-  2. Text fallback: For rows where the query UniProt pass returned no papers, run a
-     two-pass text search for the query protein only:
-       - pass1 (organism-specific): query_locus_tag OR query_genbank_acc
-       - pass2 (ambiguous + organism filter): (query_gene_name OR query_common_name) AND ORGANISM_ID:<taxid>
+     (ACCESSION_ID:ACCESSION AND ACCESSION_TYPE:uniprot) for query and target.
+  2. Text search: two-pass Europe PMC TITLE_ABS/BODY search for **both** query and
+     target using mapping-row identifiers; merged with UniProt hits (deduped).
+     Pass1: locus_tag OR GenBank acc (+ accession stem without version suffix).
+     Pass2: gene symbol / description terms plus Entrez-linked synonyms (human:
+     NCBI gene_info; all taxa: MyGene alias/symbol merge).
 
-Output columns:
-  - query_paper_dois, query_paper_titles (from UniProt pass when available, else text search)
-  - target_paper_dois, target_paper_titles (UniProt pass only; no text search for target)
+Output columns include per-source DOI lists (europepmc_accession, text_pass1,
+text_pass2_*) for query and target.
 """
 
 import argparse
 import gzip
 import json
 import os
+import re
 import socket
 import sys
 import time
@@ -410,7 +410,7 @@ def _load_human_gene_name_synonyms(
                     continue
                 if gid in clean_ids and isinstance(v, list):
                     out[gid] = [str(x).strip() for x in v if str(x).strip()]
-            if out:
+            if set(clean_ids) <= set(out.keys()):
                 return out
         except Exception:
             pass
@@ -447,6 +447,106 @@ def _load_human_gene_name_synonyms(
     return out
 
 
+def _load_mygene_synonyms_for_entrez(
+    entrez_ids: List[int],
+    output_dir: str,
+    delay: float = 0.35,
+) -> Dict[int, List[str]]:
+    """
+    Entrez Gene ID -> symbol / alias strings via MyGene.info (all species).
+
+    Fills synonym expansion for microbial and other genes not covered by
+    Homo_sapiens.gene_info alone.
+    """
+    try:
+        import mygene
+    except ImportError:
+        logger.warning(
+            "mygene is not installed; skipping MyGene-based synonym expansion "
+            "(install mygene or use human-only gene_info synonyms)"
+        )
+        return {}
+
+    clean = sorted({int(x) for x in entrez_ids if x and int(x) > 0})
+    if not clean:
+        return {}
+
+    cache_path = os.path.join(output_dir, "entrez_mygene_synonyms_cache.json")
+    cached: Dict[int, List[str]] = {}
+    if os.path.exists(cache_path):
+        try:
+            with open(cache_path, "r", encoding="utf-8") as f:
+                raw = json.load(f)
+            for k, v in (raw or {}).items():
+                try:
+                    gid = int(k)
+                except Exception:
+                    continue
+                if isinstance(v, list):
+                    cached[gid] = [str(x).strip() for x in v if str(x).strip()]
+        except Exception:
+            pass
+
+    missing = [g for g in clean if g not in cached]
+    if missing:
+        mg = mygene.MyGeneInfo()
+        batch_sz = 900
+        for i in range(0, len(missing), batch_sz):
+            batch = missing[i : i + batch_sz]
+            time.sleep(delay)
+            try:
+                hits = mg.getgenes(
+                    batch,
+                    fields="alias,symbol,name,other_names",
+                    as_dataframe=False,
+                )
+            except Exception as e:
+                logger.warning(f"MyGene getgenes synonym batch failed: {e}")
+                hits = []
+            for doc in hits or []:
+                if not isinstance(doc, dict):
+                    continue
+                try:
+                    gid = int(doc.get("_id"))
+                except Exception:
+                    continue
+                names: set[str] = set()
+                for key in ("symbol", "name"):
+                    t = _normalize_term(doc.get(key))
+                    if t:
+                        names.add(t)
+                alias = doc.get("alias")
+                if isinstance(alias, list):
+                    for x in alias:
+                        t = _normalize_term(x)
+                        if t:
+                            names.add(t)
+                elif isinstance(alias, str) and alias.strip():
+                    for part in re.split(r"[,;]", alias):
+                        t = _normalize_term(part)
+                        if t:
+                            names.add(t)
+                other = doc.get("other_names")
+                if isinstance(other, str) and other.strip():
+                    for part in re.split(r"[,;]", other):
+                        t = _normalize_term(part)
+                        if t:
+                            names.add(t)
+                elif isinstance(other, list):
+                    for x in other:
+                        t = _normalize_term(x)
+                        if t:
+                            names.add(t)
+                cached[gid] = sorted(names)
+        try:
+            with open(cache_path, "w", encoding="utf-8") as f:
+                json.dump({str(k): cached.get(k, []) for k in sorted(cached.keys())}, f, indent=2)
+        except Exception:
+            pass
+
+    return {g: cached.get(g, []) for g in clean}
+
+
 def _build_europepmc_text_query_pass1(
     row: pd.Series, prefix: str = "query"
 ) -> Tuple[Optional[str], List[str]]:
@@ -468,9 +568,24 @@ def _build_europepmc_text_query_pass1(
     genbank_acc = _normalize_term(row.get(f"{prefix}_genbank_acc"))
     if genbank_acc:
         id_terms.append(("genbank_acc", genbank_acc))
+        # Europe PMC indexing sometimes omits the version dot; search both forms.
+        if "." in genbank_acc:
+            stem = genbank_acc.split(".", 1)[0].strip()
+            if stem and stem != genbank_acc:
+                id_terms.append(("genbank_acc_stem", stem))
 
     if not id_terms:
         return None, []
+
+    seen_vals: set[str] = set()
+    deduped: List[Tuple[str, str]] = []
+    for kind, val in id_terms:
+        lk = val.lower()
+        if lk in seen_vals:
+            continue
+        seen_vals.add(lk)
+        deduped.append((kind, val))
+    id_terms = deduped
 
     or_clauses = []
     for (_kind, val) in id_terms:
@@ -806,6 +921,53 @@ def run_europepmc_search_for_row(
     }
 
 
+def _parse_accession_text_overlap(mode: Optional[str]) -> Tuple[bool, bool]:
+    """Return (filter_query, filter_target): drop accession-only DOIs without text hit."""
+    raw = mode if mode is not None else os.environ.get(
+        "AUTO_LIT_ACCESSION_REQUIRES_TEXT_OVERLAP", "off"
+    )
+    v = (raw or "").strip().lower()
+    if v in ("", "0", "false", "no", "off", "none"):
+        return False, False
+    if v in ("1", "true", "yes", "on", "both", "all"):
+        return True, True
+    if v == "query":
+        return True, False
+    if v == "target":
+        return False, True
+    logger.warning(
+        "Unknown accession_text_overlap / AUTO_LIT_ACCESSION_REQUIRES_TEXT_OVERLAP=%r; using off",
+        raw,
+    )
+    return False, False
+
+
+def _drop_accession_only_without_text_hit(
+    merged_dois: List[str],
+    id_to_title: Dict[str, str],
+    accession_dois: List[str],
+    text_dois: List[str],
+) -> Tuple[List[str], List[str], int]:
+    """
+    Remove DOIs that appear only in the Europe PMC UniProt-accession list and not
+    in the text-search result list (pass1 + pass2 union).
+    """
+    acc_set = set(accession_dois)
+    text_set = set(text_dois)
+    out_dois: List[str] = []
+    n_drop = 0
+    for d in merged_dois:
+        if d not in acc_set:
+            out_dois.append(d)
+            continue
+        if d in text_set:
+            out_dois.append(d)
+            continue
+        n_drop += 1
+    out_titles = [id_to_title[pid] for pid in out_dois]
+    return out_dois, out_titles, n_drop
+
+
 def run(
     df: pd.DataFrame,
     query_id_col: str = "query",
@@ -817,6 +979,7 @@ def run(
     output_dir: str = ".",
     delay: float = 0.35,
     use_cache: bool = True,
+    accession_text_overlap: Optional[str] = None,
 ) -> pd.DataFrame:
     """
     Two-phase Europe PMC search for each alignment row:
@@ -839,6 +1002,10 @@ def run(
             target text searches use this instead of any per-row taxid.
         output_dir: Directory for logs and cache file (search_cache.json).
         use_cache: If True, load cache at start (if exists) and save at end.
+        accession_text_overlap: If set, overrides env ``AUTO_LIT_ACCESSION_REQUIRES_TEXT_OVERLAP``.
+            Values: ``off``, ``query``, ``target``, ``both`` (or ``1``/``true`` via env).
+            When enabled for a side, DOIs that appear only in the Europe PMC UniProt-accession
+            search and not in the text-search union are dropped from merged outputs.
 
     Returns a new DataFrame with additional columns:
         - query_paper_dois, query_paper_titles (merged UniProt + text search)
@@ -861,6 +1028,14 @@ def run(
 
     result_df = df.copy()
     n_rows = len(result_df)
+    filter_q_acc, filter_t_acc = _parse_accession_text_overlap(accession_text_overlap)
+    if filter_q_acc or filter_t_acc:
+        logger.info(
+            "Accession-only papers must overlap text search: query={} target={} "
+            "(set accession_text_overlap= or AUTO_LIT_ACCESSION_REQUIRES_TEXT_OVERLAP)",
+            filter_q_acc,
+            filter_t_acc,
+        )
     logger.info(f"Search module – Entrez/PubTator first, Europe PMC fallback for {n_rows} rows (query col={query_id_col!r}, target col={target_id_col!r})")
 
     session = requests.Session()
@@ -920,6 +1095,28 @@ def run(
                     )
         except Exception as e:
             logger.warning(f"Could not load NCBI gene synonym map: {e}")
+
+    if all_entrez_ids:
+        try:
+            mg_syn = _load_mygene_synonyms_for_entrez(
+                all_entrez_ids, output_dir=output_dir, delay=delay
+            )
+            n_mg = 0
+            for gid, names in mg_syn.items():
+                if not names:
+                    continue
+                merged = set(gene_synonyms_by_entrez.get(gid, []))
+                n_before = len(merged)
+                merged.update(names)
+                if len(merged) > n_before:
+                    n_mg += 1
+                gene_synonyms_by_entrez[gid] = sorted(merged)
+            logger.info(
+                f"MyGene synonym merge: expanded {n_mg} Entrez IDs "
+                f"(total IDs with any synonyms: {len(gene_synonyms_by_entrez)})"
+            )
+        except Exception as e:
+            logger.warning(f"MyGene synonym merge failed: {e}")
 
     query_dois_col: List[str] = []
     query_titles_col: List[str] = []
@@ -1023,6 +1220,17 @@ def run(
             merged_q_dois = list(q_id_to_title.keys())
             merged_q_titles = [q_id_to_title[pid] for pid in merged_q_dois]
 
+            acc_only_drop_q = 0
+            if filter_q_acc:
+                merged_q_dois, merged_q_titles, acc_only_drop_q = (
+                    _drop_accession_only_without_text_hit(
+                        merged_q_dois,
+                        q_id_to_title,
+                        query_res["dois"],
+                        text_res_query["dois"],
+                    )
+                )
+
             if q_acc and merged_q_dois:
                 query_ids_with_papers.add(q_acc)
 
@@ -1034,6 +1242,7 @@ def run(
                 "text_pass2_base": text_res_query.get("pass2_base_count", 0),
                 "text_pass2_synonym": text_res_query.get("pass2_synonym_count", 0),
                 "text_pass2_overlap": text_res_query.get("pass2_overlap_count", 0),
+                "accession_only_dropped": acc_only_drop_q,
             }
             query_paper_ids_by_source = {
                 "entrez_pubtator": [],
@@ -1119,6 +1328,17 @@ def run(
             merged_t_dois = list(t_id_to_title.keys())
             merged_t_titles = [t_id_to_title[pid] for pid in merged_t_dois]
 
+            acc_only_drop_t = 0
+            if filter_t_acc:
+                merged_t_dois, merged_t_titles, acc_only_drop_t = (
+                    _drop_accession_only_without_text_hit(
+                        merged_t_dois,
+                        t_id_to_title,
+                        target_res["dois"],
+                        text_res_target["dois"],
+                    )
+                )
+
             if t_acc and merged_t_dois:
                 target_ids_with_papers.add(t_acc)
 
@@ -1143,6 +1363,7 @@ def run(
                 "text_pass2_base": text_res_target.get("pass2_base_count", 0),
                 "text_pass2_synonym": text_res_target.get("pass2_synonym_count", 0),
                 "text_pass2_overlap": text_res_target.get("pass2_overlap_count", 0),
+                "accession_only_dropped": acc_only_drop_t,
             }
 
         target_dois_col.append(json.dumps(merged_t_dois))
@@ -1163,11 +1384,13 @@ def run(
             "pubtator_enabled": _PUBTATOR_ENABLED,
             "pubtator_disabled_reason": _PUBTATOR_DISABLED_REASON,
             "query_counts": query_paper_counts,
+            "accession_text_overlap_filter_query": filter_q_acc,
             "query_dois_n": len(merged_q_dois),
             "query_dois_sample": merged_q_dois[:10],
             "target_pubtator_used": t_pubtator_used,
             "target_pubtator_empty": t_pubtator_empty,
             "target_counts": target_paper_counts,
+            "accession_text_overlap_filter_target": filter_t_acc,
             "target_dois_n": len(merged_t_dois),
             "target_dois_sample": merged_t_dois[:10],
         }
@@ -1389,6 +1612,17 @@ def main() -> int:
         help="Do not load or save search cache.",
     )
     parser.add_argument(
+        "--accession-text-overlap",
+        type=str,
+        default=None,
+        choices=["off", "query", "target", "both"],
+        help=(
+            "Drop DOIs found only via Europe PMC UniProt-accession search unless they "
+            "also appear in the text-search union. Default uses env "
+            "AUTO_LIT_ACCESSION_REQUIRES_TEXT_OVERLAP if set, else off."
+        ),
+    )
+    parser.add_argument(
         "--output-format",
         type=str,
         choices=["json", "csv"],
@@ -1415,6 +1649,7 @@ def main() -> int:
         target_id_col=args.target_id_col,
         taxid_col=args.taxid_col,
         default_taxid=args.default_taxid,
+        accession_text_overlap=args.accession_text_overlap,
         query_taxid=args.query_taxid,
         target_taxid=args.target_taxid,
         output_dir=output_dir,
