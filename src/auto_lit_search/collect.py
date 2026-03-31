@@ -59,7 +59,7 @@ _DEFAULT_THROTTLE_INTERVALS_S: Dict[str, float] = {
     "unpaywall": 0.55,
     "arxiv": 3.0,
     "semantic_scholar": 3.5,
-    "publisher_pdf": 0.2,
+    "pdf_url": 0.2,
 }
 
 
@@ -544,7 +544,7 @@ _EXCLUDED_PUBTYPE_SUBSTRINGS: List[str] = [
 _ALLOWED_RESEARCH_PUBTYPE_SUBSTRINGS: List[str] = [
     # Most research articles on Europe PMC.
     "research-article",
-    # Some publishers show only this category.
+    # Some records use only this category.
     "journal-article",
 ]
 
