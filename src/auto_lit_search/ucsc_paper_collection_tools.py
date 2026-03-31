@@ -6,8 +6,9 @@ Small, dependency-light utilities for collection routing in collect.py.
 
 from __future__ import annotations
 
+import os
 import time
-from typing import Optional
+from typing import Dict, Optional
 from xml.etree import ElementTree as ET
 
 import requests
@@ -107,11 +108,13 @@ def get_semantic_scholar_pdf_url(
     """
     Return open access PDF URL from Semantic Scholar if available.
     """
-    query = (doi or "").strip() or (title or "").strip()
+    d = (doi or "").strip()
+    query = d or (title or "").strip()
     if not query:
         return None
+
     url = "https://api.semanticscholar.org/graph/v1/paper/search"
-    params = {
+    params: Dict[str, object] = {
         "query": query[:150],
         "fields": "openAccessPdf,title,externalIds",
         "limit": 3,
@@ -133,14 +136,26 @@ def get_semantic_scholar_pdf_url(
                 )
                 time.sleep(delay)
                 continue
+
             resp.raise_for_status()
             data = resp.json()
+            norm_doi = d.lower().strip()
             for paper in data.get("data") or []:
+                # If DOI is available from upstream, only accept an exact DOI match
+                # from Semantic Scholar to avoid off-topic false positives.
+                if norm_doi:
+                    ext_ids = paper.get("externalIds") or {}
+                    s2_doi = str(ext_ids.get("DOI") or "").lower().strip()
+                    if s2_doi != norm_doi:
+                        continue
                 pdf = (paper.get("openAccessPdf") or {}).get("url")
                 if pdf:
                     return str(pdf).strip()
             return None
         except Exception as e:
-            logger.debug(f"Semantic Scholar lookup failed for query={query!r}: {e}")
+            logger.debug(
+                f"Semantic Scholar lookup failed for query={query!r}: {e}"
+            )
             return None
+
     return None
