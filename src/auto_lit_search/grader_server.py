@@ -18,6 +18,7 @@ app = FastAPI(title="auto_lit_search Grader node")
 
 TEXT_EXTENSIONS = (".txt",)
 MAX_PAPER_CHARS = 120000
+_MODEL_ID_CACHE: Dict[str, str] = {}
 
 
 def _ensure_dir(path: str) -> None:
@@ -32,7 +33,9 @@ def _list_paper_files(papers_dir: str) -> List[str]:
         and (f.endswith(TEXT_EXTENSIONS) or not f.endswith((".pdf", ".xml")))
     )
     labeled = [
-        f for f in files if f.endswith("__query.txt") or f.endswith("__target.txt")
+        f
+        for f in files
+        if "__query" in f.lower() or "__target" in f.lower()
     ]
     return labeled if labeled else files
 
@@ -77,6 +80,28 @@ def _rubric_dimensions(rubric: Dict[str, Any]) -> List[Dict[str, Any]]:
             )
         if out:
             return out
+    # Support rubric schema with `axes` (e.g. legionella_rubric.json).
+    # Each axis becomes one dimension in `rubric_dimension_scores`.
+    axes = rubric.get("axes")
+    if isinstance(axes, list) and axes:
+        out_axes: List[Dict[str, Any]] = []
+        for a in axes:
+            if not isinstance(a, dict):
+                continue
+            aid = str(a.get("id") or "").strip()
+            if not aid:
+                continue
+            out_axes.append(
+                {
+                    "name": aid,
+                    "description": str(a.get("description") or "").strip(),
+                    # Axis-level weights are not encoded in a simple scalar in the rubric
+                    # file, so keep 1.0 for now and let the model produce calibrated 0..1 values.
+                    "weight": float(a.get("weight") or 1.0),
+                }
+            )
+        if out_axes:
+            return out_axes
     # Fallback schema: scores: {dim: description}
     scores = rubric.get("scores")
     if isinstance(scores, dict) and scores:
@@ -87,18 +112,45 @@ def _rubric_dimensions(rubric: Dict[str, Any]) -> List[Dict[str, Any]]:
     return [{"name": "overall_relevance", "description": "overall evidence relevance", "weight": 1.0}]
 
 
+def _resolve_model_id(base_url: str) -> str:
+    cached = _MODEL_ID_CACHE.get(base_url)
+    if cached:
+        return cached
+    models_url = f"{base_url.rstrip('/')}/v1/models"
+    r = requests.get(models_url, timeout=30)
+    r.raise_for_status()
+    data = r.json()
+    models = data.get("data") if isinstance(data, dict) else None
+    if isinstance(models, list):
+        for model in models:
+            if isinstance(model, dict) and model.get("id"):
+                model_id = str(model["id"]).strip()
+                if model_id:
+                    _MODEL_ID_CACHE[base_url] = model_id
+                    return model_id
+    raise RuntimeError(f"Could not resolve model id from {models_url}")
+
+
 def _call_llm(user_content: str, base_url: str, max_tokens: int, temperature: float) -> str:
-    base_url = base_url.rstrip("/")
+    configured = (os.environ.get("VLLM_MODEL_NAME") or "").strip()
+    root_url = base_url.rstrip("/")
+    base_url = root_url
     if not base_url.endswith("/v1"):
         base_url = f"{base_url}/v1"
     url = f"{base_url}/chat/completions"
+    model_id = configured or _resolve_model_id(root_url)
     payload = {
-        "model": "default",
+        "model": model_id,
         "messages": [{"role": "user", "content": user_content}],
         "max_tokens": max_tokens,
         "temperature": temperature,
     }
     r = requests.post(url, json=payload, timeout=300)
+    if r.status_code == 404 and configured:
+        served_model = _resolve_model_id(root_url)
+        if served_model != model_id:
+            payload["model"] = served_model
+            r = requests.post(url, json=payload, timeout=300)
     r.raise_for_status()
     data = r.json()
     choices = data.get("choices") or []
@@ -110,9 +162,10 @@ def _call_llm(user_content: str, base_url: str, max_tokens: int, temperature: fl
 
 
 def _extract_paper_role(fname: str) -> Optional[str]:
-    if fname.endswith("__query.txt"):
+    lower = fname.lower()
+    if "__query" in lower:
         return "query"
-    if fname.endswith("__target.txt"):
+    if "__target" in lower:
         return "target"
     return None
 
