@@ -341,6 +341,70 @@ _EMPTY_ENTRY = {
     "status": "not_found",
 }
 
+# Last token of a protein name is often a usable symbol (e.g. "Glucosyltransferase Lgt1" → Lgt1).
+_GENERIC_PROTEIN_NAME_ENDS = frozenset({
+    "protein", "kinase", "hydrolase", "transferase", "domain", "family", "system",
+    "factor", "membrane", "synthase", "peptidase", "lipase", "ligase", "reductase",
+    "dehydrogenase", "oxidase", "subunit", "component", "type", "chain",
+})
+
+
+def _infer_gene_name_from_uniprot_protein_names(entry):
+    """
+    When genes[].geneName is absent, many Legionella effectors still name the protein
+    (e.g. recommended name ends in Lgt1; submission name ends in RomA). MyGene/NCBI may
+    only expose RS locus strings as *symbol* — use the protein title token when plausible.
+    """
+    pd = entry.get("proteinDescription") or {}
+    candidates = []
+    rec = pd.get("recommendedName") or {}
+    if rec.get("fullName", {}).get("value"):
+        candidates.append(rec["fullName"]["value"])
+    for sn in pd.get("submissionNames") or []:
+        fn = (sn.get("fullName") or {})
+        if fn.get("value"):
+            candidates.append(fn["value"])
+    for alt in pd.get("alternativeNames") or []:
+        fn = (alt.get("fullName") or {})
+        if fn.get("value"):
+            candidates.append(fn["value"])
+    for text in candidates:
+        parts = text.strip().split()
+        if not parts:
+            continue
+        last = parts[-1].strip(".,;")
+        if len(last) < 3 or len(last) > 24:
+            continue
+        if last.lower() in _GENERIC_PROTEIN_NAME_ENDS:
+            continue
+        if not re.match(r"^[A-Za-z][A-Za-z0-9\-]*$", last):
+            continue
+        return last
+    return None
+
+
+def _is_rs_style_locus_symbol(s) -> bool:
+    """True for NCBI/MyGene symbols that are genome locus IDs (e.g. AVR58_RS07000)."""
+    if not s or not isinstance(s, str):
+        return False
+    return bool(re.search(r"_RS\d+", s.strip()))
+
+
+def _prefer_gene_name_uniprot_over_rs_mygene(existing, mygene_name):
+    """
+    Prefer UniProt-derived or inferred short symbols over MyGene when MyGene only
+    returns an RS locus string (official NCBI symbol for some effectors).
+    """
+    ex = (existing or "").strip() if existing else ""
+    mg = (mygene_name or "").strip() if mygene_name else ""
+    if not mg:
+        return ex or None
+    if not ex:
+        return mg or None
+    if _is_rs_style_locus_symbol(mg) and not _is_rs_style_locus_symbol(ex):
+        return ex
+    return mg
+
 
 def _extract_uniprot_entry(entry):
     """Extract useful identifiers from a single UniProtKB JSON entry."""
@@ -398,6 +462,9 @@ def _extract_uniprot_entry(entry):
             elif isinstance(loc0, str):
                 locus_tag = loc0
 
+    if not gene_name:
+        gene_name = _infer_gene_name_from_uniprot_protein_names(entry)
+
     common_name = None
     desc = entry.get("proteinDescription") or {}
     rec = desc.get("recommendedName") or {}
@@ -411,6 +478,12 @@ def _extract_uniprot_entry(entry):
             name_val = full_alt.get("value")
             if name_val:
                 common_name = name_val
+                break
+    if not common_name:
+        for sn in desc.get("submissionNames") or []:
+            fn = (sn.get("fullName") or {}).get("value")
+            if fn:
+                common_name = fn
                 break
 
     return {
@@ -1036,8 +1109,11 @@ def run(df, query_col="query", target_col="target",
             existing = fallback_ids.get(uid, {})
             mg_lt = _sanitize_locus_tag(mg.get("locus_tag"), id_mapping.get(uid))
             ex_lt = _sanitize_locus_tag(existing.get("locus_tag"), id_mapping.get(uid))
+            merged_gn = _prefer_gene_name_uniprot_over_rs_mygene(
+                existing.get("gene_name"), mg.get("gene_name")
+            )
             fallback_ids[uid] = {
-                "gene_name": mg.get("gene_name") or existing.get("gene_name"),
+                "gene_name": merged_gn,
                 "locus_tag": mg_lt or ex_lt,
                 "genbank_acc": mg.get("genbank_acc") or existing.get("genbank_acc"),
                 "common_name": mg.get("common_name") or existing.get("common_name"),
