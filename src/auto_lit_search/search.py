@@ -348,6 +348,32 @@ def _normalize_term(term: Optional[str]) -> Optional[str]:
     return s
 
 
+def _locus_field_is_entrez_junk(val: str, entrez_id: Optional[Any]) -> bool:
+    """
+    True when a mapping \"locus_tag\" cell is actually an Entrez Gene ID or other
+    useless numeric string for Europe PMC quoted search.
+    """
+    s = (val or "").strip()
+    if not s:
+        return True
+    try:
+        f = float(s)
+        if f == int(f):
+            return True
+    except (ValueError, TypeError, OverflowError):
+        pass
+    if s.isdigit():
+        return True
+    if entrez_id is not None and str(entrez_id).strip() not in ("", "nan"):
+        try:
+            ei = int(float(str(entrez_id)))
+            if s == str(ei):
+                return True
+        except (TypeError, ValueError):
+            pass
+    return False
+
+
 def _get_pubtype_tokens(rec: Dict[str, Any]) -> List[str]:
     out: List[str] = []
     pubtype_list = rec.get("pubTypeList")
@@ -551,10 +577,10 @@ def _build_europepmc_text_query_pass1(
     row: pd.Series, prefix: str = "query"
 ) -> Tuple[Optional[str], List[str]]:
     """
-    Text query pass 1 (organism-specific): locus_tag and genbank accession.
+    Text query pass 1 (organism-specific): locus_tag and GenBank / RefSeq accession.
 
-    Uses available identifiers and ORs them together (for the given prefix):
-        <prefix>_locus_tag, <prefix>_genbank_acc
+    ORs together <prefix>_locus_tag (when not numeric junk) and <prefix>_genbank_acc
+    (plus version stem when dotted).
 
     Returns:
         (query_string or None if no identifiers, identifiers_used_types)
@@ -562,7 +588,8 @@ def _build_europepmc_text_query_pass1(
     id_terms: List[Tuple[str, str]] = []  # (type, value)
 
     locus_tag = _normalize_term(row.get(f"{prefix}_locus_tag"))
-    if locus_tag:
+    entrez_for_side = row.get(f"{prefix}_entrez_id")
+    if locus_tag and not _locus_field_is_entrez_junk(locus_tag, entrez_for_side):
         id_terms.append(("locus_tag", locus_tag))
 
     genbank_acc = _normalize_term(row.get(f"{prefix}_genbank_acc"))
@@ -985,7 +1012,7 @@ def run(
     Two-phase Europe PMC search for each alignment row:
       1. UniProt accession citations
          (ACCESSION_ID:<acc> AND ACCESSION_TYPE:uniprot) for query and target.
-      2. Text search using locus_tag / GenBank accession / gene name / common name
+      2. Text search using locus_tag / GenBank (pass1) and gene name / common name (pass2)
          for both query and target, always run and merged with UniProt results.
 
     Args:
