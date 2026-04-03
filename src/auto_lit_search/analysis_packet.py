@@ -1,6 +1,6 @@
 from typing import Any, Dict, List, Optional
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 
 class Constraints(BaseModel):
@@ -12,9 +12,10 @@ class GradedPaper(BaseModel):
     paper_id: str
     file_name: str
     paper_role: Optional[str] = None
-    relevance_grade: float
+    relevance_grade: float  # mean of rubric_dimension_scores; computed server-side
     rubric_dimension_scores: Dict[str, float]
-    rationale: str
+    rubric_axis_rationales: Dict[str, str] = Field(default_factory=dict)
+    rationale: str = ""  # optional brief cross-axis summary
     model_output: Optional[str] = None
     notes: Optional[str] = None
 
