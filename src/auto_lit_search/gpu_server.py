@@ -387,6 +387,14 @@ def _parse_quick_results_summary(synthesis_text: str) -> Dict[str, Any]:
     }
 
 
+def _synthesis_output_well_formed(synthesis_text: str) -> bool:
+    text = (synthesis_text or "").strip()
+    if not text or "Quick results summary:" not in text:
+        return False
+    quick = _parse_quick_results_summary(text)
+    return quick.get("likelihood_host_manipulation_mimicry") is not None
+
+
 def _run_alignment_impl(req: RunAlignmentRequest) -> RunAlignmentResponse:
     if not os.path.isdir(req.papers_dir):
         raise HTTPException(
@@ -481,17 +489,25 @@ def _run_alignment_graded_impl(
     if temperature is None:
         temperature = 0.0
 
-    # Keep synthesis packet compact: include grades + concise rationales.
+    # Per-paper: every axis score plus that axis's grader reasoning (capped for prompt size).
+    _per_axis_cap = 700
     graded_lines: List[str] = []
     for gp in req.graded_papers:
-        dscore = ", ".join(
-            f"{k}:{v:.3f}" for k, v in (gp.rubric_dimension_scores or {}).items()
-        )
-        graded_lines.append(
+        scores = gp.rubric_dimension_scores or {}
+        rax = gp.rubric_axis_rationales or {}
+        order = sorted(scores.keys())
+        parts: List[str] = [
             f"- {gp.file_name} role={gp.paper_role or 'unknown'} "
-            f"grade={gp.relevance_grade:.3f} dims=[{dscore}] "
-            f"rationale={gp.rationale[:350]}"
-        )
+            f"mean_axis_score={gp.relevance_grade:.3f} "
+            f"(derived from axis scores; synthesize from axes, not only this mean)"
+        ]
+        for ax in order:
+            sc = float(scores.get(ax, 0.0))
+            why = (rax.get(ax) or "")[:_per_axis_cap]
+            parts.append(f"    • {ax}: score={sc:.3f} | grader_reasoning: {why}")
+        if (gp.rationale or "").strip():
+            parts.append(f"    • cross_axis_note: {gp.rationale.strip()[:400]}")
+        graded_lines.append("\n".join(parts))
     grading_meta = req.grading_meta or {}
     term_block = _identification_terms_block(req.query, req.target_id, req.gene_context)
     # Prompt structure matters: we want a running evidence discussion, then a crisp summary.
@@ -501,9 +517,13 @@ def _run_alignment_graded_impl(
         f"Use the graded evidence below to synthesize whether the query protein "
         f"provides credible evidence for manipulating or mimicking the target host "
         f"protein in the Legionella-human interaction context.\n\n"
+        f"Each paper lists every rubric axis with a numeric score AND the grader's reasoning "
+        f"for that axis (cite-level explanations). Weigh both the scores and the qualitative "
+        f"reasoning; do not collapse your analysis to a single number per paper.\n\n"
         f"Instruction: Write a running discussion (plain text, not JSON) that references "
-        f"the graded papers. Prioritize high-grade evidence, and explicitly mention "
-        f"where low-grade or missing evidence limits confidence.\n\n"
+        f"specific axes and what the grader said about them. Prioritize papers and axes "
+        f"with strong support, and say where weak axes or conflicting axis patterns limit "
+        f"confidence.\n\n"
         f"END WITH THIS EXACT SECTION HEADER:\n"
         f"Quick results summary:\n"
         f"- Likelihood of host manipulation/mimicry (0..1): <float>\n"
@@ -515,24 +535,68 @@ def _run_alignment_graded_impl(
         f"Grading meta: {json.dumps(grading_meta, ensure_ascii=False)}\n\n"
         f"Graded papers:\n" + "\n".join(graded_lines[:500])
     )
+    synthesis_retry_suffix = (
+        "\n\nYour previous answer did not include a parseable end section. "
+        "Reply with plain text only (not JSON). Keep the running discussion, then end with "
+        "this exact header and bullet lines (replace bracketed parts):\n\n"
+        "Quick results summary:\n"
+        "- Likelihood of host manipulation/mimicry (0..1): <float>\n"
+        "- Best supporting paper(s): <paper file_name(s)>\n"
+        "- Main conflicts / uncertainties: <1-3 sentences>\n"
+    )
     synthesis_text = ""
     notes = ""
     if llm_base_url:
-        try:
-            synthesis_text = _call_llm(
-                synth_prompt,
-                llm_base_url,
-                max_tokens=max_tokens,
-                temperature=temperature,
+        synth_ok = False
+        for attempt in range(2):
+            extra = ""
+            if attempt:
+                bad = synthesis_text.strip()[:2500]
+                extra = synthesis_retry_suffix
+                if bad:
+                    extra += f"\n\nEarlier attempt (invalid or incomplete):\n{bad}\n"
+            try:
+                synthesis_text = _call_llm(
+                    synth_prompt + extra,
+                    llm_base_url,
+                    max_tokens=max_tokens,
+                    temperature=temperature,
+                )
+            except Exception as e:
+                notes = str(e)
+                logger.warning(f"Synthesis LLM call failed for {req.alignment_id}: {e}")
+                break
+            if synthesis_text.strip() and _synthesis_output_well_formed(synthesis_text):
+                synth_ok = True
+                break
+            if attempt == 0:
+                reason = (
+                    "empty synthesis response"
+                    if not synthesis_text.strip()
+                    else "missing Quick results summary or unparseable likelihood line"
+                )
+                logger.warning(
+                    f"Synthesis LLM ({req.alignment_id}): {reason}; resubmitting prompt once"
+                )
+        if not synth_ok and synthesis_text.strip() and not notes:
+            logger.warning(
+                f"Synthesis LLM ({req.alignment_id}): output still ill-formed after retry; "
+                "using fallback text"
             )
-        except Exception as e:
-            notes = str(e)
-            logger.warning(f"Synthesis LLM call failed for {req.alignment_id}: {e}")
-    if not synthesis_text.strip():
+    synth_needs_fallback = not synthesis_text.strip() or (
+        bool(llm_base_url)
+        and not notes
+        and not _synthesis_output_well_formed(synthesis_text)
+    )
+    if synth_needs_fallback:
         if notes:
-            notes = f"{notes}; empty synthesis output"
-        else:
+            notes = f"{notes}; synthesis fallback applied"
+        elif not synthesis_text.strip():
             notes = "empty synthesis output"
+        else:
+            notes = (
+                "synthesis missing parseable Quick results summary after retry; used fallback"
+            )
         synthesis_text = _fallback_synthesis_text(req)
     if log_path:
         _ensure_dir(os.path.dirname(log_path))
