@@ -27,17 +27,35 @@ from loguru import logger
 
 try:
     from .ucsc_paper_collection_tools import (
+        download_elsevier_article_pdf,
+        download_asm_article_pdf,
+        download_mdpi_article_pdf,
+        download_wiley_tdm_pdf,
         get_arxiv_pdf_url,
+        get_elsevier_fulltext_xml,
         get_semantic_scholar_pdf_url,
         get_unpaywall_pdf_url,
+        is_asm_primary_doi,
+        is_elsevier_primary_doi,
+        is_mdpi_primary_doi,
         is_ucsc_email,
+        is_wiley_primary_doi,
     )
 except ImportError:
     from ucsc_paper_collection_tools import (
+        download_elsevier_article_pdf,
+        download_asm_article_pdf,
+        download_mdpi_article_pdf,
+        download_wiley_tdm_pdf,
         get_arxiv_pdf_url,
+        get_elsevier_fulltext_xml,
         get_semantic_scholar_pdf_url,
         get_unpaywall_pdf_url,
+        is_asm_primary_doi,
+        is_elsevier_primary_doi,
+        is_mdpi_primary_doi,
         is_ucsc_email,
+        is_wiley_primary_doi,
     )
 
 
@@ -53,9 +71,90 @@ EUROPEPMC_SEARCH_URL = "https://www.ebi.ac.uk/europepmc/webservices/rest/search"
 EUROPEPMC_FULLTEXT_BASE = "https://www.ebi.ac.uk/europepmc/webservices/rest"
 API_DELAY = 0.35
 
+# PMID from the same Europe PMC search row as pmcid_cache[paper_id]; used for /article/MED/{pmid}/fullText*
+_EUROPEPMC_PMID_BY_PAPER_ID: Dict[str, Optional[str]] = {}
+
+# Last Europe PMC `/search` `query` param sent per paper_id (for logs / manifest).
+_EUROPEPMC_LAST_SEARCH_QUERY: Dict[str, str] = {}
+
+
+def _europepmc_note_search_query(
+    paper_id: str, search_query: str, cache_lock: Optional[threading.Lock]
+) -> None:
+    if cache_lock:
+        with cache_lock:
+            _EUROPEPMC_LAST_SEARCH_QUERY[paper_id] = search_query
+    else:
+        _EUROPEPMC_LAST_SEARCH_QUERY[paper_id] = search_query
+
+
+def _europepmc_store_pmid(
+    paper_id: str,
+    pmid: Optional[str],
+    cache_lock: Optional[threading.Lock],
+) -> None:
+    if cache_lock:
+        with cache_lock:
+            _EUROPEPMC_PMID_BY_PAPER_ID[paper_id] = pmid
+    else:
+        _EUROPEPMC_PMID_BY_PAPER_ID[paper_id] = pmid
+
+
+def _europepmc_get_pmid(
+    paper_id: str, cache_lock: Optional[threading.Lock]
+) -> Optional[str]:
+    if cache_lock:
+        with cache_lock:
+            return _EUROPEPMC_PMID_BY_PAPER_ID.get(paper_id)
+    return _EUROPEPMC_PMID_BY_PAPER_ID.get(paper_id)
+
+
+def _europepmc_xml_body_is_error(text: str) -> bool:
+    t = (text or "").lstrip()
+    return t.startswith("<?xml") and "<errorbean>" in t.lower()
+
+
+def _europepmc_fulltext_urls(pmcid: str, pmid: Optional[str], kind: str) -> List[str]:
+    """
+    kind is fullTextXML or fullTextPDF.
+
+    Primary URL matches Europe PMC docs / browser examples, e.g.
+    https://www.ebi.ac.uk/europepmc/webservices/rest/PMC7096322/fullTextXML
+    Then try article/MED and article/PMC fallbacks if needed.
+    """
+    base = EUROPEPMC_FULLTEXT_BASE
+    pid = (pmcid or "").strip()
+    if not pid.upper().startswith("PMC"):
+        pid = f"PMC{pid}" if pid.isdigit() else pid
+    urls: List[str] = [f"{base}/{pid}/{kind}"]
+    p = (pmid or "").strip()
+    if p.isdigit():
+        urls.append(f"{base}/article/MED/{p}/{kind}")
+    tail = pid.upper().removeprefix("PMC")
+    if tail.isdigit():
+        alt = f"{base}/article/PMC/{tail}/{kind}"
+        if alt not in urls:
+            urls.append(alt)
+    return urls
+
+def _env_float(name: str, default: float) -> float:
+    try:
+        return float(os.environ.get(name, str(default)))
+    except Exception:
+        return default
+
+
+_ASM_THROTTLE_SECONDS = _env_float("ASM_THROTTLE_SECONDS", 6.0)
+
 # Minimum spacing between outbound calls per channel (shared across threads).
 _DEFAULT_THROTTLE_INTERVALS_S: Dict[str, float] = {
     "europe_pmc": 0.35,
+    "elsevier": 0.55,
+    "wiley": 5.0,
+    "mdpi": 0.55,
+    # ASM Journals: recommended crawler throttling rates (see comments in chat).
+    # Set override explicitly with ASM_THROTTLE_SECONDS (default: 6.0s).
+    "asm": _ASM_THROTTLE_SECONDS,
     "unpaywall": 0.55,
     "arxiv": 3.0,
     "semantic_scholar": 3.5,
@@ -189,18 +288,43 @@ class UCSCEmailOnlyProvider(BaseCollectionProvider):
         title = _extract_title_from_identifier(paper_id)
         source_attempts: Dict[str, Dict[str, Any]] = {
             "europe_pmc": {"attempted": True, "success": False, "artifact": None, "error": None},
+            "elsevier": {
+                "attempted": bool(doi and is_elsevier_primary_doi(doi)),
+                "success": False,
+                "artifact": None,
+                "error": None,
+            },
+            "wiley": {
+                "attempted": bool(doi and is_wiley_primary_doi(doi)),
+                "success": False,
+                "artifact": None,
+                "error": None,
+            },
+            "mdpi": {
+                "attempted": False,
+                "success": False,
+                "artifact": None,
+                "error": None,
+            },
+            "asm": {
+                "attempted": bool(doi and is_asm_primary_doi(doi)),
+                "success": False,
+                "artifact": None,
+                "error": None,
+            },
             "unpaywall": {"attempted": bool(doi), "success": False, "artifact": None, "error": None},
             "arxiv": {"attempted": bool(doi or title), "success": False, "artifact": None, "error": None},
             "semantic_scholar": {"attempted": bool(doi or title), "success": False, "artifact": None, "error": None},
         }
 
-        pmcid = _resolve_to_pmcid(
+        pmcid, epmc_search_query = _resolve_to_pmcid(
             paper_id,
             context.session,
             context.pmcid_cache,
             throttle=context.throttle,
             cache_lock=context.cache_lock,
         )
+        epmc_pmid = _europepmc_get_pmid(paper_id, context.cache_lock)
         xml_text = ""
         xml_path: Optional[str] = None
         pdf_path: Optional[str] = None
@@ -227,6 +351,7 @@ class UCSCEmailOnlyProvider(BaseCollectionProvider):
                 context.xml_dir,
                 file_stem=safe,
                 throttle=context.throttle,
+                pmid=epmc_pmid,
             )
             if xml_path:
                 xml_text = _extract_text_from_xml(xml_path)
@@ -242,14 +367,77 @@ class UCSCEmailOnlyProvider(BaseCollectionProvider):
                 context.pdf_dir,
                 file_stem=safe,
                 throttle=context.throttle,
+                pmid=epmc_pmid,
             )
             if epmc_pdf:
                 pdf_path = epmc_pdf
                 source_attempts["europe_pmc"]["success"] = True
                 source_attempts["europe_pmc"]["artifact"] = "pdf"
 
+        if doi and not text_path:
+            source_attempts["elsevier"]["attempted"] = True
+            if context.throttle:
+                context.throttle.wait("elsevier")
+            elsevier_raw = get_elsevier_fulltext_xml(doi, context.session)
+            if elsevier_raw:
+                els_plain = _extract_text_from_xml_string(elsevier_raw)
+                els_stats = _xml_quality_stats(els_plain)
+                epmc_stats = _xml_quality_stats(xml_text)
+                if els_stats["quality_pass"] and (
+                    not epmc_stats["quality_pass"]
+                    or len(els_plain) > len(xml_text or "") * 1.05
+                ):
+                    xml_text = els_plain
+                    try:
+                        os.makedirs(context.xml_dir, exist_ok=True)
+                        els_out = os.path.join(
+                            context.xml_dir, f"{safe}__elsevier.xml"
+                        )
+                        with open(
+                            els_out, "w", encoding="utf-8", errors="replace"
+                        ) as xf:
+                            xf.write(elsevier_raw)
+                        xml_path = els_out
+                    except Exception as ex:
+                        logger.debug(
+                            f"Could not save Elsevier XML for {safe}: {ex}"
+                        )
+                    source_attempts["elsevier"]["success"] = True
+                    source_attempts["elsevier"]["artifact"] = "xml"
+
+        # MDPI before Unpaywall: OA PDFs are on mdpi.com; Unpaywall often omits them.
+        if doi and is_mdpi_primary_doi(doi) and not pdf_path:
+            source_attempts["mdpi"]["attempted"] = True
+            if context.throttle:
+                context.throttle.wait("mdpi")
+            mdpi_pdf = download_mdpi_article_pdf(
+                doi,
+                context.session,
+                context.pdf_dir,
+                f"{safe}__mdpi",
+            )
+            if mdpi_pdf:
+                source_attempts["mdpi"]["success"] = True
+                source_attempts["mdpi"]["artifact"] = "pdf"
+                pdf_path = pdf_path or mdpi_pdf
+
+        # ASM before Unpaywall: ASM PDFs are often reachable via doi-derived URL patterns.
+        if doi and is_asm_primary_doi(doi) and not pdf_path:
+            if context.throttle:
+                context.throttle.wait("asm")
+            asm_pdf = download_asm_article_pdf(
+                doi,
+                context.session,
+                context.pdf_dir,
+                f"{safe}__asm",
+            )
+            if asm_pdf:
+                source_attempts["asm"]["success"] = True
+                source_attempts["asm"]["artifact"] = "pdf"
+                pdf_path = pdf_path or asm_pdf
+
         unpaywall_url = None
-        if doi:
+        if doi and not pdf_path:
             if context.throttle:
                 context.throttle.wait("unpaywall")
             unpaywall_url = get_unpaywall_pdf_url(
@@ -268,6 +456,35 @@ class UCSCEmailOnlyProvider(BaseCollectionProvider):
                 source_attempts["unpaywall"]["success"] = True
                 source_attempts["unpaywall"]["artifact"] = "pdf"
                 pdf_path = pdf_path or up_pdf
+
+        if doi and is_wiley_primary_doi(doi):
+            source_attempts["wiley"]["attempted"] = True
+            if context.throttle:
+                context.throttle.wait("wiley")
+            wiley_pdf = download_wiley_tdm_pdf(
+                doi,
+                context.session,
+                context.pdf_dir,
+                f"{safe}__wiley_tdm",
+            )
+            if wiley_pdf:
+                source_attempts["wiley"]["success"] = True
+                source_attempts["wiley"]["artifact"] = "pdf"
+                pdf_path = pdf_path or wiley_pdf
+
+        if doi and is_elsevier_primary_doi(doi):
+            if context.throttle:
+                context.throttle.wait("elsevier")
+            el_pdf = download_elsevier_article_pdf(
+                doi,
+                context.session,
+                context.pdf_dir,
+                f"{safe}__elsevier",
+            )
+            if el_pdf:
+                source_attempts["elsevier"]["success"] = True
+                source_attempts["elsevier"]["artifact"] = "pdf"
+                pdf_path = pdf_path or el_pdf
 
         arxiv_url = None
         if doi or title:
@@ -355,6 +572,48 @@ class UCSCEmailOnlyProvider(BaseCollectionProvider):
             except Exception as e:
                 logger.warning(f"Could not delete PDF {pdf_path}: {e}")
 
+        retrieval_queries: Dict[str, Any] = {
+            "paper_id": paper_id,
+            "source_tag": source,
+            "doi": doi,
+            "title": title,
+            "europe_pmc": {
+                "search_endpoint": EUROPEPMC_SEARCH_URL,
+                "search_query": epmc_search_query,
+                "pmcid_resolved": pmcid,
+                "pmid_from_search": epmc_pmid,
+                "fulltext_xml_url_try_order": (
+                    _europepmc_fulltext_urls(pmcid, epmc_pmid, "fullTextXML")
+                    if pmcid
+                    else []
+                ),
+                "fulltext_pdf_url_try_order": (
+                    _europepmc_fulltext_urls(pmcid, epmc_pmid, "fullTextPDF")
+                    if pmcid
+                    else []
+                ),
+            },
+            "identifiers_used_elsewhere": {
+                "elsevier_xml_pdf": doi,
+                "unpaywall": doi,
+                "wiley_tdm": doi,
+                "mdpi": doi,
+                "asm": doi,
+                "arxiv": {"doi": doi, "title": title},
+                "semantic_scholar": {"doi": doi, "title": title},
+            },
+            "resolved_pdf_urls": {
+                "unpaywall": unpaywall_url,
+                "arxiv": arxiv_url,
+                "semantic_scholar": s2_url,
+            },
+        }
+        logger.info(
+            f"paper_text_retrieval paper_id={paper_id!r} doi={doi!r} "
+            f"europe_pmc_search_query={epmc_search_query!r} pmcid={pmcid!r} "
+            f"pmid={epmc_pmid!r}"
+        )
+
         return DownloadRecord(
             paper_id=paper_id,
             source=source,
@@ -376,6 +635,7 @@ class UCSCEmailOnlyProvider(BaseCollectionProvider):
                 "unpaywall_url": unpaywall_url,
                 "arxiv_url": arxiv_url,
                 "semantic_scholar_url": s2_url,
+                "retrieval_queries": retrieval_queries,
             },
         )
 
@@ -578,9 +838,12 @@ def _resolve_to_pmcid(
     delay: float = API_DELAY,
     throttle: Optional[CollectThrottle] = None,
     cache_lock: Optional[threading.Lock] = None,
-) -> Optional[str]:
+) -> Tuple[Optional[str], str]:
     """
     Resolve an arbitrary paper identifier to a Europe PMC PMCID, if possible.
+
+    Returns (pmcid_or_None, europe_pmc_search_query) where the query is the
+    exact `query` param sent to /search, or ``pmcid_cache_hit`` if served from cache.
 
     Supported inputs:
         - PMC123456 or PMC:123456
@@ -591,9 +854,14 @@ def _resolve_to_pmcid(
     if cache_lock:
         with cache_lock:
             if paper_id in cache:
-                return cache[paper_id]
+                qnote = _EUROPEPMC_LAST_SEARCH_QUERY.get(
+                    paper_id, "pmcid_cache_hit"
+                )
+                return cache[paper_id], qnote
     elif paper_id in cache:
-        return cache[paper_id]
+        return cache[paper_id], _EUROPEPMC_LAST_SEARCH_QUERY.get(
+            paper_id, "pmcid_cache_hit"
+        )
 
     pid = paper_id.strip()
     u = pid.upper()
@@ -602,18 +870,27 @@ def _resolve_to_pmcid(
     # If the input is already a PMC id, still resolve it through the Europe PMC
     # search API so we can filter out notices (e.g. expression of concern).
     if u.startswith("PMC:"):
-        pmcid = u[4:].strip()
-        pmcid = f"PMC{pmcid}" if not pmcid.upper().startswith("PMC") else pmcid
-        search_query = pmcid
+        pmcid_norm = u[4:].strip()
+        pmcid_norm = (
+            f"PMC{pmcid_norm}"
+            if not pmcid_norm.upper().startswith("PMC")
+            else pmcid_norm
+        )
+        search_query = pmcid_norm
     elif u.startswith("PMC"):
         search_query = u
     else:
-        # Try to resolve via EXT_ID search.
+        # Europe PMC: DOI: finds PubMed-linked records; EXT_ID:10.xxx often returns zero hits.
         if u.startswith("PMID:"):
             ext_id = u[5:].strip()
         else:
             ext_id = pid
-        search_query = f"EXT_ID:{ext_id}"
+        if ext_id.startswith("10."):
+            search_query = f"DOI:{ext_id}"
+        else:
+            search_query = f"EXT_ID:{ext_id}"
+
+    _europepmc_note_search_query(paper_id, search_query, cache_lock)
 
     if throttle:
         throttle.wait("europe_pmc")
@@ -636,13 +913,14 @@ def _resolve_to_pmcid(
         resp.raise_for_status()
         data = resp.json()
     except Exception as e:
-        logger.debug(f"EXT_ID lookup failed for {paper_id}: {e}")
+        logger.debug(f"Europe PMC lookup failed for {paper_id}: {e}")
         if cache_lock:
             with cache_lock:
                 cache[paper_id] = None
         else:
             cache[paper_id] = None
-        return None
+        _europepmc_store_pmid(paper_id, None, cache_lock)
+        return None, search_query
 
     results = (data.get("resultList") or {}).get("result") or []
     for rec in results:
@@ -665,19 +943,24 @@ def _resolve_to_pmcid(
         pmcid = str(pmcid).strip()
         if not pmcid.upper().startswith("PMC"):
             pmcid = f"PMC{pmcid}"
+        pmid_raw = rec.get("pmid") or rec.get("id")
+        pmid_str = str(pmid_raw).strip() if pmid_raw is not None else ""
+        pmid_out: Optional[str] = pmid_str if pmid_str.isdigit() else None
         if cache_lock:
             with cache_lock:
                 cache[paper_id] = pmcid
         else:
             cache[paper_id] = pmcid
-        return pmcid
+        _europepmc_store_pmid(paper_id, pmid_out, cache_lock)
+        return pmcid, search_query
 
     if cache_lock:
         with cache_lock:
             cache[paper_id] = None
     else:
         cache[paper_id] = None
-    return None
+    _europepmc_store_pmid(paper_id, None, cache_lock)
+    return None, search_query
 
 
 def _fetch_fulltext_pdf(
@@ -687,6 +970,7 @@ def _fetch_fulltext_pdf(
     timeout: int = 120,
     file_stem: Optional[str] = None,
     throttle: Optional[CollectThrottle] = None,
+    pmid: Optional[str] = None,
 ) -> Optional[str]:
     """
     Download full-text PDF for a given PMCID from Europe PMC, if available.
@@ -700,32 +984,27 @@ def _fetch_fulltext_pdf(
         logger.debug(f"PDF cache hit: {out_path}")
         return out_path
 
-    url = f"{EUROPEPMC_FULLTEXT_BASE}/{pmcid}/fullTextPDF"
-    logger.debug(f"Fetching PDF for {pmcid} -> {url}")
-    if throttle:
-        throttle.wait("europe_pmc")
-    else:
-        time.sleep(API_DELAY)
-    try:
-        resp = session.get(url, timeout=timeout)
-        # Some responses may be HTML if PDF is not available.
-        resp.raise_for_status()
-        content_type = resp.headers.get("Content-Type", "").lower()
-        # Europe PMC sometimes returns PDFs with a non-standard/misleading
-        # Content-Type header, so also detect by magic header.
-        content_bytes = resp.content or b""
-        is_pdf_by_magic = content_bytes.startswith(b"%PDF")
-        if (("pdf" not in content_type) and not is_pdf_by_magic):
-            logger.debug(
-                f"PDF not available for {pmcid} (content-type={content_type!r})"
-            )
-            return None
-        with open(out_path, "wb") as f:
-            f.write(content_bytes)
-        return out_path
-    except Exception as e:
-        logger.debug(f"PDF fetch failed for {pmcid}: {e}")
-        return None
+    for url in _europepmc_fulltext_urls(pmcid, pmid, "fullTextPDF"):
+        logger.debug(f"Fetching PDF for {pmcid} -> {url}")
+        if throttle:
+            throttle.wait("europe_pmc")
+        else:
+            time.sleep(API_DELAY)
+        try:
+            resp = session.get(url, timeout=timeout)
+            if resp.status_code != 200:
+                continue
+            content_type = (resp.headers.get("Content-Type") or "").lower()
+            content_bytes = resp.content or b""
+            is_pdf_by_magic = content_bytes.startswith(b"%PDF")
+            if (("pdf" not in content_type) and not is_pdf_by_magic):
+                continue
+            with open(out_path, "wb") as f:
+                f.write(content_bytes)
+            return out_path
+        except Exception as e:
+            logger.debug(f"PDF fetch failed {url}: {e}")
+    return None
 
 
 def _fetch_fulltext_xml(
@@ -735,6 +1014,7 @@ def _fetch_fulltext_xml(
     timeout: int = 120,
     file_stem: Optional[str] = None,
     throttle: Optional[CollectThrottle] = None,
+    pmid: Optional[str] = None,
 ) -> Optional[str]:
     """
     Download full-text XML for a given PMCID from Europe PMC, if available.
@@ -748,24 +1028,25 @@ def _fetch_fulltext_xml(
         logger.debug(f"XML cache hit: {out_path}")
         return out_path
 
-    url = f"{EUROPEPMC_FULLTEXT_BASE}/{pmcid}/fullTextXML"
-    logger.debug(f"Fetching XML for {pmcid} -> {url}")
-    if throttle:
-        throttle.wait("europe_pmc")
-    else:
-        time.sleep(API_DELAY)
-    try:
-        resp = session.get(url, timeout=timeout)
-        resp.raise_for_status()
-        text = resp.text
-        if not text or len(text) < 500:
-            return None
-        with open(out_path, "w", encoding="utf-8", errors="replace") as f:
-            f.write(text)
-        return out_path
-    except Exception as e:
-        logger.debug(f"XML fetch failed for {pmcid}: {e}")
-        return None
+    for url in _europepmc_fulltext_urls(pmcid, pmid, "fullTextXML"):
+        logger.debug(f"Fetching XML for {pmcid} -> {url}")
+        if throttle:
+            throttle.wait("europe_pmc")
+        else:
+            time.sleep(API_DELAY)
+        try:
+            resp = session.get(url, timeout=timeout)
+            if resp.status_code != 200:
+                continue
+            text = resp.text or ""
+            if not text or len(text) < 500 or _europepmc_xml_body_is_error(text):
+                continue
+            with open(out_path, "w", encoding="utf-8", errors="replace") as f:
+                f.write(text)
+            return out_path
+        except Exception as e:
+            logger.debug(f"XML fetch failed {url}: {e}")
+    return None
 
 
 def _extract_text_from_xml(xml_path: str) -> str:
@@ -775,6 +1056,24 @@ def _extract_text_from_xml(xml_path: str) -> str:
     try:
         tree = ET.parse(xml_path)
         root = tree.getroot()
+    except Exception:
+        return ""
+
+    parts: List[str] = []
+    for elem in root.iter():
+        if elem.text and elem.text.strip():
+            parts.append(elem.text.strip())
+    return "\n".join(parts)
+
+
+def _extract_text_from_xml_string(xml: str) -> str:
+    """Same as _extract_text_from_xml but from an in-memory document (e.g. Elsevier API)."""
+    import xml.etree.ElementTree as ET
+
+    if not (xml or "").strip():
+        return ""
+    try:
+        root = ET.fromstring(xml.strip())
     except Exception:
         return ""
 
