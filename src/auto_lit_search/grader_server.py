@@ -1,7 +1,7 @@
 import json
 import os
 import time
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import requests
 from fastapi import FastAPI, HTTPException
@@ -19,6 +19,48 @@ app = FastAPI(title="auto_lit_search Grader node")
 TEXT_EXTENSIONS = (".txt",)
 MAX_PAPER_CHARS = 120000
 _MODEL_ID_CACHE: Dict[str, str] = {}
+
+
+def _env_positive_float(name: str, default: float) -> float:
+    raw = os.environ.get(name)
+    if raw is None or not str(raw).strip():
+        return default
+    try:
+        v = float(str(raw).strip())
+        return v if v > 0 else default
+    except ValueError:
+        return default
+
+
+def _env_positive_int(name: str, default: int) -> int:
+    raw = os.environ.get(name)
+    if raw is None or not str(raw).strip():
+        return default
+    try:
+        v = int(str(raw).strip(), 10)
+        return v if v >= 1 else default
+    except ValueError:
+        return default
+
+
+def _grader_http_read_timeout_sec() -> float:
+    """Seconds to wait for vLLM response body per attempt (queue + generation)."""
+    for key in ("VLLM_HTTP_READ_TIMEOUT", "VLLM_GRADER_TIMEOUT"):
+        raw = os.environ.get(key)
+        if raw is not None and str(raw).strip():
+            try:
+                v = float(str(raw).strip())
+                if v > 0:
+                    return v
+            except ValueError:
+                pass
+    return 300.0
+
+
+def _grader_http_timeout_tuple() -> Tuple[float, float]:
+    connect = _env_positive_float("VLLM_HTTP_CONNECT_TIMEOUT", 30.0)
+    read = _grader_http_read_timeout_sec()
+    return (connect, read)
 
 
 def _ensure_dir(path: str) -> None:
@@ -131,33 +173,78 @@ def _resolve_model_id(base_url: str) -> str:
     raise RuntimeError(f"Could not resolve model id from {models_url}")
 
 
-def _call_llm(user_content: str, base_url: str, max_tokens: int, temperature: float) -> str:
+def _post_chat_completion(
+    url: str,
+    payload: Dict[str, Any],
+    timeout: Tuple[float, float],
+    root_url: str,
+) -> requests.Response:
+    r = requests.post(url, json=payload, timeout=timeout)
+    configured = (os.environ.get("VLLM_MODEL_NAME") or "").strip()
+    if r.status_code == 404 and configured:
+        model_id = str(payload.get("model") or "")
+        served_model = _resolve_model_id(root_url)
+        if served_model != model_id:
+            retry_payload = dict(payload)
+            retry_payload["model"] = served_model
+            r = requests.post(url, json=retry_payload, timeout=timeout)
+    return r
+
+
+def _call_llm(
+    user_content: str,
+    base_url: str,
+    max_tokens: int,
+    temperature: float,
+    log_context: str = "",
+) -> str:
     configured = (os.environ.get("VLLM_MODEL_NAME") or "").strip()
     root_url = base_url.rstrip("/")
-    base_url = root_url
-    if not base_url.endswith("/v1"):
-        base_url = f"{base_url}/v1"
-    url = f"{base_url}/chat/completions"
+    api_base = root_url
+    if not api_base.endswith("/v1"):
+        api_base = f"{api_base}/v1"
+    url = f"{api_base}/chat/completions"
     model_id = configured or _resolve_model_id(root_url)
-    payload = {
+    payload: Dict[str, Any] = {
         "model": model_id,
         "messages": [{"role": "user", "content": user_content}],
         "max_tokens": max_tokens,
         "temperature": temperature,
     }
-    r = requests.post(url, json=payload, timeout=300)
-    if r.status_code == 404 and configured:
-        served_model = _resolve_model_id(root_url)
-        if served_model != model_id:
-            payload["model"] = served_model
-            r = requests.post(url, json=payload, timeout=300)
-    r.raise_for_status()
-    data = r.json()
-    choices = data.get("choices") or []
-    if choices and isinstance(choices[0], dict):
-        msg = choices[0].get("message") or {}
-        if isinstance(msg, dict):
-            return str(msg.get("content") or "").strip()
+    timeout = _grader_http_timeout_tuple()
+    max_attempts = _env_positive_int("VLLM_GRADER_HTTP_RETRIES", 3)
+    backoff_base = _env_positive_float("VLLM_GRADER_RETRY_BACKOFF_SEC", 45.0)
+    backoff_cap = _env_positive_float("VLLM_GRADER_RETRY_BACKOFF_CAP_SEC", 180.0)
+
+    last_exc: Optional[BaseException] = None
+    for attempt in range(max_attempts):
+        try:
+            r = _post_chat_completion(url, payload, timeout, root_url)
+            r.raise_for_status()
+            data = r.json()
+            choices = data.get("choices") or []
+            if choices and isinstance(choices[0], dict):
+                msg = choices[0].get("message") or {}
+                if isinstance(msg, dict):
+                    return str(msg.get("content") or "").strip()
+            return ""
+        except (requests.exceptions.ReadTimeout, requests.exceptions.ConnectionError) as e:
+            last_exc = e
+            if attempt + 1 >= max_attempts:
+                raise
+            wait = min(backoff_base * (2**attempt), backoff_cap)
+            ctx = log_context or "grader"
+            logger.warning(
+                "Grader LLM {} (attempt {}/{}); sleeping {:.1f}s before retry context={!r}",
+                type(e).__name__,
+                attempt + 1,
+                max_attempts,
+                wait,
+                ctx,
+            )
+            time.sleep(wait)
+    if last_exc:
+        raise last_exc
     return ""
 
 
@@ -243,31 +330,73 @@ def _safe_float(v: Any, default: float = 0.0) -> float:
     return max(0.0, min(1.0, x))
 
 
-def _parse_grade_output(raw: str, dims: List[Dict[str, Any]]) -> Dict[str, Any]:
+def _strip_markdown_json_fence(text: str) -> str:
+    t = text.strip()
+    if not t.startswith("```"):
+        return t
+    lines = t.split("\n")
+    if len(lines) < 2:
+        return t
+    body = lines[1:]
+    while body and body[-1].strip() == "```":
+        body.pop()
+    return "\n".join(body).strip()
+
+
+def _try_parse_grade_json(raw: str, dims: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    s = raw.strip()
+    if not s:
+        return None
     try:
-        obj = json.loads(raw)
-        if isinstance(obj, dict):
-            dsc = obj.get("rubric_dimension_scores") or {}
-            if not isinstance(dsc, dict):
-                dsc = {}
-            dim_scores: Dict[str, float] = {}
-            for d in dims:
-                dn = d["name"]
-                dim_scores[dn] = _safe_float(dsc.get(dn), 0.0)
-            grade = _safe_float(obj.get("relevance_grade"), sum(dim_scores.values()) / max(len(dim_scores), 1))
-            return {
-                "relevance_grade": grade,
-                "rubric_dimension_scores": dim_scores,
-                "rationale": str(obj.get("rationale") or "").strip(),
-            }
+        obj = json.loads(s)
     except Exception:
-        pass
-    # Fallback to empty parse.
+        return None
+    if not isinstance(obj, dict):
+        return None
+    dsc = obj.get("rubric_dimension_scores")
+    if not isinstance(dsc, dict):
+        return None
+    rax = obj.get("rubric_axis_rationales")
+    if not isinstance(rax, dict):
+        return None
+    dim_scores: Dict[str, float] = {}
+    axis_rationales: Dict[str, str] = {}
+    for d in dims:
+        dn = d["name"]
+        if dn not in dsc:
+            return None
+        if dn not in rax:
+            return None
+        dim_scores[dn] = _safe_float(dsc.get(dn), 0.0)
+        rtext = str(rax.get(dn) or "").strip()
+        if not rtext:
+            return None
+        axis_rationales[dn] = rtext
+    grade = sum(dim_scores.values()) / max(len(dim_scores), 1)
+    return {
+        "relevance_grade": grade,
+        "rubric_dimension_scores": dim_scores,
+        "rubric_axis_rationales": axis_rationales,
+        "rationale": str(obj.get("rationale") or "").strip(),
+    }
+
+
+def _parse_grade_output(raw: str, dims: List[Dict[str, Any]]) -> Dict[str, Any]:
+    stripped = _strip_markdown_json_fence(raw)
+    parsed = _try_parse_grade_json(stripped, dims)
+    if parsed is not None:
+        return parsed
     dim_scores = {d["name"]: 0.0 for d in dims}
+    axr = {d["name"]: "" for d in dims}
+    if stripped and dims:
+        axr[dims[0]["name"]] = (
+            f"[Grader JSON parse failed; raw output excerpt:] {stripped[:2000]}"
+        )
     return {
         "relevance_grade": 0.0,
         "rubric_dimension_scores": dim_scores,
-        "rationale": raw[:800],
+        "rubric_axis_rationales": axr,
+        "rationale": stripped[:800],
     }
 
 
@@ -285,28 +414,48 @@ def _grade_single_paper(
     dim_lines = "\n".join(
         f"- {d['name']}: {d['description']} (weight={d['weight']})" for d in dims
     )
-    prompt = (
-        "You are grading one research paper for relevance to a protein alignment.\n"
-        "Return strict JSON only with keys:\n"
-        "relevance_grade (0..1 float), rubric_dimension_scores (object dim->0..1), rationale (string).\n\n"
-        f"Alignment={req.alignment_id}\n"
-        f"Query={req.query}\n"
-        f"Target={req.target_id}\n"
-        f"Paper role={role or 'unknown'}\n"
-        f"{term_block}\n"
-        f"Rubric:\n{json.dumps(rubric, ensure_ascii=False)}\n"
-        f"Dimensions:\n{dim_lines}\n\n"
-        f"Paper excerpt:\n{text[:80000]}"
+    gene_focus = (
+        "the QUERY gene (pathogen / microbe-side rubric context)"
+        if role == "query"
+        else (
+            "the TARGET gene (host-side rubric context)"
+            if role == "target"
+            else "the gene implied by this paper's role in the pair below (query vs target)"
+        )
     )
+    prompt = (
+        "Grade using the RUBRIC JSON object below. If `grader_instructions` exists, read it first; "
+        "then `system_context`, `evaluation_unit`, `scoring_scale`, and each `axis` with criteria.\n\n"
+        "Alignment context (pair-level; the rubric file is per side):\n"
+        f"- alignment_id={req.alignment_id}\n"
+        f"- query_gene_id={req.query}\n"
+        f"- target_gene_id={req.target_id}\n"
+        f"- paper_role={role or 'unknown'} (query → microbe rubric; target → host rubric)\n"
+        f"- gene_focus_for_this_paper: {gene_focus}\n"
+        f"{term_block}\n"
+        "OUTPUT (pipeline JSON schema; not part of the rubric file):\n"
+        "Return strict JSON only with keys:\n"
+        "rubric_dimension_scores (object: each axis id below → number 0..1),\n"
+        "rubric_axis_rationales (object: SAME axis ids → string: cite evidence from the excerpt; "
+        "explain how you applied that axis’s criteria; no empty strings),\n"
+        "rationale (optional string: one-sentence cross-axis takeaway; may be \"\").\n"
+        "Do not output relevance_grade; it will be computed as the mean of axis scores.\n\n"
+        f"RUBRIC:\n{json.dumps(rubric, ensure_ascii=False)}\n"
+        f"rubric_dimension_scores and rubric_axis_rationales must each include exactly these "
+        f"axis ids:\n{dim_lines}\n\n"
+        f"Paper excerpt:\n{text[:100000]}"
+    )
+    dim_names = ", ".join(d["name"] for d in dims)
     notes = ""
     raw = ""
-    parsed = {
+    parsed: Dict[str, Any] = {
         "relevance_grade": 0.0,
         "rubric_dimension_scores": {d["name"]: 0.0 for d in dims},
+        "rubric_axis_rationales": {d["name"]: "" for d in dims},
         "rationale": "",
     }
     if llm_base_url and text.strip():
-        max_tokens = (req.constraints and req.constraints.max_tokens) or 1024
+        max_tokens = (req.constraints and req.constraints.max_tokens) or 3072
         temperature = (
             (req.constraints and req.constraints.temperature)
             if req.constraints is not None
@@ -314,20 +463,66 @@ def _grade_single_paper(
         )
         if temperature is None:
             temperature = 0.0
-        try:
-            raw = _call_llm(prompt, llm_base_url, max_tokens=max_tokens, temperature=temperature)
-            if raw:
-                parsed = _parse_grade_output(raw, dims)
-        except Exception as e:
-            notes = str(e)
-            logger.warning(f"Grader LLM call failed for {fname}: {e}")
+        graded_ok = False
+        for attempt in range(2):
+            retry_extra = ""
+            if attempt:
+                bad = _strip_markdown_json_fence(raw)[:1500]
+                retry_extra = (
+                    "\n\nYour previous reply was not usable (empty, prose, markdown fences, "
+                    "or missing required JSON keys). Follow rubric.grader_instructions and the axes, "
+                    "then respond with ONLY one JSON object—no other text.\n"
+                    "Required keys: rubric_dimension_scores (numbers 0..1), "
+                    "rubric_axis_rationales (strings; same keys), optional rationale (string). "
+                    f"Axis ids: {dim_names}.\n"
+                )
+                if bad:
+                    retry_extra += f"Invalid earlier reply (excerpt):\n{bad}\n"
+            try:
+                raw = _call_llm(
+                    prompt + retry_extra,
+                    llm_base_url,
+                    max_tokens=max_tokens,
+                    temperature=temperature,
+                    log_context=fname,
+                )
+            except Exception as e:
+                notes = str(e)
+                logger.warning(f"Grader LLM call failed for {fname}: {e}")
+                break
+            candidate = _strip_markdown_json_fence(raw)
+            maybe = _try_parse_grade_json(candidate, dims)
+            if maybe is not None:
+                parsed = maybe
+                graded_ok = True
+                break
+            if attempt == 0:
+                reason = (
+                    "empty model content"
+                    if not candidate.strip()
+                    else "invalid JSON or missing rubric_dimension_scores / rubric_axis_rationales"
+                )
+                logger.warning(
+                    f"Grader LLM ({fname}): {reason}; resubmitting prompt once with stricter instruction"
+                )
+        if not graded_ok and raw:
+            if not notes:
+                logger.warning(
+                    f"Grader LLM ({fname}): invalid JSON after retry; "
+                    "using default scores and rationale excerpt"
+                )
+            parsed = _parse_grade_output(raw, dims)
+    rdim = parsed["rubric_dimension_scores"]
+    grade = sum(float(rdim[k]) for k in rdim) / max(len(rdim), 1)
     return GradedPaper(
         paper_id=fname,
         file_name=fname,
         paper_role=role,
-        relevance_grade=_safe_float(parsed["relevance_grade"]),
+        relevance_grade=_safe_float(grade),
         rubric_dimension_scores=parsed["rubric_dimension_scores"],
-        rationale=parsed["rationale"],
+        rubric_axis_rationales=parsed.get("rubric_axis_rationales")
+        or {d["name"]: "" for d in dims},
+        rationale=parsed.get("rationale") or "",
         model_output=raw or None,
         notes=notes or None,
     )
@@ -367,6 +562,25 @@ def grade_alignment(req: GradeAlignmentRequest) -> RunAlignmentResponse:
             )
         )
 
+    def _parse_fallback_paper(g: GradedPaper) -> bool:
+        rax = g.rubric_axis_rationales or {}
+        return any(
+            str(v).strip().startswith("[Grader JSON parse failed")
+            for v in rax.values()
+        )
+
+    llm_enabled = bool(llm_base_url and str(llm_base_url).strip())
+    n_llm_exceptions = sum(1 for g in graded if (g.notes or "").strip())
+    n_without_model_output = sum(1 for g in graded if not (g.model_output or "").strip())
+    n_json_parse_fallback = sum(1 for g in graded if _parse_fallback_paper(g))
+    n_llm_ok_structured = sum(
+        1
+        for g in graded
+        if (g.model_output or "").strip()
+        and not (g.notes or "").strip()
+        and not _parse_fallback_paper(g)
+    )
+
     _ensure_dir(req.output_root)
     graded_path = os.path.join(req.output_root, f"{req.alignment_id}_graded.json")
     grading_meta: Dict[str, Any] = {
@@ -375,6 +589,11 @@ def grade_alignment(req: GradeAlignmentRequest) -> RunAlignmentResponse:
         "microbe_rubric_path": req.microbe_rubric_path,
         "graded_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         "n_papers": len(graded),
+        "llm_enabled": llm_enabled,
+        "n_llm_exceptions": n_llm_exceptions,
+        "n_without_model_output": n_without_model_output,
+        "n_json_parse_fallback": n_json_parse_fallback,
+        "n_llm_ok_structured": n_llm_ok_structured,
     }
     with open(graded_path, "w", encoding="utf-8") as f:
         json.dump(
@@ -388,6 +607,12 @@ def grade_alignment(req: GradeAlignmentRequest) -> RunAlignmentResponse:
         )
     logger.info(
         f"Grader wrote {len(graded)} graded papers for {req.alignment_id} -> {graded_path}"
+    )
+    logger.info(
+        f"Grader summary {req.alignment_id}: n_papers={len(graded)} llm_enabled={llm_enabled} "
+        f"n_llm_ok_structured={n_llm_ok_structured} n_llm_exceptions={n_llm_exceptions} "
+        f"n_json_parse_fallback={n_json_parse_fallback} "
+        f"n_without_model_output={n_without_model_output}"
     )
 
     synth_payload = RunAlignmentGradedRequest(
