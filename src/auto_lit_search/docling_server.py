@@ -1,5 +1,6 @@
 import os
 import json
+import gc
 from typing import Any, Dict, List, Optional
 
 # Headless-friendly defaults for PDF stacks that touch Qt/XCB in some builds.
@@ -54,6 +55,23 @@ _DOC_CONVERTER = DocumentConverter(
         InputFormat.PDF: PdfFormatOption(),
     }
 )
+
+def _best_effort_free_memory() -> None:
+    """
+    Docling/pdf stacks can hold onto large CPU/GPU allocations between requests.
+    Force Python GC and (when available) clear CUDA caching allocator.
+    """
+    try:
+        gc.collect()
+    except Exception:
+        pass
+    try:
+        import torch  # type: ignore
+
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+    except Exception:
+        pass
 
 
 def _extract_text_pypdf(pdf_path: str) -> str:
@@ -139,6 +157,8 @@ def _convert_pdfs_to_text(
             continue
         attempted += 1
         text = ""
+        result = None
+        doc = None
         try:
             result = _DOC_CONVERTER.convert(source=pdf_path)
             doc = result.document
@@ -146,6 +166,17 @@ def _convert_pdfs_to_text(
         except Exception as e:
             logger.warning(f"Docling failed for {pdf_path}: {e}")
             text = ""
+        finally:
+            # Ensure large objects are dereferenced between PDFs.
+            try:
+                del doc
+            except Exception:
+                pass
+            try:
+                del result
+            except Exception:
+                pass
+            _best_effort_free_memory()
         if not (text or "").strip():
             fallback = _extract_text_pypdf(pdf_path)
             if fallback.strip():
