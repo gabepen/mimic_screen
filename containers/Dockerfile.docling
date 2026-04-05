@@ -15,8 +15,17 @@ RUN set -e && \
         poppler-utils && \
     apt-get clean && rm -rf /var/lib/apt/lists/*
 
+# PyTorch: install CUDA 12.4 wheels *before* docling so pip does not pull torch+cu130 (CUDA 13),
+# which fails on typical cluster drivers (nvidia-smi CUDA 12.x, e.g. 560.xx).
+# Match lit-llm strategy: explicit index, then app packages.
 RUN python3 -m pip install --no-cache-dir --upgrade pip && \
     python3 -m pip install --no-cache-dir \
+        "torch==2.6.0" \
+        "torchvision==0.21.0" \
+        --index-url https://download.pytorch.org/whl/cu124
+
+RUN python3 -m pip install --no-cache-dir \
+        --extra-index-url https://download.pytorch.org/whl/cu124 \
         docling \
         rapidocr \
         pypdf \
@@ -26,7 +35,8 @@ RUN python3 -m pip install --no-cache-dir --upgrade pip && \
         "uvicorn[standard]" \
         requests
 
-RUN python3 -c "import uvicorn; import fastapi"
+RUN python3 -c "import torch; print('torch', torch.__version__, 'cuda', torch.version.cuda)" && \
+    python3 -c "import uvicorn; import fastapi"
 
 ENV PYTHONUNBUFFERED=1
 ENV QT_QPA_PLATFORM=offscreen
