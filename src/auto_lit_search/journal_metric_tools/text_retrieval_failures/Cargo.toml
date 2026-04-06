@@ -1,0 +1,17 @@
+[package]
+name = "text_retrieval_failures"
+version = "0.1.0"
+edition = "2021"
+description = "Count JSONL papers with failed text retrieval, group by publisher/journal (Crossref + Europe PMC)"
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive", "env"] }
+futures = "0.3"
+glob = "0.3"
+regex = "1"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["fs", "io-util", "macros", "rt-multi-thread", "sync"] }
+walkdir = "2"
