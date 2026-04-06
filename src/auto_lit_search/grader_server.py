@@ -1,6 +1,9 @@
 import json
 import os
+import threading
 import time
+import uuid
+from collections import deque
 from typing import Any, Dict, List, Optional, Tuple
 
 import requests
@@ -19,6 +22,10 @@ app = FastAPI(title="auto_lit_search Grader node")
 TEXT_EXTENSIONS = (".txt",)
 MAX_PAPER_CHARS = 120000
 _MODEL_ID_CACHE: Dict[str, str] = {}
+_ASYNC_JOBS: Dict[str, Dict[str, Any]] = {}
+_ASYNC_QUEUE: "deque[Tuple[str, GradeAlignmentRequest]]" = deque()
+_ASYNC_LOCK = threading.Lock()
+_ASYNC_WORKER_STARTED = False
 
 
 def _env_positive_float(name: str, default: float) -> float:
@@ -528,13 +535,7 @@ def _grade_single_paper(
     )
 
 
-@app.get("/healthz")
-def healthz() -> Dict[str, str]:
-    return {"status": "ok", "detail": "ready"}
-
-
-@app.post("/grade_alignment", response_model=RunAlignmentResponse)
-def grade_alignment(req: GradeAlignmentRequest) -> RunAlignmentResponse:
+def _grade_alignment_sync(req: GradeAlignmentRequest) -> RunAlignmentResponse:
     if not os.path.isdir(req.papers_dir):
         raise HTTPException(
             status_code=400,
@@ -642,6 +643,116 @@ def grade_alignment(req: GradeAlignmentRequest) -> RunAlignmentResponse:
         alignment_id=req.alignment_id,
         results_path=str(out.get("results_path") or ""),
     )
+
+
+def _async_queue_max_size() -> int:
+    return _env_positive_int("GRADER_ASYNC_MAX_QUEUE", 1)
+
+
+def _async_poll_interval_sec() -> float:
+    return _env_positive_float("GRADER_ASYNC_POLL_INTERVAL_SEC", 2.0)
+
+
+def _async_worker_loop() -> None:
+    while True:
+        with _ASYNC_LOCK:
+            item = _ASYNC_QUEUE.popleft() if _ASYNC_QUEUE else None
+        if item is None:
+            time.sleep(0.2)
+            continue
+        job_id, req = item
+        with _ASYNC_LOCK:
+            job = _ASYNC_JOBS.get(job_id) or {}
+            job["status"] = "running"
+            job["started_at"] = time.time()
+            _ASYNC_JOBS[job_id] = job
+        try:
+            out = _grade_alignment_sync(req)
+            with _ASYNC_LOCK:
+                job = _ASYNC_JOBS.get(job_id) or {}
+                job["status"] = "succeeded"
+                job["finished_at"] = time.time()
+                job["result"] = out.dict()
+                _ASYNC_JOBS[job_id] = job
+        except Exception as e:
+            with _ASYNC_LOCK:
+                job = _ASYNC_JOBS.get(job_id) or {}
+                job["status"] = "failed"
+                job["finished_at"] = time.time()
+                job["error"] = str(e)
+                _ASYNC_JOBS[job_id] = job
+
+
+def _ensure_async_worker_started() -> None:
+    global _ASYNC_WORKER_STARTED
+    with _ASYNC_LOCK:
+        if _ASYNC_WORKER_STARTED:
+            return
+        t = threading.Thread(target=_async_worker_loop, daemon=True)
+        t.start()
+        _ASYNC_WORKER_STARTED = True
+
+
+@app.get("/healthz")
+def healthz() -> Dict[str, str]:
+    return {"status": "ok", "detail": "ready"}
+
+
+@app.post("/grade_alignment", response_model=RunAlignmentResponse)
+def grade_alignment(req: GradeAlignmentRequest) -> RunAlignmentResponse:
+    return _grade_alignment_sync(req)
+
+
+@app.get("/grader_capacity")
+def grader_capacity() -> Dict[str, Any]:
+    _ensure_async_worker_started()
+    with _ASYNC_LOCK:
+        queue_depth = len(_ASYNC_QUEUE)
+        running = sum(1 for v in _ASYNC_JOBS.values() if v.get("status") == "running")
+        max_queue = _async_queue_max_size()
+    return {
+        "status": "ok",
+        "can_accept": queue_depth < max_queue,
+        "queue_depth": queue_depth,
+        "max_queue": max_queue,
+        "running_jobs": running,
+    }
+
+
+@app.post("/grade_alignment_async")
+def grade_alignment_async(req: GradeAlignmentRequest) -> Dict[str, Any]:
+    _ensure_async_worker_started()
+    max_queue = _async_queue_max_size()
+    with _ASYNC_LOCK:
+        if len(_ASYNC_QUEUE) >= max_queue:
+            raise HTTPException(
+                status_code=429,
+                detail=f"grader queue full (queue_depth={len(_ASYNC_QUEUE)} max_queue={max_queue})",
+            )
+        job_id = uuid.uuid4().hex
+        _ASYNC_JOBS[job_id] = {
+            "job_id": job_id,
+            "alignment_id": req.alignment_id,
+            "status": "queued",
+            "submitted_at": time.time(),
+        }
+        _ASYNC_QUEUE.append((job_id, req))
+    return {
+        "job_id": job_id,
+        "alignment_id": req.alignment_id,
+        "status": "queued",
+        "poll_interval_sec": _async_poll_interval_sec(),
+    }
+
+
+@app.get("/grade_alignment_status/{job_id}")
+def grade_alignment_status(job_id: str) -> Dict[str, Any]:
+    with _ASYNC_LOCK:
+        job = _ASYNC_JOBS.get(job_id)
+        if job is None:
+            raise HTTPException(status_code=404, detail=f"unknown job_id: {job_id}")
+        out = dict(job)
+    return out
 
 
 if __name__ == "__main__":

@@ -139,6 +139,52 @@ def _wait_health(
     return False
 
 
+def _submit_grader_async(
+    session: requests.Session,
+    grader_url_base: str,
+    payload: Dict[str, Any],
+    submit_timeout: int,
+) -> str:
+    r = session.post(
+        f"{grader_url_base}/grade_alignment_async",
+        json=payload,
+        timeout=submit_timeout,
+    )
+    r.raise_for_status()
+    out = r.json()
+    job_id = str(out.get("job_id") or "").strip()
+    if not job_id:
+        raise RuntimeError("grader async submit returned empty job_id")
+    return job_id
+
+
+def _poll_grader_async(
+    session: requests.Session,
+    grader_url_base: str,
+    job_id: str,
+    alignment_id: str,
+    attempt_timeout: int,
+    poll_interval_seconds: int,
+) -> Dict[str, Any]:
+    started = time.monotonic()
+    while True:
+        if time.monotonic() - started > attempt_timeout:
+            raise requests.exceptions.ReadTimeout(
+                f"grader async status timeout for {alignment_id} (job_id={job_id}) "
+                f"after {attempt_timeout}s"
+            )
+        r = session.get(
+            f"{grader_url_base}/grade_alignment_status/{job_id}",
+            timeout=30,
+        )
+        r.raise_for_status()
+        status = r.json()
+        st = str(status.get("status") or "").strip().lower()
+        if st in {"succeeded", "failed"}:
+            return status
+        time.sleep(max(1, poll_interval_seconds))
+
+
 def run(
     paper_ids_path: str,
     data_root: str,
@@ -250,9 +296,17 @@ def run(
     pending_grader: Dict[str, Dict[str, Any]] = {}
     pending_attempts: Dict[str, int] = {}
     max_grader_attempts = int(os.environ.get("GRADER_MAX_ATTEMPTS", "3"))
-    grader_attempt_timeout = int(os.environ.get("GRADER_ATTEMPT_TIMEOUT_SECONDS", "120"))
-    grader_attempt_timeout = min(grader_attempt_timeout, int(request_timeout))
+    # Grader requests can span many files and multiple LLM calls; default to the
+    # top-level request timeout unless explicitly overridden.
+    grader_attempt_timeout = int(
+        os.environ.get("GRADER_ATTEMPT_TIMEOUT_SECONDS", str(request_timeout))
+    )
+    grader_attempt_timeout = max(30, grader_attempt_timeout)
     grader_retry_sleep_seconds = int(os.environ.get("GRADER_RETRY_SLEEP_SECONDS", "15"))
+    grader_submit_timeout = int(os.environ.get("GRADER_SUBMIT_TIMEOUT_SECONDS", "30"))
+    grader_poll_interval_seconds = int(
+        os.environ.get("GRADER_POLL_INTERVAL_SECONDS", "5")
+    )
 
     def _outputs_done(alignment_id: str) -> bool:
         # Grader writes *_graded.json and synthesis (GPU node) writes *_results.json.
@@ -456,19 +510,30 @@ def run(
                 continue
 
             try:
-                r = session.post(
-                    f"{grader_url_base}/grade_alignment",
-                    json=payload,
-                    # Attempt with a bounded timeout so one slow grader doesn't stall the whole CPU run.
-                    timeout=grader_attempt_timeout,
+                job_id = _submit_grader_async(
+                    session=session,
+                    grader_url_base=grader_url_base,
+                    payload=payload,
+                    submit_timeout=grader_submit_timeout,
                 )
-                r.raise_for_status()
-                out = r.json()
+                out = _poll_grader_async(
+                    session=session,
+                    grader_url_base=grader_url_base,
+                    job_id=job_id,
+                    alignment_id=alignment_id,
+                    attempt_timeout=grader_attempt_timeout,
+                    poll_interval_seconds=grader_poll_interval_seconds,
+                )
+                st = str(out.get("status") or "").strip().lower()
+                if st != "succeeded":
+                    err = out.get("error") or "unknown grader async failure"
+                    raise RuntimeError(f"grader async failed for {alignment_id}: {err}")
+                result = out.get("result") or {}
                 logger.info(
-                    f"Alignment {alignment_id}: graded+synthesis {out.get('status')} -> {out.get('results_path')}"
+                    f"Alignment {alignment_id}: graded+synthesis {result.get('status')} -> {result.get('results_path')} (job_id={job_id})"
                 )
                 total += 1
-            except requests.RequestException as e:
+            except (requests.RequestException, RuntimeError) as e:
                 logger.error(f"Alignment {alignment_id}: grader request failed: {e}")
                 grader_failures += 1
                 # Queue for retry; CPU should keep processing other alignments.
@@ -503,19 +568,31 @@ def run(
                 pending_attempts.pop(alignment_id, None)
                 continue
             try:
-                r = session.post(
-                    f"{grader_url_base}/grade_alignment",
-                    json=pending_payload,
-                    timeout=grader_attempt_timeout,
+                job_id = _submit_grader_async(
+                    session=session,
+                    grader_url_base=grader_url_base,
+                    payload=pending_payload,
+                    submit_timeout=grader_submit_timeout,
                 )
-                r.raise_for_status()
-                out = r.json()
+                out = _poll_grader_async(
+                    session=session,
+                    grader_url_base=grader_url_base,
+                    job_id=job_id,
+                    alignment_id=alignment_id,
+                    attempt_timeout=grader_attempt_timeout,
+                    poll_interval_seconds=grader_poll_interval_seconds,
+                )
+                st = str(out.get("status") or "").strip().lower()
+                if st != "succeeded":
+                    err = out.get("error") or "unknown grader async failure"
+                    raise RuntimeError(f"grader async failed for {alignment_id}: {err}")
+                result = out.get("result") or {}
                 logger.info(
-                    f"Alignment {alignment_id}: graded+synthesis {out.get('status')} -> {out.get('results_path')} (retry {attempts})"
+                    f"Alignment {alignment_id}: graded+synthesis {result.get('status')} -> {result.get('results_path')} (retry {attempts}, job_id={job_id})"
                 )
                 total += 1
                 pending_attempts.pop(alignment_id, None)
-            except requests.RequestException as e:
+            except (requests.RequestException, RuntimeError) as e:
                 logger.error(
                     f"Alignment {alignment_id}: retry {attempts} grader request failed: {e}"
                 )
