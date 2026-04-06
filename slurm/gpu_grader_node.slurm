@@ -37,6 +37,7 @@ PY=\"\${AUTO_LIT_PYTHON:-python3.11}\"
 \"\$PY\" -c \"import sys; print('PYTHON', sys.executable, sys.version)\"
 
 vllm serve \"${MODEL_DIR}\" \
+    --served-model-name qwen3 \
     --port \"${VLLM_PORT}\" \
     --max-model-len 131072 \
     --reasoning-parser qwen3 \
