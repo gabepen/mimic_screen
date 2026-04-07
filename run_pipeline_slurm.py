@@ -1,6 +1,10 @@
 #!/usr/bin/env python3
 """
-Launch the two-node Slurm pipeline: GPU LLM node first, then CPU download node.
+Submit Slurm jobs for the auto_lit_search pipeline (Docling + Grader + LLM GPUs, then CPU download).
+
+Typically invoked via ``literature_analysis_launcher.sh``, which sets paths and optional secrets
+in the environment; this script forwards publisher tokens into the CPU job when present.
+
 Usage: python run_pipeline_slurm.py --paper-ids <search_output.json> [options]
 """
 
@@ -10,17 +14,39 @@ import re
 import subprocess
 import sys
 import time
+from typing import Literal
+
+# Forwarded into the CPU/download job if set in the environment when launching.
+_PUBLISHER_CPU_ENV_KEYS: tuple[str, ...] = (
+    "ELSEVIER_API_KEY",
+    "ELS_API_KEY",
+    "ELSEVIER_INSTTOKEN",
+    "ELS_INSTTOKEN",
+    "TDM_API_TOKEN",
+    "WILEY_TDM_API_TOKEN",
+    "CROSSREF_MAILTO",
+)
+
+
+def _publisher_env_from_os() -> dict[str, str]:
+    out: dict[str, str] = {}
+    for k in _PUBLISHER_CPU_ENV_KEYS:
+        v = os.environ.get(k, "").strip()
+        if v:
+            out[k] = v
+    return out
 
 
 def _sbatch(
     script_path: str,
     env: dict,
     dependency: str | None = None,
+    dependency_kind: Literal["afterok", "after"] = "afterok",
     log_path: str | None = None,
 ) -> str:
     cmd = ["sbatch", "--parsable"]
     if dependency:
-        cmd.extend(["--dependency=afterok:" + dependency])
+        cmd.extend([f"--dependency={dependency_kind}:{dependency}"])
     if log_path:
         cmd.extend(["--output", log_path])
     export_pairs = [f"{k}={v}" for k, v in env.items() if v is not None]
@@ -38,17 +64,40 @@ def _scontrol_show_job(job_id: str) -> str:
     )
 
 
+def _node_from_scontrol_job(raw: str) -> str | None:
+    """
+    Extract the allocated hostname from `scontrol show job` output.
+
+    Slurm often prints several space-separated Key=Value tokens on one line,
+    e.g. ``NodeList=(null) SchedNodeList=phoenix-00``.  Taking ``split('=', 1)[1]``
+    for ``NodeList=`` would incorrectly return ``(null) SchedNodeList=phoenix-00``.
+    We take the first token after ``NodeList=``; if that is unset, use
+    ``SchedNodeList=``.
+    """
+    invalid = {"", "none", "(null)", "null", "n/a", "unknown"}
+
+    def _ok(name: str) -> bool:
+        return bool(name) and name.lower() not in invalid
+
+    for m in re.finditer(r"\bNodeList=(\S+)", raw):
+        node = m.group(1).strip()
+        if _ok(node):
+            return node
+    for m in re.finditer(r"\bSchedNodeList=(\S+)", raw):
+        node = m.group(1).strip()
+        if _ok(node):
+            return node
+    return None
+
+
 def _get_node_name(job_id: str, max_wait: int = 12 * 60 * 60) -> str | None:
-    invalid_nodes = {"", "none", "(null)", "null", "n/a", "unknown"}
     start = time.monotonic()
     while time.monotonic() - start < max_wait:
         try:
             raw = _scontrol_show_job(job_id)
-            for line in raw.splitlines():
-                if line.strip().startswith("NodeList="):
-                    node = line.split("=", 1)[1].strip()
-                    if node and node.lower() not in invalid_nodes:
-                        return node
+            node = _node_from_scontrol_job(raw)
+            if node:
+                return node
             st = subprocess.run(
                 ["squeue", "-j", job_id, "-h", "-o", "%T"],
                 capture_output=True,
@@ -390,11 +439,19 @@ def main() -> int:
     if args.idmap_csv:
         cpu_env["IDMAP_CSV"] = os.path.abspath(args.idmap_csv)
 
+    cpu_env.update(_publisher_env_from_os())
+
     if gpu_host and docling_host and grader_host:
         dep = f"{gpu_job_id}:{docling_job_id}:{grader_job_id}"
         cpu_log = os.path.join(logs_root, "auto_lit_cpu_%j.log")
-        cpu_job_id = _sbatch(cpu_script, cpu_env, dependency=dep, log_path=cpu_log)
-        print(f"Submitted CPU job (after GPU+Docling+Grader): {cpu_job_id}")
+        cpu_job_id = _sbatch(
+            cpu_script,
+            cpu_env,
+            dependency=dep,
+            dependency_kind="after",
+            log_path=cpu_log,
+        )
+        print(f"Submitted CPU job (after GPU+Docling+Grader start): {cpu_job_id}")
     else:
         print(
             "GPU and/or Docling and/or Grader node name not available. Submit the CPU job manually "
@@ -425,8 +482,11 @@ def main() -> int:
             export_str += f",INSTRUCTIONS_FILE={os.path.abspath(args.instructions_file)}"
         if args.idmap_csv:
             export_str += f",IDMAP_CSV={os.path.abspath(args.idmap_csv)}"
+        _extra = _publisher_env_from_os()
+        if _extra:
+            export_str += "," + ",".join(f"{k}={v}" for k, v in _extra.items())
         print(
-            f"  sbatch --dependency=afterok:{gpu_job_id}:{docling_job_id}:{grader_job_id} "
+            f"  sbatch --dependency=after:{gpu_job_id}:{docling_job_id}:{grader_job_id} "
             f"--export=ALL,{export_str} {cpu_script}"
         )
 
