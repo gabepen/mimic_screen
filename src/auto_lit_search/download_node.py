@@ -185,6 +185,52 @@ def _poll_grader_async(
         time.sleep(max(1, poll_interval_seconds))
 
 
+def _submit_docling_async(
+    session: requests.Session,
+    docling_url_base: str,
+    payload: Dict[str, Any],
+    submit_timeout: int,
+) -> str:
+    r = session.post(
+        f"{docling_url_base}/convert_alignment_async",
+        json=payload,
+        timeout=submit_timeout,
+    )
+    r.raise_for_status()
+    out = r.json()
+    job_id = str(out.get("job_id") or "").strip()
+    if not job_id:
+        raise RuntimeError("docling async submit returned empty job_id")
+    return job_id
+
+
+def _poll_docling_async(
+    session: requests.Session,
+    docling_url_base: str,
+    job_id: str,
+    alignment_id: str,
+    attempt_timeout: int,
+    poll_interval_seconds: int,
+) -> Dict[str, Any]:
+    started = time.monotonic()
+    while True:
+        if time.monotonic() - started > attempt_timeout:
+            raise requests.exceptions.ReadTimeout(
+                f"docling async status timeout for {alignment_id} (job_id={job_id}) "
+                f"after {attempt_timeout}s"
+            )
+        r = session.get(
+            f"{docling_url_base}/convert_alignment_status/{job_id}",
+            timeout=30,
+        )
+        r.raise_for_status()
+        status = r.json()
+        st = str(status.get("status") or "").strip().lower()
+        if st in {"succeeded", "failed"}:
+            return status
+        time.sleep(max(1, poll_interval_seconds))
+
+
 def run(
     paper_ids_path: str,
     data_root: str,
@@ -306,6 +352,15 @@ def run(
     grader_submit_timeout = int(os.environ.get("GRADER_SUBMIT_TIMEOUT_SECONDS", "30"))
     grader_poll_interval_seconds = int(
         os.environ.get("GRADER_POLL_INTERVAL_SECONDS", "5")
+    )
+    docling_attempt_timeout = int(
+        os.environ.get("DOCLING_ATTEMPT_TIMEOUT_SECONDS", str(request_timeout))
+    )
+    docling_submit_timeout = int(
+        os.environ.get("DOCLING_SUBMIT_TIMEOUT_SECONDS", "30")
+    )
+    docling_poll_interval_seconds = int(
+        os.environ.get("DOCLING_POLL_INTERVAL_SECONDS", "5")
     )
 
     def _outputs_done(alignment_id: str) -> bool:
@@ -444,20 +499,34 @@ def run(
                     "call_analysis": False,
                 }
                 try:
-                    r = session.post(
-                        f"{docling_url_base}/convert_alignment",
-                        json=docling_payload,
-                        timeout=request_timeout,
+                    docling_job_id = _submit_docling_async(
+                        session=session,
+                        docling_url_base=docling_url_base,
+                        payload=docling_payload,
+                        submit_timeout=docling_submit_timeout,
                     )
-                    r.raise_for_status()
-                    out = r.json()
+                    out = _poll_docling_async(
+                        session=session,
+                        docling_url_base=docling_url_base,
+                        job_id=docling_job_id,
+                        alignment_id=alignment_id,
+                        attempt_timeout=docling_attempt_timeout,
+                        poll_interval_seconds=docling_poll_interval_seconds,
+                    )
+                    st = str(out.get("status") or "").strip().lower()
+                    if st != "succeeded":
+                        err = out.get("error") or "unknown docling async failure"
+                        raise RuntimeError(
+                            f"docling async failed for {alignment_id}: {err}"
+                        )
+                    result = out.get("result") or {}
                     logger.info(
-                        f"Alignment {alignment_id}: docling_status={out.get('status')} "
-                        f"papers_dir={out.get('papers_dir')} (analysis deferred to GPU step)"
+                        f"Alignment {alignment_id}: docling_status={result.get('status')} "
+                        f"papers_dir={result.get('papers_dir')} (job_id={docling_job_id}, analysis deferred to GPU step)"
                     )
-                except requests.RequestException as e:
+                except (requests.RequestException, RuntimeError) as e:
                     logger.error(f"Alignment {alignment_id}: Docling request failed: {e}")
-                    resp = getattr(e, "response", None)
+                    resp = getattr(e, "response", None) if hasattr(e, "response") else None
                     if resp is not None:
                         try:
                             logger.error(
