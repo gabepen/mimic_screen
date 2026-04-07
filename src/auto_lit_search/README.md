@@ -93,3 +93,25 @@ Or if using conda:
 conda install -c bioconda mygene
 ```
 
+## Grader node (`grader_server`) and vLLM HTTP settings
+
+The grader calls `VLLM_BASE_URL` (OpenAI-compatible `/v1/chat/completions`). Tune timeouts when vLLM is busy (queue + generation can exceed a few minutes).
+
+| Variable | Default | Meaning |
+|----------|---------|---------|
+| `VLLM_BASE_URL` | (required) | Base URL of the vLLM server (e.g. `http://127.0.0.1:8000`). |
+| `VLLM_MODEL_NAME` | auto from `/v1/models` | Must match a served model id; wrong names cause 404s and empty replies. |
+| `VLLM_HTTP_CONNECT_TIMEOUT` | `30` | TCP connect timeout (seconds). |
+| `VLLM_HTTP_READ_TIMEOUT` | `300` | Per-attempt read timeout (seconds). Alias: `VLLM_GRADER_TIMEOUT`. For heavy runs try `900`–`1800`. |
+| `VLLM_GRADER_HTTP_RETRIES` | `3` | Attempts per LLM call on `ReadTimeout` / `ConnectionError` (exponential backoff between attempts). |
+| `VLLM_GRADER_RETRY_BACKOFF_SEC` | `45` | Base sleep (seconds) before retry; actual wait is `min(base * 2**attempt, cap)`. |
+| `VLLM_GRADER_RETRY_BACKOFF_CAP_SEC` | `180` | Max sleep between retries (seconds). |
+
+Example for a loaded GPU host:
+
+```bash
+export VLLM_HTTP_READ_TIMEOUT=1200
+export VLLM_GRADER_HTTP_RETRIES=4
+export VLLM_GRADER_RETRY_BACKOFF_SEC=60
+```
+
