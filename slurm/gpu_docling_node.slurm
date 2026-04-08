@@ -34,7 +34,6 @@ export DOCLING_API_PORT=\"${DOCLING_API_PORT}\"
 PY=\"\${AUTO_LIT_PYTHON:-python3}\"
 \"\$PY\" -m uvicorn auto_lit_search.docling_server:app \
   --host 0.0.0.0 --port \"${DOCLING_API_PORT}\" \
-  --workers 1 \
-  --limit-max-requests 25 --limit-max-requests-jitter 5
+  --workers 1
 "
 

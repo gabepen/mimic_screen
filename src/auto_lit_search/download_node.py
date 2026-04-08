@@ -145,44 +145,75 @@ def _submit_grader_async(
     payload: Dict[str, Any],
     submit_timeout: int,
 ) -> str:
-    r = session.post(
-        f"{grader_url_base}/grade_alignment_async",
-        json=payload,
-        timeout=submit_timeout,
-    )
-    r.raise_for_status()
-    out = r.json()
-    job_id = str(out.get("job_id") or "").strip()
-    if not job_id:
-        raise RuntimeError("grader async submit returned empty job_id")
-    return job_id
+    deadline = time.monotonic() + max(1, submit_timeout)
+    while True:
+        try:
+            r = session.post(
+                f"{grader_url_base}/grade_alignment_async",
+                json=payload,
+                timeout=30,
+            )
+            r.raise_for_status()
+            out = r.json()
+            job_id = str(out.get("job_id") or "").strip()
+            if not job_id:
+                raise RuntimeError("grader async submit returned empty job_id")
+            return job_id
+        except requests.exceptions.HTTPError as e:
+            resp = getattr(e, "response", None)
+            if resp is None or resp.status_code != 429:
+                raise
+            if time.monotonic() >= deadline:
+                raise
+            time.sleep(2)
 
 
-def _poll_grader_async(
+def _wait_service_capacity(
+    session: requests.Session,
+    base_url: str,
+    endpoint: str,
+    service_name: str,
+    timeout_seconds: int,
+    poll_interval_seconds: int,
+    warn_on_timeout: bool = True,
+) -> bool:
+    """Wait until remote async queue reports can_accept=true.
+
+    If the capacity endpoint is unavailable/malformed, fail open so older
+    server versions still work.
+    """
+    deadline = time.monotonic() + max(1, timeout_seconds)
+    while time.monotonic() < deadline:
+        try:
+            r = session.get(f"{base_url.rstrip('/')}/{endpoint}", timeout=10)
+            r.raise_for_status()
+            data = r.json()
+            can_accept = bool(data.get("can_accept", False))
+            if can_accept:
+                return True
+        except Exception:
+            return True
+        time.sleep(max(1, poll_interval_seconds))
+    if warn_on_timeout:
+        logger.warning(
+            "{} capacity wait timed out after {}s; attempting submit anyway",
+            service_name,
+            timeout_seconds,
+        )
+    return False
+
+
+def _grader_status_once(
     session: requests.Session,
     grader_url_base: str,
     job_id: str,
-    alignment_id: str,
-    attempt_timeout: int,
-    poll_interval_seconds: int,
 ) -> Dict[str, Any]:
-    started = time.monotonic()
-    while True:
-        if time.monotonic() - started > attempt_timeout:
-            raise requests.exceptions.ReadTimeout(
-                f"grader async status timeout for {alignment_id} (job_id={job_id}) "
-                f"after {attempt_timeout}s"
-            )
-        r = session.get(
-            f"{grader_url_base}/grade_alignment_status/{job_id}",
-            timeout=30,
-        )
-        r.raise_for_status()
-        status = r.json()
-        st = str(status.get("status") or "").strip().lower()
-        if st in {"succeeded", "failed"}:
-            return status
-        time.sleep(max(1, poll_interval_seconds))
+    r = session.get(
+        f"{grader_url_base}/grade_alignment_status/{job_id}",
+        timeout=30,
+    )
+    r.raise_for_status()
+    return r.json()
 
 
 def _submit_docling_async(
@@ -191,44 +222,40 @@ def _submit_docling_async(
     payload: Dict[str, Any],
     submit_timeout: int,
 ) -> str:
-    r = session.post(
-        f"{docling_url_base}/convert_alignment_async",
-        json=payload,
-        timeout=submit_timeout,
-    )
-    r.raise_for_status()
-    out = r.json()
-    job_id = str(out.get("job_id") or "").strip()
-    if not job_id:
-        raise RuntimeError("docling async submit returned empty job_id")
-    return job_id
+    deadline = time.monotonic() + max(1, submit_timeout)
+    while True:
+        try:
+            r = session.post(
+                f"{docling_url_base}/convert_alignment_async",
+                json=payload,
+                timeout=30,
+            )
+            r.raise_for_status()
+            out = r.json()
+            job_id = str(out.get("job_id") or "").strip()
+            if not job_id:
+                raise RuntimeError("docling async submit returned empty job_id")
+            return job_id
+        except requests.exceptions.HTTPError as e:
+            resp = getattr(e, "response", None)
+            if resp is None or resp.status_code != 429:
+                raise
+            if time.monotonic() >= deadline:
+                raise
+            time.sleep(2)
 
 
-def _poll_docling_async(
+def _docling_status_once(
     session: requests.Session,
     docling_url_base: str,
     job_id: str,
-    alignment_id: str,
-    attempt_timeout: int,
-    poll_interval_seconds: int,
 ) -> Dict[str, Any]:
-    started = time.monotonic()
-    while True:
-        if time.monotonic() - started > attempt_timeout:
-            raise requests.exceptions.ReadTimeout(
-                f"docling async status timeout for {alignment_id} (job_id={job_id}) "
-                f"after {attempt_timeout}s"
-            )
-        r = session.get(
-            f"{docling_url_base}/convert_alignment_status/{job_id}",
-            timeout=30,
-        )
-        r.raise_for_status()
-        status = r.json()
-        st = str(status.get("status") or "").strip().lower()
-        if st in {"succeeded", "failed"}:
-            return status
-        time.sleep(max(1, poll_interval_seconds))
+    r = session.get(
+        f"{docling_url_base}/convert_alignment_status/{job_id}",
+        timeout=30,
+    )
+    r.raise_for_status()
+    return r.json()
 
 
 def run(
@@ -250,13 +277,31 @@ def run(
     host_rubric_path: str = "",
     microbe_rubric_path: str = "",
 ) -> None:
+    STATE_DOWNLOADING = "DOWNLOADING"
+    STATE_DOCLING_PENDING = "DOCLING_PENDING"
+    STATE_DOCLING_INFLIGHT = "DOCLING_INFLIGHT"
+    STATE_GRADER_READY = "GRADER_READY"
+    STATE_GRADER_INFLIGHT = "GRADER_INFLIGHT"
+    STATE_DONE = "DONE"
+    STATE_FAILED = "FAILED"
+
+    service_health_wait_seconds = int(
+        os.environ.get("SERVICE_HEALTH_WAIT_SECONDS", "900")
+    )
+    service_health_wait_seconds = max(60, service_health_wait_seconds)
+    logger.info(
+        "download_node: SERVICE_HEALTH_WAIT_SECONDS={} (LLM / Docling / Grader /healthz)",
+        service_health_wait_seconds,
+    )
     gpu_url_base = f"http://{gpu_host}:{gpu_port}"
     logger.info(
         "download_node: probing LLM GPU health at {}/healthz",
         gpu_url_base.rstrip("/"),
     )
     sys.stdout.flush()
-    if not _wait_health("LLM GPU", gpu_url_base, timeout=300):
+    if not _wait_health(
+        "LLM GPU", gpu_url_base, timeout=service_health_wait_seconds
+    ):
         raise RuntimeError(f"GPU node not healthy at {gpu_url_base}")
 
     docling_url_base = ""
@@ -267,7 +312,9 @@ def run(
             docling_url_base.rstrip("/"),
         )
         sys.stdout.flush()
-        if not _wait_health("Docling", docling_url_base, timeout=300):
+        if not _wait_health(
+            "Docling", docling_url_base, timeout=service_health_wait_seconds
+        ):
             raise RuntimeError(f"Docling node not healthy at {docling_url_base}")
     if not grader_host:
         raise RuntimeError("GRADER_HOST is required for two-stage analysis flow")
@@ -280,7 +327,9 @@ def run(
         "download_node: probing Grader health at {}/healthz",
         grader_url_base.rstrip("/"),
     )
-    if not _wait_health("Grader", grader_url_base, timeout=300):
+    if not _wait_health(
+        "Grader", grader_url_base, timeout=service_health_wait_seconds
+    ):
         raise RuntimeError(f"Grader node not healthy at {grader_url_base}")
 
     instructions_text = instructions
@@ -334,40 +383,237 @@ def run(
     os.makedirs(papers_base, exist_ok=True)
     os.makedirs(logs_base, exist_ok=True)
     os.makedirs(output_root, exist_ok=True)
+    scheduler_state_dir = os.path.join(logs_base, "scheduler_state")
+    os.makedirs(scheduler_state_dir, exist_ok=True)
 
     session = requests.Session()
     pmcid_cache: Dict[str, str | None] = {}
-    total = 0
-    grader_failures = 0
-    pending_grader: Dict[str, Dict[str, Any]] = {}
-    pending_attempts: Dict[str, int] = {}
-    max_grader_attempts = int(os.environ.get("GRADER_MAX_ATTEMPTS", "3"))
-    # Grader requests can span many files and multiple LLM calls; default to the
-    # top-level request timeout unless explicitly overridden.
-    grader_attempt_timeout = int(
-        os.environ.get("GRADER_ATTEMPT_TIMEOUT_SECONDS", str(request_timeout))
+    total_done = 0
+    failed_count = 0
+    docling_inflight_cap = max(1, int(os.environ.get("DOCLING_INFLIGHT_CAP", "1")))
+    grader_inflight_cap = max(1, int(os.environ.get("GRADER_INFLIGHT_CAP", "1")))
+    scheduler_tick_seconds = max(
+        1, int(os.environ.get("SCHEDULER_TICK_SECONDS", "5"))
     )
-    grader_attempt_timeout = max(30, grader_attempt_timeout)
-    grader_retry_sleep_seconds = int(os.environ.get("GRADER_RETRY_SLEEP_SECONDS", "15"))
-    grader_submit_timeout = int(os.environ.get("GRADER_SUBMIT_TIMEOUT_SECONDS", "30"))
-    grader_poll_interval_seconds = int(
-        os.environ.get("GRADER_POLL_INTERVAL_SECONDS", "5")
+    stage_watchdog_seconds = max(
+        300, int(os.environ.get("STAGE_WATCHDOG_SECONDS", str(request_timeout)))
     )
-    docling_attempt_timeout = int(
-        os.environ.get("DOCLING_ATTEMPT_TIMEOUT_SECONDS", str(request_timeout))
-    )
-    docling_submit_timeout = int(
-        os.environ.get("DOCLING_SUBMIT_TIMEOUT_SECONDS", "30")
-    )
-    docling_poll_interval_seconds = int(
-        os.environ.get("DOCLING_POLL_INTERVAL_SECONDS", "5")
-    )
+
+    alignment_states: Dict[str, Dict[str, Any]] = {}
+    docling_inflight: Dict[str, Dict[str, Any]] = {}
+    grader_inflight: Dict[str, Dict[str, Any]] = {}
 
     def _outputs_done(alignment_id: str) -> bool:
         # Grader writes *_graded.json and synthesis (GPU node) writes *_results.json.
         graded_path = os.path.join(output_root, f"{alignment_id}_graded.json")
         results_path = os.path.join(output_root, f"{alignment_id}_results.json")
         return os.path.isfile(graded_path) and os.path.isfile(results_path)
+
+    def _state_path(alignment_id: str) -> str:
+        return os.path.join(scheduler_state_dir, f"{alignment_id}.json")
+
+    def _write_state(alignment_id: str) -> None:
+        st = alignment_states.get(alignment_id)
+        if not st:
+            return
+        try:
+            with open(_state_path(alignment_id), "w", encoding="utf-8") as f:
+                json.dump(st, f, indent=2)
+        except Exception as e:
+            logger.warning("Could not write scheduler state for {}: {}", alignment_id, e)
+
+    def _required_docling_txt_done(st: Dict[str, Any]) -> bool:
+        req = st.get("docling_required_basenames") or []
+        if not req:
+            return True
+        papers_dir = str(st.get("papers_dir") or "")
+        for base in req:
+            txt_path = os.path.join(papers_dir, f"{base}.txt")
+            if not (os.path.isfile(txt_path) and os.path.getsize(txt_path) > 0):
+                return False
+        return True
+
+    def _is_grader_ready(st: Dict[str, Any]) -> bool:
+        if _outputs_done(st["alignment_id"]):
+            return False
+        papers_dir = str(st.get("papers_dir") or "")
+        has_text = any(
+            fname.endswith(".txt")
+            for fname in os.listdir(papers_dir)
+            if os.path.isfile(os.path.join(papers_dir, fname))
+        )
+        return has_text and _required_docling_txt_done(st)
+
+    def _bootstrap_state(alignment_id: str, defaults: Dict[str, Any]) -> Dict[str, Any]:
+        state = dict(defaults)
+        path = _state_path(alignment_id)
+        if os.path.isfile(path):
+            try:
+                with open(path, "r", encoding="utf-8") as f:
+                    prev = json.load(f)
+                if isinstance(prev, dict):
+                    state.update(prev)
+            except Exception:
+                pass
+        if _outputs_done(alignment_id):
+            state["state"] = STATE_DONE
+        elif _is_grader_ready(state):
+            state["state"] = STATE_GRADER_READY
+        elif (state.get("docling_required_basenames") or []) and not _required_docling_txt_done(state):
+            state["state"] = STATE_DOCLING_PENDING
+        return state
+
+    def _poll_inflight() -> None:
+        nonlocal total_done, failed_count
+        for aid, meta in list(docling_inflight.items()):
+            st = alignment_states.get(aid)
+            if not st:
+                docling_inflight.pop(aid, None)
+                continue
+            if time.monotonic() - float(meta.get("started_monotonic", 0)) > stage_watchdog_seconds:
+                st["state"] = STATE_FAILED
+                st["last_error"] = "docling watchdog timeout"
+                failed_count += 1
+                docling_inflight.pop(aid, None)
+                _write_state(aid)
+                continue
+            try:
+                status = _docling_status_once(session, docling_url_base, meta["job_id"])
+            except Exception:
+                continue
+            s = str(status.get("status") or "").strip().lower()
+            if s not in {"succeeded", "failed"}:
+                continue
+            docling_inflight.pop(aid, None)
+            if s == "failed":
+                st["state"] = STATE_FAILED
+                st["last_error"] = str(status.get("error") or "docling failed")
+                failed_count += 1
+            elif _outputs_done(aid):
+                st["state"] = STATE_DONE
+                total_done += 1
+            elif _is_grader_ready(st):
+                st["state"] = STATE_GRADER_READY
+            else:
+                st["state"] = STATE_FAILED
+                st["last_error"] = "docling succeeded but package not grader-ready"
+                failed_count += 1
+            _write_state(aid)
+
+        for aid, meta in list(grader_inflight.items()):
+            st = alignment_states.get(aid)
+            if not st:
+                grader_inflight.pop(aid, None)
+                continue
+            if time.monotonic() - float(meta.get("started_monotonic", 0)) > stage_watchdog_seconds:
+                st["state"] = STATE_FAILED
+                st["last_error"] = "grader watchdog timeout"
+                failed_count += 1
+                grader_inflight.pop(aid, None)
+                _write_state(aid)
+                continue
+            try:
+                status = _grader_status_once(session, grader_url_base, meta["job_id"])
+            except Exception:
+                continue
+            s = str(status.get("status") or "").strip().lower()
+            if s not in {"succeeded", "failed"}:
+                continue
+            grader_inflight.pop(aid, None)
+            if s == "failed":
+                st["state"] = STATE_FAILED
+                st["last_error"] = str(status.get("error") or "grader failed")
+                failed_count += 1
+            elif _outputs_done(aid):
+                st["state"] = STATE_DONE
+                total_done += 1
+            else:
+                st["state"] = STATE_FAILED
+                st["last_error"] = "grader succeeded but results file missing"
+                failed_count += 1
+            _write_state(aid)
+
+    def _dispatch_docling() -> None:
+        if not docling_url_base:
+            return
+        if len(docling_inflight) >= docling_inflight_cap:
+            return
+        if not _wait_service_capacity(
+            session=session,
+            base_url=docling_url_base,
+            endpoint="docling_capacity",
+            service_name="Docling",
+            timeout_seconds=1,
+            poll_interval_seconds=1,
+            warn_on_timeout=False,
+        ):
+            return
+        for aid, st in alignment_states.items():
+            if st.get("state") != STATE_DOCLING_PENDING:
+                continue
+            try:
+                job_id = _submit_docling_async(
+                    session=session,
+                    docling_url_base=docling_url_base,
+                    payload=st["docling_payload"],
+                    submit_timeout=30,
+                )
+                st["state"] = STATE_DOCLING_INFLIGHT
+                st["docling_job_id"] = job_id
+                st["docling_submitted_at"] = time.time()
+                docling_inflight[aid] = {
+                    "job_id": job_id,
+                    "started_monotonic": time.monotonic(),
+                }
+                _write_state(aid)
+            except Exception as e:
+                st["state"] = STATE_FAILED
+                st["last_error"] = f"docling submit failed: {e}"
+                _write_state(aid)
+            break
+
+    def _dispatch_grader() -> None:
+        if len(grader_inflight) >= grader_inflight_cap:
+            return
+        if not _wait_service_capacity(
+            session=session,
+            base_url=grader_url_base,
+            endpoint="grader_capacity",
+            service_name="Grader",
+            timeout_seconds=1,
+            poll_interval_seconds=1,
+            warn_on_timeout=False,
+        ):
+            return
+        for aid, st in alignment_states.items():
+            if st.get("state") != STATE_GRADER_READY:
+                continue
+            try:
+                job_id = _submit_grader_async(
+                    session=session,
+                    grader_url_base=grader_url_base,
+                    payload=st["grader_payload"],
+                    submit_timeout=30,
+                )
+                st["state"] = STATE_GRADER_INFLIGHT
+                st["grader_job_id"] = job_id
+                st["grader_submitted_at"] = time.time()
+                grader_inflight[aid] = {
+                    "job_id": job_id,
+                    "started_monotonic": time.monotonic(),
+                }
+                _write_state(aid)
+            except Exception as e:
+                st["state"] = STATE_FAILED
+                st["last_error"] = f"grader submit failed: {e}"
+                _write_state(aid)
+            break
+
+    def _tick_scheduler() -> None:
+        _poll_inflight()
+        _dispatch_docling()
+        _dispatch_grader()
+
     for query_id, alignments in data.items():
         if not isinstance(alignments, list):
             continue
@@ -378,10 +624,8 @@ def run(
             if not paper_ids_src:
                 logger.warning(f"Alignment {alignment_id}: no paper IDs")
                 continue
-
             papers_dir = os.path.join(papers_base, alignment_id)
             os.makedirs(papers_dir, exist_ok=True)
-
             logger.info(f"Downloading {len(paper_ids_src)} papers for {alignment_id}")
             recs = download_papers_to_dir(
                 paper_ids_src,
@@ -397,50 +641,22 @@ def run(
                 max_workers=collect_max_workers,
                 disable_semantic_scholar=collect_disable_s2,
             )
-            has_text = any(r.text_path for r in recs)
             has_pdf = any(r.pdf_path for r in recs)
             n_docling_required = sum(
                 1 for r in recs if ((r.details or {}).get("pdf_docling_required"))
             )
-            n_text = sum(1 for r in recs if r.text_path)
-            n_pdf = sum(1 for r in recs if r.pdf_path)
-            n_ok = sum(1 for r in recs if r.status == "ok")
-            n_failed = sum(1 for r in recs if r.status == "failed")
-            source_names = (
-                "europe_pmc",
-                "unpaywall",
-                "arxiv",
-                "semantic_scholar",
+            docling_required_basenames = sorted(
+                {
+                    os.path.splitext(os.path.basename(str(r.pdf_path)))[0]
+                    for r in recs
+                    if ((r.details or {}).get("pdf_docling_required")) and r.pdf_path
+                }
             )
-            source_attempt_counts: Dict[str, int] = {k: 0 for k in source_names}
-            source_success_counts: Dict[str, int] = {k: 0 for k in source_names}
-            for rec in recs:
-                attempts = ((rec.details or {}).get("source_attempts") or {})
-                for sname in source_names:
-                    sat = attempts.get(sname) or {}
-                    if sat.get("attempted"):
-                        source_attempt_counts[sname] += 1
-                    if sat.get("success"):
-                        source_success_counts[sname] += 1
-            logger.info(
-                f"Alignment {alignment_id}: downloaded_papers={len(recs)} "
-                f"text_files={n_text} pdf_files={n_pdf} "
-                f"docling_required={n_docling_required} ok={n_ok} failed={n_failed}"
-            )
-            logger.info(
-                f"Alignment {alignment_id}: source_attempt_counts={source_attempt_counts} "
-                f"source_success_counts={source_success_counts}"
-            )
-
-            gene_context: Dict[str, Any] | None = None
-            # Prefer inline meta if present, otherwise fall back to ID map env.
             query_meta = al.get("query_meta")
             target_meta = al.get("target_meta")
+            gene_context: Dict[str, Any] | None = None
             if isinstance(query_meta, dict) or isinstance(target_meta, dict):
-                gene_context = {
-                    "query": query_meta or {},
-                    "target": target_meta or {},
-                }
+                gene_context = {"query": query_meta or {}, "target": target_meta or {}}
             elif idmap:
                 key = f"{query_id}|{target}"
                 meta = idmap.get(key)
@@ -450,111 +666,52 @@ def run(
                         "target": meta.get("target_meta") or {},
                     }
 
-            # Convert only PDFs selected over XML through Docling.
-            if docling_url_base and n_docling_required > 0 and has_pdf:
-                pdf_dir = os.path.join(papers_dir, "pdf")
-                eval_manifest_path = os.path.join(
-                    papers_dir, "docling_eval_manifest.jsonl"
-                )
-                try:
-                    with open(eval_manifest_path, "w", encoding="utf-8") as mf:
-                        for rrec in recs:
-                            mf.write(
-                                json.dumps(
-                                    {
-                                        "paper_id": rrec.paper_id,
-                                        "pdf_path": rrec.pdf_path,
-                                        "details": rrec.details or {},
-                                    }
-                                )
-                                + "\n"
+            eval_manifest_path = os.path.join(papers_dir, "docling_eval_manifest.jsonl")
+            try:
+                with open(eval_manifest_path, "w", encoding="utf-8") as mf:
+                    for rrec in recs:
+                        mf.write(
+                            json.dumps(
+                                {
+                                    "paper_id": rrec.paper_id,
+                                    "pdf_path": rrec.pdf_path,
+                                    "details": rrec.details or {},
+                                }
                             )
-                except Exception as e:
-                    logger.warning(
-                        f"Alignment {alignment_id}: could not write docling manifest: {e}"
-                    )
-                    eval_manifest_path = ""
-
-                docling_payload: Dict[str, Any] = {
-                    "alignment_id": alignment_id,
-                    "pdf_dir": pdf_dir,
-                    "papers_dir": papers_dir,
-                    "query": query_id,
-                    "target_id": target,
-                    "constraints": {
-                        "max_tokens": max_tokens,
-                        "temperature": temperature,
-                    },
-                    "instructions": instructions_text
-                    or (
-                        "Analyze the paper excerpt for relevance to the genes in this alignment. "
-                        "First give a brief justification (2-4 sentences). "
-                        "Then output a single line: relevance_score=<float between 0 and 1>."
-                    ),
-                    "output_root": output_root,
-                    "gene_context": gene_context,
-                    "analysis_host": gpu_host,
-                    "analysis_port": gpu_port,
-                    "evaluation_manifest_path": eval_manifest_path or None,
-                    "call_analysis": False,
-                }
-                try:
-                    docling_job_id = _submit_docling_async(
-                        session=session,
-                        docling_url_base=docling_url_base,
-                        payload=docling_payload,
-                        submit_timeout=docling_submit_timeout,
-                    )
-                    out = _poll_docling_async(
-                        session=session,
-                        docling_url_base=docling_url_base,
-                        job_id=docling_job_id,
-                        alignment_id=alignment_id,
-                        attempt_timeout=docling_attempt_timeout,
-                        poll_interval_seconds=docling_poll_interval_seconds,
-                    )
-                    st = str(out.get("status") or "").strip().lower()
-                    if st != "succeeded":
-                        err = out.get("error") or "unknown docling async failure"
-                        raise RuntimeError(
-                            f"docling async failed for {alignment_id}: {err}"
+                            + "\n"
                         )
-                    result = out.get("result") or {}
-                    logger.info(
-                        f"Alignment {alignment_id}: docling_status={result.get('status')} "
-                        f"papers_dir={result.get('papers_dir')} (job_id={docling_job_id}, analysis deferred to GPU step)"
-                    )
-                except (requests.RequestException, RuntimeError) as e:
-                    logger.error(f"Alignment {alignment_id}: Docling request failed: {e}")
-                    resp = getattr(e, "response", None) if hasattr(e, "response") else None
-                    if resp is not None:
-                        try:
-                            logger.error(
-                                f"Alignment {alignment_id}: Docling response: {resp.text[:800]}"
-                            )
-                        except Exception:
-                            pass
-
-            if not any(
-                fname.endswith(".txt")
-                for fname in os.listdir(papers_dir)
-                if os.path.isfile(os.path.join(papers_dir, fname))
-            ):
+            except Exception as e:
                 logger.warning(
-                    f"Alignment {alignment_id}: no text files available after collection/conversion; skipping GPU"
+                    f"Alignment {alignment_id}: could not write docling manifest: {e}"
                 )
-                continue
+                eval_manifest_path = ""
 
-            # Final handoff: CPU -> grader -> synthesis GPU.
-            payload: Dict[str, Any] = {
+            docling_payload: Dict[str, Any] = {
+                "alignment_id": alignment_id,
+                "pdf_dir": os.path.join(papers_dir, "pdf"),
+                "papers_dir": papers_dir,
+                "query": query_id,
+                "target_id": target,
+                "constraints": {"max_tokens": max_tokens, "temperature": temperature},
+                "instructions": instructions_text
+                or (
+                    "Analyze the paper excerpt for relevance to the genes in this alignment. "
+                    "First give a brief justification (2-4 sentences). "
+                    "Then output a single line: relevance_score=<float between 0 and 1>."
+                ),
+                "output_root": output_root,
+                "gene_context": gene_context,
+                "analysis_host": gpu_host,
+                "analysis_port": gpu_port,
+                "evaluation_manifest_path": eval_manifest_path or None,
+                "call_analysis": False,
+            }
+            grader_payload: Dict[str, Any] = {
                 "alignment_id": alignment_id,
                 "papers_dir": papers_dir,
                 "query": query_id,
                 "target_id": target,
-                "constraints": {
-                    "max_tokens": max_tokens,
-                    "temperature": temperature,
-                },
+                "constraints": {"max_tokens": max_tokens, "temperature": temperature},
                 "instructions": instructions_text
                 or (
                     "Analyze the paper excerpt for relevance to the genes in this alignment. "
@@ -568,113 +725,41 @@ def run(
                 "synthesis_port": gpu_port,
             }
             if gene_context is not None:
-                payload["gene_context"] = gene_context
+                grader_payload["gene_context"] = gene_context
 
-            # If we already have both graded + synthesis outputs, skip calling the grader again.
-            if _outputs_done(alignment_id):
-                logger.info(
-                    f"Alignment {alignment_id}: outputs already exist; skipping grader call."
-                )
-                total += 1
-                continue
+            needs_docling = bool(docling_url_base and n_docling_required > 0 and has_pdf)
+            default_state = STATE_DOCLING_PENDING if needs_docling else STATE_GRADER_READY
+            state_obj = _bootstrap_state(
+                alignment_id,
+                {
+                    "alignment_id": alignment_id,
+                    "state": default_state,
+                    "papers_dir": papers_dir,
+                    "docling_required_basenames": docling_required_basenames,
+                    "docling_payload": docling_payload,
+                    "grader_payload": grader_payload,
+                    "updated_at": time.time(),
+                },
+            )
+            alignment_states[alignment_id] = state_obj
+            _write_state(alignment_id)
+            _tick_scheduler()
 
-            try:
-                job_id = _submit_grader_async(
-                    session=session,
-                    grader_url_base=grader_url_base,
-                    payload=payload,
-                    submit_timeout=grader_submit_timeout,
-                )
-                out = _poll_grader_async(
-                    session=session,
-                    grader_url_base=grader_url_base,
-                    job_id=job_id,
-                    alignment_id=alignment_id,
-                    attempt_timeout=grader_attempt_timeout,
-                    poll_interval_seconds=grader_poll_interval_seconds,
-                )
-                st = str(out.get("status") or "").strip().lower()
-                if st != "succeeded":
-                    err = out.get("error") or "unknown grader async failure"
-                    raise RuntimeError(f"grader async failed for {alignment_id}: {err}")
-                result = out.get("result") or {}
-                logger.info(
-                    f"Alignment {alignment_id}: graded+synthesis {result.get('status')} -> {result.get('results_path')} (job_id={job_id})"
-                )
-                total += 1
-            except (requests.RequestException, RuntimeError) as e:
-                logger.error(f"Alignment {alignment_id}: grader request failed: {e}")
-                grader_failures += 1
-                # Queue for retry; CPU should keep processing other alignments.
-                prev = pending_attempts.get(alignment_id, 0)
-                if prev < max_grader_attempts:
-                    pending_grader[alignment_id] = payload
-                    pending_attempts[alignment_id] = prev + 1
-                continue
-
-    # Retry any pending alignments while CPU has finished collecting.
-    if pending_grader:
-        logger.info(
-            f"Retrying {len(pending_grader)} pending alignments (max_attempts={max_grader_attempts}, attempt_timeout={grader_attempt_timeout}s)..."
-        )
-    for _ in range(max_grader_attempts):
-        if not pending_grader:
+    while True:
+        _tick_scheduler()
+        terminal = {STATE_DONE, STATE_FAILED}
+        non_terminal = [
+            st for st in alignment_states.values() if st.get("state") not in terminal
+        ]
+        if not non_terminal and not docling_inflight and not grader_inflight:
             break
-        still_pending: Dict[str, Dict[str, Any]] = {}
-        for alignment_id, pending_payload in pending_grader.items():
-            if _outputs_done(alignment_id):
-                logger.info(
-                    f"Alignment {alignment_id}: outputs appeared after previous attempt; marking done."
-                )
-                total += 1
-                pending_attempts.pop(alignment_id, None)
-                continue
-            attempts = pending_attempts.get(alignment_id, 1)
-            if attempts > max_grader_attempts:
-                logger.error(
-                    f"Alignment {alignment_id}: exceeded GRADER_MAX_ATTEMPTS ({max_grader_attempts}); giving up for now."
-                )
-                pending_attempts.pop(alignment_id, None)
-                continue
-            try:
-                job_id = _submit_grader_async(
-                    session=session,
-                    grader_url_base=grader_url_base,
-                    payload=pending_payload,
-                    submit_timeout=grader_submit_timeout,
-                )
-                out = _poll_grader_async(
-                    session=session,
-                    grader_url_base=grader_url_base,
-                    job_id=job_id,
-                    alignment_id=alignment_id,
-                    attempt_timeout=grader_attempt_timeout,
-                    poll_interval_seconds=grader_poll_interval_seconds,
-                )
-                st = str(out.get("status") or "").strip().lower()
-                if st != "succeeded":
-                    err = out.get("error") or "unknown grader async failure"
-                    raise RuntimeError(f"grader async failed for {alignment_id}: {err}")
-                result = out.get("result") or {}
-                logger.info(
-                    f"Alignment {alignment_id}: graded+synthesis {result.get('status')} -> {result.get('results_path')} (retry {attempts}, job_id={job_id})"
-                )
-                total += 1
-                pending_attempts.pop(alignment_id, None)
-            except (requests.RequestException, RuntimeError) as e:
-                logger.error(
-                    f"Alignment {alignment_id}: retry {attempts} grader request failed: {e}"
-                )
-                pending_attempts[alignment_id] = attempts + 1
-                still_pending[alignment_id] = pending_payload
-        pending_grader = still_pending
-        if pending_grader:
-            time.sleep(grader_retry_sleep_seconds)
+        time.sleep(scheduler_tick_seconds)
 
     logger.info(
-        "Submitted {} alignments to GPU node (grader failures: {}).".format(
-            total, grader_failures
-        )
+        "Scheduler complete: done={} failed={} total={}",
+        total_done,
+        failed_count,
+        len(alignment_states),
     )
 
 
