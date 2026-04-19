@@ -27,7 +27,7 @@ singularity exec --nv \
     -B "${OUTPUT_ROOT}:${OUTPUT_ROOT}" \
     -B "${REPO_ROOT}:${REPO_ROOT}" \
     "${GRADER_IMAGE}" \
-    bash -lc "
+    bash -c "
 set -euo pipefail
 
 export PYTHONPATH=\"${REPO_ROOT}/src:\${PYTHONPATH:-}\"

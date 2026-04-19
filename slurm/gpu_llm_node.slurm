@@ -27,7 +27,7 @@ singularity exec --nv \
     -B "${OUTPUT_ROOT}:${OUTPUT_ROOT}" \
     -B "${REPO_ROOT}:${REPO_ROOT}" \
     "${GPU_IMAGE}" \
-    bash -lc "
+    bash -c "
 set -euo pipefail
 
 # Optional AUTO_LIT_PYTHON if probe_container_python.slurm shows a non-default binary.
