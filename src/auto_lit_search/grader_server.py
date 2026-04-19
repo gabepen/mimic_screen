@@ -187,6 +187,11 @@ def _post_chat_completion(
     root_url: str,
 ) -> requests.Response:
     r = requests.post(url, json=payload, timeout=timeout)
+    if r.status_code == 400 and "response_format" in payload:
+        # Some vLLM/OpenAI-compatible servers reject response_format. Retry once.
+        fallback_payload = dict(payload)
+        fallback_payload.pop("response_format", None)
+        r = requests.post(url, json=fallback_payload, timeout=timeout)
     configured = (os.environ.get("VLLM_MODEL_NAME") or "").strip()
     if r.status_code == 404 and configured:
         model_id = str(payload.get("model") or "")
@@ -217,6 +222,7 @@ def _call_llm(
         "messages": [{"role": "user", "content": user_content}],
         "max_tokens": max_tokens,
         "temperature": temperature,
+        "response_format": {"type": "json_object"},
     }
     timeout = _grader_http_timeout_tuple()
     max_attempts = _env_positive_int("VLLM_GRADER_HTTP_RETRIES", 3)
@@ -337,6 +343,28 @@ def _safe_float(v: Any, default: float = 0.0) -> float:
     return max(0.0, min(1.0, x))
 
 
+def _compute_relevance_grade(dim_scores: Dict[str, float]) -> float:
+    """
+    Compute aggregate relevance from per-axis scores.
+
+    Host rubric Axis 3 (`disease_population_relevance`) is bonus-only:
+    it can increase the aggregate when present, but a low/absent value
+    must not reduce the baseline formed by other axes.
+    """
+    if not dim_scores:
+        return 0.0
+    axis3_key = "disease_population_relevance"
+    if axis3_key in dim_scores and len(dim_scores) > 1:
+        base_keys = [k for k in dim_scores.keys() if k != axis3_key]
+        base = sum(float(dim_scores[k]) for k in base_keys) / len(base_keys)
+        # Keep Axis 3 on the same nominal weight scale as one axis in the legacy mean.
+        bonus = float(dim_scores[axis3_key]) / len(dim_scores)
+        return _safe_float(base + bonus, default=0.0)
+    return _safe_float(
+        sum(float(v) for v in dim_scores.values()) / len(dim_scores), default=0.0
+    )
+
+
 def _strip_markdown_json_fence(text: str) -> str:
     t = text.strip()
     if not t.startswith("```"):
@@ -350,14 +378,73 @@ def _strip_markdown_json_fence(text: str) -> str:
     return "\n".join(body).strip()
 
 
+def _build_grade_repair_prompt(
+    bad_output: str,
+    dim_names: str,
+) -> str:
+    excerpt = _strip_markdown_json_fence(bad_output)[:4000]
+    return (
+        "Your previous response was non-empty but not valid for the required schema.\n"
+        "Do NOT re-grade the paper and do NOT add new evidence.\n"
+        "Only reformat/recover the previous response into strict JSON.\n\n"
+        "Return JSON only with keys:\n"
+        "- rubric_dimension_scores (object: axis id -> number 0..1)\n"
+        "- rubric_axis_rationales (object: same axis ids -> non-empty string)\n"
+        "- rationale (optional string)\n\n"
+        f"Axis ids must be exactly: {dim_names}\n\n"
+        "Invalid output to repair:\n"
+        f"{excerpt}\n"
+    )
+
+
+def _extract_first_json_object(raw: str) -> Optional[str]:
+    """Extract the first balanced JSON object from mixed model text."""
+    s = raw.strip()
+    if not s:
+        return None
+    start = s.find("{")
+    if start < 0:
+        return None
+    depth = 0
+    in_string = False
+    escaped = False
+    for i in range(start, len(s)):
+        ch = s[i]
+        if in_string:
+            if escaped:
+                escaped = False
+            elif ch == "\\":
+                escaped = True
+            elif ch == '"':
+                in_string = False
+            continue
+        if ch == '"':
+            in_string = True
+            continue
+        if ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0:
+                return s[start : i + 1]
+    return None
+
+
 def _try_parse_grade_json(raw: str, dims: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
     s = raw.strip()
     if not s:
         return None
+    candidate = s
     try:
-        obj = json.loads(s)
+        obj = json.loads(candidate)
     except Exception:
-        return None
+        wrapped = _extract_first_json_object(candidate)
+        if not wrapped:
+            return None
+        try:
+            obj = json.loads(wrapped)
+        except Exception:
+            return None
     if not isinstance(obj, dict):
         return None
     dsc = obj.get("rubric_dimension_scores")
@@ -379,7 +466,7 @@ def _try_parse_grade_json(raw: str, dims: List[Dict[str, Any]]) -> Optional[Dict
         if not rtext:
             return None
         axis_rationales[dn] = rtext
-    grade = sum(dim_scores.values()) / max(len(dim_scores), 1)
+    grade = _compute_relevance_grade(dim_scores)
     return {
         "relevance_grade": grade,
         "rubric_dimension_scores": dim_scores,
@@ -412,7 +499,7 @@ def _grade_single_paper(
     req: GradeAlignmentRequest,
     rubric: Dict[str, Any],
     llm_base_url: Optional[str],
-) -> GradedPaper:
+) -> Tuple[GradedPaper, Dict[str, int]]:
     fname = os.path.basename(file_path)
     role = _extract_paper_role(fname)
     text = _read_text(file_path)
@@ -446,7 +533,8 @@ def _grade_single_paper(
         "rubric_axis_rationales (object: SAME axis ids → string: cite evidence from the excerpt; "
         "explain how you applied that axis’s criteria; no empty strings),\n"
         "rationale (optional string: one-sentence cross-axis takeaway; may be \"\").\n"
-        "Do not output relevance_grade; it will be computed as the mean of axis scores.\n\n"
+        "Do not output relevance_grade; it will be computed server-side from axis scores "
+        "(with rubric-specific aggregation rules).\n\n"
         f"RUBRIC:\n{json.dumps(rubric, ensure_ascii=False)}\n"
         f"rubric_dimension_scores and rubric_axis_rationales must each include exactly these "
         f"axis ids:\n{dim_lines}\n\n"
@@ -461,6 +549,9 @@ def _grade_single_paper(
         "rubric_axis_rationales": {d["name"]: "" for d in dims},
         "rationale": "",
     }
+    repair_attempted = 0
+    repair_succeeded = 0
+    regrade_retry_used = 0
     if llm_base_url and text.strip():
         max_tokens = (req.constraints and req.constraints.max_tokens) or 3072
         temperature = (
@@ -504,13 +595,42 @@ def _grade_single_paper(
                 graded_ok = True
                 break
             if attempt == 0:
-                reason = (
-                    "empty model content"
-                    if not candidate.strip()
-                    else "invalid JSON or missing rubric_dimension_scores / rubric_axis_rationales"
-                )
+                if not candidate.strip():
+                    regrade_retry_used += 1
+                    logger.warning(
+                        f"Grader LLM ({fname}): empty model content; "
+                        "resubmitting full grading prompt once"
+                    )
+                    continue
+                repair_attempted += 1
                 logger.warning(
-                    f"Grader LLM ({fname}): {reason}; resubmitting prompt once with stricter instruction"
+                    f"Grader LLM ({fname}): non-empty invalid JSON; attempting repair pass "
+                    "before full regrade retry"
+                )
+                repair_prompt = _build_grade_repair_prompt(raw, dim_names)
+                try:
+                    repaired_raw = _call_llm(
+                        repair_prompt,
+                        llm_base_url,
+                        max_tokens=min(max_tokens, 2048),
+                        temperature=0.0,
+                        log_context=f"{fname}::repair",
+                    )
+                except Exception as e:
+                    logger.warning(f"Grader repair LLM call failed for {fname}: {e}")
+                    repaired_raw = ""
+                repaired_candidate = _strip_markdown_json_fence(repaired_raw)
+                repaired = _try_parse_grade_json(repaired_candidate, dims)
+                if repaired is not None:
+                    parsed = repaired
+                    graded_ok = True
+                    repair_succeeded += 1
+                    raw = repaired_raw
+                    break
+                regrade_retry_used += 1
+                logger.warning(
+                    f"Grader LLM ({fname}): repair pass still invalid; "
+                    "resubmitting full grading prompt once with stricter instruction"
                 )
         if not graded_ok and raw:
             if not notes:
@@ -520,8 +640,8 @@ def _grade_single_paper(
                 )
             parsed = _parse_grade_output(raw, dims)
     rdim = parsed["rubric_dimension_scores"]
-    grade = sum(float(rdim[k]) for k in rdim) / max(len(rdim), 1)
-    return GradedPaper(
+    grade = _compute_relevance_grade(rdim)
+    paper = GradedPaper(
         paper_id=fname,
         file_name=fname,
         paper_role=role,
@@ -533,6 +653,11 @@ def _grade_single_paper(
         model_output=raw or None,
         notes=notes or None,
     )
+    return paper, {
+        "repair_attempted": repair_attempted,
+        "repair_succeeded": repair_succeeded,
+        "regrade_retry_used": regrade_retry_used,
+    }
 
 
 def _grade_alignment_sync(req: GradeAlignmentRequest) -> RunAlignmentResponse:
@@ -551,17 +676,22 @@ def _grade_alignment_sync(req: GradeAlignmentRequest) -> RunAlignmentResponse:
     microbe_rubric = _load_json_file(req.microbe_rubric_path)
     llm_base_url = os.environ.get("VLLM_BASE_URL")
     graded: List[GradedPaper] = []
+    n_repair_attempted = 0
+    n_repair_succeeded = 0
+    n_regrade_retry_used = 0
     for fname in files:
         role = _extract_paper_role(fname)
         rubric = microbe_rubric if role == "query" else host_rubric
-        graded.append(
-            _grade_single_paper(
-                file_path=os.path.join(req.papers_dir, fname),
-                req=req,
-                rubric=rubric,
-                llm_base_url=llm_base_url,
-            )
+        gp, retry_meta = _grade_single_paper(
+            file_path=os.path.join(req.papers_dir, fname),
+            req=req,
+            rubric=rubric,
+            llm_base_url=llm_base_url,
         )
+        graded.append(gp)
+        n_repair_attempted += int(retry_meta.get("repair_attempted", 0))
+        n_repair_succeeded += int(retry_meta.get("repair_succeeded", 0))
+        n_regrade_retry_used += int(retry_meta.get("regrade_retry_used", 0))
 
     def _parse_fallback_paper(g: GradedPaper) -> bool:
         rax = g.rubric_axis_rationales or {}
@@ -595,6 +725,9 @@ def _grade_alignment_sync(req: GradeAlignmentRequest) -> RunAlignmentResponse:
         "n_without_model_output": n_without_model_output,
         "n_json_parse_fallback": n_json_parse_fallback,
         "n_llm_ok_structured": n_llm_ok_structured,
+        "n_repair_attempted": n_repair_attempted,
+        "n_repair_succeeded": n_repair_succeeded,
+        "n_regrade_retry_used": n_regrade_retry_used,
     }
     with open(graded_path, "w", encoding="utf-8") as f:
         json.dump(
@@ -613,7 +746,9 @@ def _grade_alignment_sync(req: GradeAlignmentRequest) -> RunAlignmentResponse:
         f"Grader summary {req.alignment_id}: n_papers={len(graded)} llm_enabled={llm_enabled} "
         f"n_llm_ok_structured={n_llm_ok_structured} n_llm_exceptions={n_llm_exceptions} "
         f"n_json_parse_fallback={n_json_parse_fallback} "
-        f"n_without_model_output={n_without_model_output}"
+        f"n_without_model_output={n_without_model_output} "
+        f"n_repair_attempted={n_repair_attempted} n_repair_succeeded={n_repair_succeeded} "
+        f"n_regrade_retry_used={n_regrade_retry_used}"
     )
 
     synth_payload = RunAlignmentGradedRequest(

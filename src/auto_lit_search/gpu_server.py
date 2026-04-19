@@ -2,7 +2,7 @@ import json
 import os
 import re
 import time
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from fastapi import FastAPI, HTTPException
 from loguru import logger
@@ -331,8 +331,11 @@ def _write_alignment_results(
     )
 
 
-def _fallback_synthesis_text(req: RunAlignmentGradedRequest) -> str:
-    graded = req.graded_papers or []
+def _fallback_synthesis_text(
+    req: RunAlignmentGradedRequest,
+    graded_override: Optional[List[Any]] = None,
+) -> str:
+    graded = graded_override if graded_override is not None else (req.graded_papers or [])
     if not graded:
         return (
             "No graded papers were available for synthesis.\n\n"
@@ -393,6 +396,89 @@ def _synthesis_output_well_formed(synthesis_text: str) -> bool:
         return False
     quick = _parse_quick_results_summary(text)
     return quick.get("likelihood_host_manipulation_mimicry") is not None
+
+
+def _chunk_items(items: List[Any], chunk_size: int) -> List[List[Any]]:
+    return [items[i:i + chunk_size] for i in range(0, len(items), chunk_size)]
+
+
+def _summarize_batch_fallback(batch: List[Any]) -> Dict[str, Any]:
+    paper_summaries: List[Dict[str, Any]] = []
+    memory_updates: List[str] = []
+    for gp in batch:
+        rax = gp.rubric_axis_rationales or {}
+        top_axes = sorted(
+            (gp.rubric_dimension_scores or {}).items(),
+            key=lambda kv: float(kv[1]),
+            reverse=True,
+        )[:2]
+        axis_bits = []
+        for ax, sc in top_axes:
+            why = str(rax.get(ax) or "").strip()
+            why = why[:220] if why else "no rationale provided"
+            axis_bits.append(f"{ax}={float(sc):.3f} ({why})")
+        summary = (
+            f"Fallback summary from grader rationale for {gp.file_name}: "
+            + "; ".join(axis_bits)
+        )[:700]
+        paper_summaries.append(
+            {
+                "file_name": gp.file_name,
+                "summary": summary,
+                "important_points": axis_bits[:3],
+                "confidence_notes": "Derived from grader outputs due to batch-summary parse failure.",
+            }
+        )
+        memory_updates.extend(axis_bits[:2])
+    return {"paper_summaries": paper_summaries, "memory_updates": _dedupe_keep_order(memory_updates)}
+
+
+def _parse_batch_summary_output(raw: str, batch: List[Any]) -> Dict[str, Any]:
+    stripped = (raw or "").strip()
+    if not stripped:
+        return _summarize_batch_fallback(batch)
+    if stripped.startswith("```"):
+        lines = stripped.split("\n")
+        body = lines[1:]
+        while body and body[-1].strip() == "```":
+            body.pop()
+        stripped = "\n".join(body).strip()
+    try:
+        obj = json.loads(stripped)
+    except Exception:
+        return _summarize_batch_fallback(batch)
+    if not isinstance(obj, dict):
+        return _summarize_batch_fallback(batch)
+    expected = {gp.file_name for gp in batch}
+    items = obj.get("paper_summaries")
+    if not isinstance(items, list):
+        return _summarize_batch_fallback(batch)
+    parsed_items: List[Dict[str, Any]] = []
+    seen: set = set()
+    for it in items:
+        if not isinstance(it, dict):
+            continue
+        file_name = str(it.get("file_name") or "").strip()
+        if not file_name or file_name not in expected or file_name in seen:
+            continue
+        summary = str(it.get("summary") or "").strip()
+        if not summary:
+            continue
+        important_points = _as_list(it.get("important_points"))[:6]
+        confidence_notes = str(it.get("confidence_notes") or "").strip()
+        parsed_items.append(
+            {
+                "file_name": file_name,
+                "summary": summary[:1200],
+                "important_points": important_points,
+                "confidence_notes": confidence_notes[:500],
+            }
+        )
+        seen.add(file_name)
+    if len(parsed_items) != len(batch):
+        return _summarize_batch_fallback(batch)
+    memory_updates = _as_list(obj.get("memory_updates"))[:20]
+    return {"paper_summaries": parsed_items, "memory_updates": _dedupe_keep_order(memory_updates)}
 
 
 def _run_alignment_impl(req: RunAlignmentRequest) -> RunAlignmentResponse:
@@ -489,51 +575,113 @@ def _run_alignment_graded_impl(
     if temperature is None:
         temperature = 0.0
 
-    # Per-paper: every axis score plus that axis's grader reasoning (capped for prompt size).
+    # Filter synthesis inputs to non-zero aggregate relevance.
+    filtered_rule = "relevance_grade > 0.0"
+    sorted_graded = sorted(
+        req.graded_papers,
+        key=lambda g: (-float(g.relevance_grade), g.file_name),
+    )
+    kept_for_synthesis = [gp for gp in sorted_graded if float(gp.relevance_grade) > 0.0]
+    filtered_out = [gp for gp in sorted_graded if float(gp.relevance_grade) <= 0.0]
+
+    # Per-paper axis evidence lines used for batch summarization.
     _per_axis_cap = 700
-    graded_lines: List[str] = []
-    for gp in req.graded_papers:
-        scores = gp.rubric_dimension_scores or {}
-        rax = gp.rubric_axis_rationales or {}
-        order = sorted(scores.keys())
-        parts: List[str] = [
-            f"- {gp.file_name} role={gp.paper_role or 'unknown'} "
-            f"mean_axis_score={gp.relevance_grade:.3f} "
-            f"(derived from axis scores; synthesize from axes, not only this mean)"
-        ]
-        for ax in order:
-            sc = float(scores.get(ax, 0.0))
-            why = (rax.get(ax) or "")[:_per_axis_cap]
-            parts.append(f"    • {ax}: score={sc:.3f} | grader_reasoning: {why}")
-        if (gp.rationale or "").strip():
-            parts.append(f"    • cross_axis_note: {gp.rationale.strip()[:400]}")
-        graded_lines.append("\n".join(parts))
     grading_meta = req.grading_meta or {}
     term_block = _identification_terms_block(req.query, req.target_id, req.gene_context)
-    # Prompt structure matters: we want a running evidence discussion, then a crisp summary.
+    batch_size_raw = int(os.environ.get("SYNTHESIS_BATCH_SIZE", "5") or "5")
+    batch_size = max(3, min(5, batch_size_raw))
+    batches = _chunk_items(kept_for_synthesis, batch_size) if kept_for_synthesis else []
+
+    all_paper_summaries: List[Dict[str, Any]] = []
+    important_points_memory: List[str] = []
+    batch_outputs: List[Dict[str, Any]] = []
+
+    for batch_idx, batch in enumerate(batches, start=1):
+        batch_lines: List[str] = []
+        for gp in batch:
+            scores = gp.rubric_dimension_scores or {}
+            rax = gp.rubric_axis_rationales or {}
+            order = sorted(scores.keys())
+            parts: List[str] = [
+                f"- {gp.file_name} role={gp.paper_role or 'unknown'} "
+                f"aggregate_axis_score={gp.relevance_grade:.3f}"
+            ]
+            for ax in order:
+                sc = float(scores.get(ax, 0.0))
+                why = (rax.get(ax) or "")[:_per_axis_cap]
+                parts.append(f"    • {ax}: score={sc:.3f} | grader_reasoning: {why}")
+            if (gp.rationale or "").strip():
+                parts.append(f"    • cross_axis_note: {gp.rationale.strip()[:400]}")
+            batch_lines.append("\n".join(parts))
+
+        batch_prompt = (
+            f"{req.instructions}\n\n"
+            f"{term_block}\n\n"
+            f"Stateful synthesis step: summarize batch {batch_idx}/{len(batches)}.\n"
+            "Use prior memory points to keep continuity across batches.\n"
+            "Return strict JSON only with keys:\n"
+            "- paper_summaries: array of objects with keys "
+            "(file_name, summary, important_points, confidence_notes)\n"
+            "- memory_updates: array of short strings for cross-paper memory\n\n"
+            f"Prior memory points:\n{json.dumps(important_points_memory[-60:], ensure_ascii=False)}\n\n"
+            f"Batch papers:\n" + "\n".join(batch_lines[:200])
+        )
+        batch_raw = ""
+        if llm_base_url:
+            try:
+                batch_raw = _call_llm(
+                    batch_prompt,
+                    llm_base_url,
+                    max_tokens=min(max_tokens, 3000),
+                    temperature=temperature,
+                )
+            except Exception as e:
+                logger.warning(
+                    f"Synthesis batch LLM call failed for {req.alignment_id} batch {batch_idx}: {e}"
+                )
+        parsed_batch = _parse_batch_summary_output(batch_raw, batch)
+        all_paper_summaries.extend(parsed_batch["paper_summaries"])
+        important_points_memory = _dedupe_keep_order(
+            important_points_memory + parsed_batch.get("memory_updates", [])
+        )[-200:]
+        batch_outputs.append(
+            {
+                "batch_index": batch_idx,
+                "paper_files": [gp.file_name for gp in batch],
+                "memory_updates": parsed_batch.get("memory_updates", []),
+            }
+        )
+
+    summary_lines: List[str] = []
+    for ps in all_paper_summaries:
+        pts = "; ".join(ps.get("important_points") or [])
+        conf = ps.get("confidence_notes") or ""
+        summary_lines.append(
+            f"- {ps.get('file_name')}: {ps.get('summary')} "
+            f"| important_points={pts} | confidence_notes={conf}"
+        )
+
     synth_prompt = (
         f"{req.instructions}\n\n"
         f"{term_block}\n\n"
-        f"Use the graded evidence below to synthesize whether the query protein "
-        f"provides credible evidence for manipulating or mimicking the target host "
-        f"protein in the Legionella-human interaction context.\n\n"
-        f"Each paper lists every rubric axis with a numeric score AND the grader's reasoning "
-        f"for that axis (cite-level explanations). Weigh both the scores and the qualitative "
-        f"reasoning; do not collapse your analysis to a single number per paper.\n\n"
-        f"Instruction: Write a running discussion (plain text, not JSON) that references "
-        f"specific axes and what the grader said about them. Prioritize papers and axes "
-        f"with strong support, and say where weak axes or conflicting axis patterns limit "
-        f"confidence.\n\n"
-        f"END WITH THIS EXACT SECTION HEADER:\n"
-        f"Quick results summary:\n"
-        f"- Likelihood of host manipulation/mimicry (0..1): <float>\n"
-        f"- Best supporting paper(s): <paper file_name(s)>\n"
-        f"- Main conflicts / uncertainties: <1-3 sentences>\n\n"
+        "You are in final synthesis stage. Use ONLY the accumulated per-paper summaries and "
+        "stateful memory points below to produce the final conclusion.\n\n"
+        "Instruction: Write a running discussion (plain text, not JSON) that references "
+        "which summarized papers and axis patterns drive confidence or uncertainty.\n\n"
+        "END WITH THIS EXACT SECTION HEADER:\n"
+        "Quick results summary:\n"
+        "- Likelihood of host manipulation/mimicry (0..1): <float>\n"
+        "- Best supporting paper(s): <paper file_name(s)>\n"
+        "- Main conflicts / uncertainties: <1-3 sentences>\n\n"
         f"Alignment: {req.alignment_id}\n"
         f"Query={req.query}\n"
         f"Target={req.target_id}\n"
-        f"Grading meta: {json.dumps(grading_meta, ensure_ascii=False)}\n\n"
-        f"Graded papers:\n" + "\n".join(graded_lines[:500])
+        f"Grading meta: {json.dumps(grading_meta, ensure_ascii=False)}\n"
+        f"Synthesis filtering: kept={len(kept_for_synthesis)} filtered_out={len(filtered_out)} "
+        f"rule={filtered_rule}\n"
+        f"Stateful memory points:\n{json.dumps(important_points_memory, ensure_ascii=False)}\n\n"
+        "Per-paper summaries:\n"
+        + ("\n".join(summary_lines[:500]) if summary_lines else "- none")
     )
     synthesis_retry_suffix = (
         "\n\nYour previous answer did not include a parseable end section. "
@@ -597,12 +745,16 @@ def _run_alignment_graded_impl(
             notes = (
                 "synthesis missing parseable Quick results summary after retry; used fallback"
             )
-        synthesis_text = _fallback_synthesis_text(req)
+        synthesis_text = _fallback_synthesis_text(req, graded_override=kept_for_synthesis)
     if log_path:
         _ensure_dir(os.path.dirname(log_path))
         with open(log_path, "a", encoding="utf-8") as f:
             f.write(f"alignment={req.alignment_id}\n")
             f.write(f"n_graded={len(req.graded_papers)}\n")
+            f.write(
+                f"n_kept_for_synthesis={len(kept_for_synthesis)} "
+                f"n_filtered_out={len(filtered_out)} rule={filtered_rule}\n"
+            )
             f.write(
                 f"prompt_preview={synth_prompt[:3500]}"
                 + ("\n...[truncated]\n" if len(synth_prompt) > 3500 else "\n")
@@ -621,6 +773,15 @@ def _run_alignment_graded_impl(
             "notes": notes,
             "llm_model": os.environ.get("VLLM_MODEL_NAME", "unknown"),
             "constraints": req.constraints.dict() if req.constraints else None,
+            "filter_rule": filtered_rule,
+            "filtered_out_count": len(filtered_out),
+            "kept_count": len(kept_for_synthesis),
+            "batch_size": batch_size,
+            "batch_count": len(batches),
+            "paper_summaries": all_paper_summaries,
+            "batch_outputs": batch_outputs,
+            "important_points_memory": important_points_memory,
+            "filtered_out_papers": [gp.file_name for gp in filtered_out],
         },
         "meta": {
             "finished_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),

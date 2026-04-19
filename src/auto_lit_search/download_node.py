@@ -437,12 +437,38 @@ def run(
         if _outputs_done(st["alignment_id"]):
             return False
         papers_dir = str(st.get("papers_dir") or "")
+        if not os.path.isdir(papers_dir):
+            return False
         has_text = any(
             fname.endswith(".txt")
             for fname in os.listdir(papers_dir)
             if os.path.isfile(os.path.join(papers_dir, fname))
         )
         return has_text and _required_docling_txt_done(st)
+
+    def _infer_docling_required_basenames_from_disk(papers_dir: str) -> List[str]:
+        """Best-effort resume helper when a prior run already downloaded artifacts."""
+        pdf_dir = os.path.join(papers_dir, "pdf")
+        if not os.path.isdir(pdf_dir):
+            return []
+        txt_basenames = {
+            os.path.splitext(fname)[0]
+            for fname in os.listdir(papers_dir)
+            if fname.endswith(".txt")
+            and os.path.isfile(os.path.join(papers_dir, fname))
+            and os.path.getsize(os.path.join(papers_dir, fname)) > 0
+        }
+        required: List[str] = []
+        for fname in os.listdir(pdf_dir):
+            if not fname.endswith(".pdf"):
+                continue
+            pdf_path = os.path.join(pdf_dir, fname)
+            if not os.path.isfile(pdf_path) or os.path.getsize(pdf_path) <= 0:
+                continue
+            base = os.path.splitext(fname)[0]
+            if base not in txt_basenames:
+                required.append(base)
+        return sorted(required)
 
     def _bootstrap_state(alignment_id: str, defaults: Dict[str, Any]) -> Dict[str, Any]:
         state = dict(defaults)
@@ -626,32 +652,72 @@ def run(
                 continue
             papers_dir = os.path.join(papers_base, alignment_id)
             os.makedirs(papers_dir, exist_ok=True)
-            logger.info(f"Downloading {len(paper_ids_src)} papers for {alignment_id}")
-            recs = download_papers_to_dir(
-                paper_ids_src,
-                papers_dir,
-                session=session,
-                pmcid_cache=pmcid_cache,
-                no_cache=no_cache,
-                force_pdfs=True,
-                prefer_pdf_text=False,
-                collection_org=collection_org,
-                auth_scope=collection_auth_scope,
-                collector_email=collector_email or None,
-                max_workers=collect_max_workers,
-                disable_semantic_scholar=collect_disable_s2,
-            )
-            has_pdf = any(r.pdf_path for r in recs)
-            n_docling_required = sum(
-                1 for r in recs if ((r.details or {}).get("pdf_docling_required"))
-            )
-            docling_required_basenames = sorted(
-                {
-                    os.path.splitext(os.path.basename(str(r.pdf_path)))[0]
-                    for r in recs
-                    if ((r.details or {}).get("pdf_docling_required")) and r.pdf_path
-                }
-            )
+            already_done = _outputs_done(alignment_id)
+            if already_done:
+                logger.info(
+                    "Alignment {} already has graded+results outputs; skipping download/convert/grade",
+                    alignment_id,
+                )
+                recs = []
+                has_pdf = False
+                n_docling_required = 0
+                docling_required_basenames: List[str] = []
+            else:
+                existing_txt = [
+                    fname
+                    for fname in os.listdir(papers_dir)
+                    if fname.endswith(".txt")
+                    and os.path.isfile(os.path.join(papers_dir, fname))
+                    and os.path.getsize(os.path.join(papers_dir, fname)) > 0
+                ]
+                existing_pdf_dir = os.path.join(papers_dir, "pdf")
+                existing_pdf = os.path.isdir(existing_pdf_dir) and any(
+                    fname.endswith(".pdf")
+                    and os.path.isfile(os.path.join(existing_pdf_dir, fname))
+                    and os.path.getsize(os.path.join(existing_pdf_dir, fname)) > 0
+                    for fname in os.listdir(existing_pdf_dir)
+                )
+                can_resume_from_disk = bool(existing_txt or existing_pdf) and not no_cache
+                if can_resume_from_disk:
+                    docling_required_basenames = _infer_docling_required_basenames_from_disk(
+                        papers_dir
+                    )
+                    n_docling_required = len(docling_required_basenames)
+                    has_pdf = existing_pdf
+                    recs = []
+                    logger.info(
+                        "Alignment {} reusing existing artifacts (txt={} pending_docling={}): skipping re-download",
+                        alignment_id,
+                        len(existing_txt),
+                        n_docling_required,
+                    )
+                else:
+                    logger.info(f"Downloading {len(paper_ids_src)} papers for {alignment_id}")
+                    recs = download_papers_to_dir(
+                        paper_ids_src,
+                        papers_dir,
+                        session=session,
+                        pmcid_cache=pmcid_cache,
+                        no_cache=no_cache,
+                        force_pdfs=True,
+                        prefer_pdf_text=False,
+                        collection_org=collection_org,
+                        auth_scope=collection_auth_scope,
+                        collector_email=collector_email or None,
+                        max_workers=collect_max_workers,
+                        disable_semantic_scholar=collect_disable_s2,
+                    )
+                    has_pdf = any(r.pdf_path for r in recs)
+                    n_docling_required = sum(
+                        1 for r in recs if ((r.details or {}).get("pdf_docling_required"))
+                    )
+                    docling_required_basenames = sorted(
+                        {
+                            os.path.splitext(os.path.basename(str(r.pdf_path)))[0]
+                            for r in recs
+                            if ((r.details or {}).get("pdf_docling_required")) and r.pdf_path
+                        }
+                    )
             query_meta = al.get("query_meta")
             target_meta = al.get("target_meta")
             gene_context: Dict[str, Any] | None = None
