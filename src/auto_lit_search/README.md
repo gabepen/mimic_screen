@@ -93,25 +93,48 @@ Or if using conda:
 conda install -c bioconda mygene
 ```
 
-## Grader node (`grader_server`) and vLLM HTTP settings
+## CPU-owned queue scheduler (download_node)
 
-The grader calls `VLLM_BASE_URL` (OpenAI-compatible `/v1/chat/completions`). Tune timeouts when vLLM is busy (queue + generation can exceed a few minutes).
+The CPU node owns orchestration state and keeps stage queues locally:
+
+1. download package on CPU
+2. if PDF conversion required, submit async Docling work
+3. when package is fully converted, mark grader-ready
+4. submit async grading+synthesis when grader has capacity
+
+Docling and grader are independent stages. Slow grading does not block
+Docling submission, except for each stage's own inflight cap.
+
+### Restart semantics
+
+Scheduler state is persisted under:
+
+- `DATA_ROOT/logs/scheduler_state/<alignment_id>.json`
+
+On restart, the CPU job reconstructs state from persisted files + output files:
+
+- `<alignment>_results.json` + `<alignment>_graded.json` => `DONE`
+- required Docling outputs present + no results => `GRADER_READY`
+- missing required Docling outputs => `DOCLING_PENDING`
+
+### Minimal runtime knobs
 
 | Variable | Default | Meaning |
 |----------|---------|---------|
-| `VLLM_BASE_URL` | (required) | Base URL of the vLLM server (e.g. `http://127.0.0.1:8000`). |
-| `VLLM_MODEL_NAME` | auto from `/v1/models` | Must match a served model id; wrong names cause 404s and empty replies. |
-| `VLLM_HTTP_CONNECT_TIMEOUT` | `30` | TCP connect timeout (seconds). |
-| `VLLM_HTTP_READ_TIMEOUT` | `300` | Per-attempt read timeout (seconds). Alias: `VLLM_GRADER_TIMEOUT`. For heavy runs try `900`–`1800`. |
-| `VLLM_GRADER_HTTP_RETRIES` | `3` | Attempts per LLM call on `ReadTimeout` / `ConnectionError` (exponential backoff between attempts). |
-| `VLLM_GRADER_RETRY_BACKOFF_SEC` | `45` | Base sleep (seconds) before retry; actual wait is `min(base * 2**attempt, cap)`. |
-| `VLLM_GRADER_RETRY_BACKOFF_CAP_SEC` | `180` | Max sleep between retries (seconds). |
+| `SERVICE_HEALTH_WAIT_SECONDS` | `900` | Max wait for LLM/Docling/Grader `/healthz` startup checks. |
+| `DOCLING_CHUNK_SIZE` | `25` | PDFs per Docling conversion chunk. |
+| `DOCLING_INFLIGHT_CAP` | `1` | Max async Docling jobs inflight from CPU scheduler. |
+| `GRADER_INFLIGHT_CAP` | `1` | Max async grader jobs inflight from CPU scheduler. |
+| `SCHEDULER_TICK_SECONDS` | `5` | Scheduler poll/admission tick cadence. |
+| `STAGE_WATCHDOG_SECONDS` | `3600` | Fail inflight stage jobs that exceed this runtime. |
 
-Example for a loaded GPU host:
+### Grader -> vLLM settings
 
-```bash
-export VLLM_HTTP_READ_TIMEOUT=1200
-export VLLM_GRADER_HTTP_RETRIES=4
-export VLLM_GRADER_RETRY_BACKOFF_SEC=60
-```
+`grader_server` calls `VLLM_BASE_URL` (`/v1/chat/completions`):
+
+| Variable | Default | Meaning |
+|----------|---------|---------|
+| `VLLM_BASE_URL` | (required) | Base URL of the local vLLM server. |
+| `VLLM_MODEL_NAME` | auto from `/v1/models` | Served model id override. |
+| `VLLM_HTTP_READ_TIMEOUT` | `300` | Per-attempt read timeout inside grader->vLLM call. |
 
