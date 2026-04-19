@@ -12,7 +12,7 @@ class GradedPaper(BaseModel):
     paper_id: str
     file_name: str
     paper_role: Optional[str] = None
-    relevance_grade: float  # mean of rubric_dimension_scores; computed server-side
+    relevance_grade: float  # computed server-side from rubric_dimension_scores
     rubric_dimension_scores: Dict[str, float]
     rubric_axis_rationales: Dict[str, str] = Field(default_factory=dict)
     rationale: str = ""  # optional brief cross-axis summary
