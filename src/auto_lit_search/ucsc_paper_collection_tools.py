@@ -10,7 +10,7 @@ import os
 import re
 import time
 from typing import Dict, List, Optional
-from urllib.parse import quote, unquote
+from urllib.parse import quote, unquote, urlparse, urlunparse
 from uuid import UUID
 from xml.etree import ElementTree as ET
 
@@ -392,6 +392,63 @@ def is_mdpi_primary_doi(doi: Optional[str]) -> bool:
     return bool(d) and d.startswith("10.3390/")
 
 
+def _browser_like_user_agent() -> str:
+    """Used for publisher sites that reject non-browser clients (MDPI, ASM PDF GET)."""
+    return (
+        "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/120.0.0.0 Safari/537.36"
+    )
+
+
+_CITATION_PDF_META_RE = re.compile(
+    r'<meta\s+name=["\']citation_pdf_url["\']\s+content=["\']([^"\']+)["\']',
+    re.I,
+)
+_CITATION_PDF_META_RE2 = re.compile(
+    r'<meta\s+content=["\']([^"\']+)["\']\s+name=["\']citation_pdf_url["\']',
+    re.I,
+)
+
+
+def _extract_citation_pdf_url_from_html(html: str) -> Optional[str]:
+    """Highwire / Silverchair-style citation PDF link from article HTML."""
+    if not html:
+        return None
+    for rx in (_CITATION_PDF_META_RE, _CITATION_PDF_META_RE2):
+        m = rx.search(html)
+        if m:
+            url = (m.group(1) or "").strip()
+            if url.lower().startswith(("http://", "https://")):
+                return url
+    return None
+
+
+def _browser_html_fetch_headers(referer: Optional[str] = None) -> Dict[str, str]:
+    h: Dict[str, str] = {
+        "User-Agent": _browser_like_user_agent(),
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Upgrade-Insecure-Requests": "1",
+    }
+    if referer:
+        h["Referer"] = referer
+    return h
+
+
+def _browser_pdf_fetch_headers(referer: str) -> Dict[str, str]:
+    ref = (referer or "").strip()
+    return {
+        "User-Agent": _browser_like_user_agent(),
+        "Accept": "application/pdf,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Referer": ref,
+        "Sec-Fetch-Dest": "document",
+        "Sec-Fetch-Mode": "navigate",
+        "Sec-Fetch-Site": "same-origin",
+        "Upgrade-Insecure-Requests": "1",
+    }
+
+
 def _crossref_user_agent() -> str:
     mailto = (
         os.environ.get("COLLECTOR_EMAIL")
@@ -402,21 +459,62 @@ def _crossref_user_agent() -> str:
     return f"{base} mailto:{mailto}" if mailto else base
 
 
+def _mdpi_normalize_mdpi_url(url: str) -> str:
+    """Force https and bare mdpi.com -> www.mdpi.com (article PDFs live on www)."""
+    if not url or "mdpi.com" not in url.lower():
+        return url
+    p = urlparse(url.strip())
+    host = (p.netloc or "").lower()
+    if "mdpi.com" not in host:
+        return url
+    scheme = "https"
+    if host == "mdpi.com":
+        host = "www.mdpi.com"
+    return urlunparse((scheme, host, p.path or "", p.params, p.query, p.fragment))
+
+
+def _mdpi_pdf_referer(pdf_url: str) -> str:
+    u = (pdf_url or "").rstrip("/")
+    if re.search(r"/pdf$", u, re.I):
+        return re.sub(r"/pdf$", "/", u, count=1, flags=re.I)
+    return u + "/" if u else pdf_url
+
+
 def _mdpi_guess_pdf_from_landing_url(url: str) -> Optional[str]:
     """
-    MDPI article pages use /htm or bare .../vol/issue/article paths; PDF is sibling .../pdf.
+    MDPI article pages use /htm or bare .../<journal>/vol/issue/article paths; PDF is .../pdf.
+
+    Journal id is often an ISSN-like token (e.g. 2218-273X), not all digits — older code
+    required /\\d+/\\d+/\\d+$/ and never derived /pdf for real MDPI URLs.
     """
     if not url or "mdpi.com" not in url.lower():
         return None
     base = url.split("?")[0].strip()
-    low = base.lower().rstrip("/")
+    parsed = urlparse(base)
+    if "mdpi.com" not in (parsed.netloc or "").lower():
+        return None
+    path = (parsed.path or "").rstrip("/")
+    low = path.lower()
     if low.endswith("/pdf"):
-        return base
+        return _mdpi_normalize_mdpi_url(base)
     if low.endswith("/htm") or low.endswith("/html"):
-        return re.sub(r"/html?$", "/pdf", base.rstrip("/"), count=1, flags=re.I)
-    # https://www.mdpi.com/ISSN/vol/issue/article
-    if re.search(r"/\d+/\d+/\d+$", base.rstrip("/"), re.I):
-        return base.rstrip("/") + "/pdf"
+        new_path = re.sub(r"/html?$", "/pdf", path, count=1, flags=re.I)
+        return _mdpi_normalize_mdpi_url(
+            urlunparse((parsed.scheme, parsed.netloc, new_path, "", "", ""))
+        )
+    # https://www.mdpi.com/<journal-id>/<vol>/<issue>/<article>
+    parts = [p for p in path.split("/") if p]
+    if (
+        len(parts) >= 4
+        and parts[-1].isdigit()
+        and parts[-2].isdigit()
+        and parts[-3].isdigit()
+    ):
+        prefix = "/".join(parts)
+        pdf_path = f"/{prefix}/pdf"
+        return _mdpi_normalize_mdpi_url(
+            urlunparse((parsed.scheme, parsed.netloc, pdf_path, "", "", ""))
+        )
     return None
 
 
@@ -436,14 +534,17 @@ def _mdpi_pdf_url_from_doi_org_redirect(
             url,
             allow_redirects=True,
             timeout=timeout_s,
-            headers={"User-Agent": _crossref_user_agent()},
+            headers={
+                "User-Agent": _browser_like_user_agent(),
+                "Accept": "text/html,application/xhtml+xml;q=0.9,*/*;q=0.8",
+            },
             stream=True,
         )
         try:
             final = (resp.url or "").strip()
         finally:
             resp.close()
-        return _mdpi_guess_pdf_from_landing_url(final)
+        return _mdpi_guess_pdf_from_landing_url(_mdpi_normalize_mdpi_url(final))
     except Exception as e:
         logger.debug(f"doi.org redirect for MDPI failed doi={d!r}: {e}")
         return None
@@ -482,7 +583,7 @@ def _mdpi_pdf_url_candidates_from_crossref(
     def add(u: Optional[str]) -> None:
         if not u:
             return
-        u = u.strip()
+        u = _mdpi_normalize_mdpi_url(u.strip())
         if u in seen:
             return
         seen.add(u)
@@ -567,18 +668,85 @@ def download_mdpi_article_pdf(
     if os.path.exists(out_path) and os.path.getsize(out_path) > 0:
         return out_path
 
-    headers = {
-        "User-Agent": _crossref_user_agent(),
-        "Accept": "application/pdf,*/*;q=0.8",
-    }
-    for pdf_url in candidates:
+    # Normalize + dedupe after normalization
+    seen_c: set[str] = set()
+    norm_candidates: List[str] = []
+    for u in candidates:
+        nu = _mdpi_normalize_mdpi_url(u)
+        if nu and nu not in seen_c:
+            seen_c.add(nu)
+            norm_candidates.append(nu)
+
+    for pdf_url in norm_candidates:
         try:
-            resp = session.get(pdf_url, headers=headers, timeout=timeout_s)
-            if resp.status_code != 200:
-                continue
+            ref = _mdpi_pdf_referer(pdf_url)
+            htm_url = ref.rstrip("/") + "/htm"
+            warm_hdr = _browser_html_fetch_headers(ref)
+            for warm in (htm_url, ref):
+                try:
+                    session.get(
+                        warm,
+                        headers=warm_hdr,
+                        timeout=min(25, timeout_s),
+                        allow_redirects=True,
+                    )
+                except Exception:
+                    pass
+            hdr = _browser_pdf_fetch_headers(ref)
+            resp = session.get(
+                pdf_url,
+                headers=hdr,
+                timeout=timeout_s,
+                allow_redirects=True,
+            )
+            if resp.status_code not in (200, 206):
+                logger.debug(
+                    f"MDPI PDF GET status={resp.status_code} url={pdf_url!r} doi={d!r}"
+                )
+                if resp.status_code == 403:
+                    try:
+                        hresp = session.get(
+                            htm_url,
+                            headers=warm_hdr,
+                            timeout=min(25, timeout_s),
+                            allow_redirects=True,
+                        )
+                        if hresp.status_code == 200:
+                            alt_raw = _extract_citation_pdf_url_from_html(
+                                hresp.text
+                            )
+                            alt = (
+                                _mdpi_normalize_mdpi_url(alt_raw)
+                                if alt_raw
+                                else None
+                            )
+                            retry_urls: List[str] = []
+                            if alt:
+                                retry_urls.append(alt)
+                            if pdf_url not in retry_urls:
+                                retry_urls.append(pdf_url)
+                            for ru in retry_urls:
+                                resp = session.get(
+                                    ru,
+                                    headers=_browser_pdf_fetch_headers(htm_url),
+                                    timeout=timeout_s,
+                                    allow_redirects=True,
+                                )
+                                if resp.status_code in (200, 206):
+                                    break
+                    except Exception as e:
+                        logger.debug(
+                            f"MDPI 403 HTML fallback failed url={pdf_url!r} doi={d!r}: {e}"
+                        )
+                if resp.status_code not in (200, 206):
+                    continue
             content = resp.content or b""
             ctype = (resp.headers.get("Content-Type") or "").lower()
             if (not content.startswith(b"%PDF")) and ("pdf" not in ctype):
+                logger.debug(
+                    f"MDPI non-PDF body url={pdf_url!r} doi={d!r} "
+                    f"ctype={ctype!r} head={content[:80]!r}"
+                )
                 continue
             with open(out_path, "wb") as f:
                 f.write(content)
@@ -598,11 +766,10 @@ def is_asm_primary_doi(doi: Optional[str]) -> bool:
 
 def _asm_pdf_candidates(doi: str) -> List[str]:
     """
-    ASM PDF URL patterns.
+    ASM / Silverchair PDF URL patterns.
 
-    ASM's site commonly exposes PDFs via endpoints like:
-      https://journals.asm.org/doi/pdf/<prefix>/<suffix>
-      https://journals.asm.org/doi/epdf/<prefix>/<suffix>
+    Try full DOI as one encoded path segment first (common on current asm.org),
+    then legacy two-segment prefix/suffix URLs.
     """
     d = (doi or "").strip()
     if not d:
@@ -610,16 +777,18 @@ def _asm_pdf_candidates(doi: str) -> List[str]:
 
     if "/" not in d:
         return []
+    enc_full = quote(d, safe="")
     prefix, suffix = d.split("/", 1)
     prefix = prefix.strip()
     suffix = suffix.strip()
     if not prefix or not suffix:
         return []
 
-    # Keep prefix/suffix as path segments; quote only to be safe.
     prefix_q = quote(prefix, safe="")
     suffix_q = quote(suffix, safe="")
     return [
+        f"https://journals.asm.org/doi/pdf/{enc_full}",
+        f"https://journals.asm.org/doi/epdf/{enc_full}",
         f"https://journals.asm.org/doi/pdf/{prefix_q}/{suffix_q}",
         f"https://journals.asm.org/doi/epdf/{prefix_q}/{suffix_q}",
     ]
@@ -638,18 +807,28 @@ def _asm_derive_pdf_from_doi_url(final_url: str, timeout_s: int = 25) -> List[st
     if "/doi/" not in final_url:
         return []
 
-    # final URL often looks like: .../doi/<full-doi>
+    # final URL often looks like: .../doi/<full-doi> (possibly URL-encoded)
     try:
-        after = final_url.split("/doi/", 1)[1].strip().rstrip("/")
-        if not after or "/" not in after:
+        tail = final_url.split("/doi/", 1)[1].strip().rstrip("/").split("?")[0]
+        tail = unquote(tail)
+        if not tail:
             return []
-        prefix, suffix = after.split("/", 1)
-        prefix_q = quote(prefix.strip(), safe="")
-        suffix_q = quote(suffix.strip(), safe="")
-        return [
-            f"https://journals.asm.org/doi/pdf/{prefix_q}/{suffix_q}",
-            f"https://journals.asm.org/doi/epdf/{prefix_q}/{suffix_q}",
+        enc_full = quote(tail, safe="")
+        out = [
+            f"https://journals.asm.org/doi/pdf/{enc_full}",
+            f"https://journals.asm.org/doi/epdf/{enc_full}",
         ]
+        if "/" in tail:
+            prefix, suffix = tail.split("/", 1)
+            prefix_q = quote(prefix.strip(), safe="")
+            suffix_q = quote(suffix.strip(), safe="")
+            out.extend(
+                [
+                    f"https://journals.asm.org/doi/pdf/{prefix_q}/{suffix_q}",
+                    f"https://journals.asm.org/doi/epdf/{prefix_q}/{suffix_q}",
+                ]
+            )
+        return out
     except Exception:
         return []
 
@@ -687,7 +866,10 @@ def download_asm_article_pdf(
             f"https://doi.org/{quote(d, safe='')}",
             allow_redirects=True,
             timeout=min(25, timeout_s),
-            headers={"User-Agent": "auto-lit-metrics/1.0 (ASM/doi resolver)"},
+            headers={
+                "User-Agent": _browser_like_user_agent(),
+                "Accept": "text/html,application/xhtml+xml;q=0.9,*/*;q=0.8",
+            },
             stream=True,
         )
         try:
@@ -707,18 +889,82 @@ def download_asm_article_pdf(
             seen.add(u)
             uniq.append(u)
 
-    headers = {
-        "Accept": "application/pdf,*/*;q=0.8",
-        "User-Agent": "auto-lit-metrics/1.0 (ASM PDF downloader)",
-    }
+    doi_landing = f"https://journals.asm.org/doi/{quote(d, safe='/')}"
+    warm_h = _browser_html_fetch_headers("https://doi.org/")
+    landing_html: Optional[str] = None
+    try:
+        lr = session.get(
+            doi_landing,
+            headers=warm_h,
+            timeout=min(25, timeout_s),
+            allow_redirects=True,
+        )
+        if lr.status_code == 200:
+            landing_html = lr.text
+    except Exception:
+        pass
+
+    if landing_html:
+        front: List[str] = []
+        meta_u = _extract_citation_pdf_url_from_html(landing_html)
+        if meta_u:
+            front.append(meta_u.strip())
+        for m in re.finditer(
+            r'https://journals\.asm\.org/doi/(?:pdf|epdf)/[^"\'\s<>]+',
+            landing_html,
+            re.I,
+        ):
+            u = m.group(0).strip().rstrip(").,;")
+            if u and u not in front:
+                front.append(u)
+        if front:
+            seen_asm: set[str] = set()
+            merged: List[str] = []
+            for u in front + uniq:
+                if u and u not in seen_asm:
+                    seen_asm.add(u)
+                    merged.append(u)
+            uniq = merged
+
     for pdf_url in uniq:
         try:
-            r = session.get(pdf_url, headers=headers, timeout=timeout_s)
-            if r.status_code != 200:
-                continue
+            r = session.get(
+                pdf_url,
+                headers=_browser_pdf_fetch_headers(doi_landing),
+                timeout=timeout_s,
+                allow_redirects=True,
+            )
+            if r.status_code not in (200, 206):
+                logger.debug(
+                    f"ASM PDF GET status={r.status_code} url={pdf_url!r} doi={d!r}"
+                )
+                if r.status_code == 403:
+                    try:
+                        session.get(
+                            doi_landing,
+                            headers=warm_h,
+                            timeout=min(25, timeout_s),
+                            allow_redirects=True,
+                        )
+                        r = session.get(
+                            pdf_url,
+                            headers=_browser_pdf_fetch_headers(doi_landing),
+                            timeout=timeout_s,
+                            allow_redirects=True,
+                        )
+                    except Exception as e:
+                        logger.debug(
+                            f"ASM 403 re-warm retry failed url={pdf_url!r} doi={d!r}: {e}"
+                        )
+                if r.status_code not in (200, 206):
+                    continue
             content = r.content or b""
             ctype = (r.headers.get("Content-Type") or "").lower()
             if (not content.startswith(b"%PDF")) and ("pdf" not in ctype):
+                logger.debug(
+                    f"ASM non-PDF body url={pdf_url!r} doi={d!r} "
+                    f"ctype={ctype!r} head={content[:80]!r}"
+                )
                 continue
             with open(out_path, "wb") as f:
                 f.write(content)
