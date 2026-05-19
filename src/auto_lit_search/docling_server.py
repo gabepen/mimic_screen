@@ -5,7 +5,7 @@ import threading
 import time
 import uuid
 from collections import deque
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Union
 
 # Headless-friendly defaults for PDF stacks that touch Qt/XCB in some builds.
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
@@ -15,8 +15,23 @@ from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 from loguru import logger
 
+from docling.datamodel.accelerator_options import AcceleratorDevice, AcceleratorOptions
 from docling.datamodel.base_models import InputFormat
+from docling.datamodel.pipeline_options import PdfPipelineOptions, RapidOcrOptions, ThreadedPdfPipelineOptions
 from docling.document_converter import DocumentConverter, PdfFormatOption
+
+try:
+    from docling.pipeline.threaded_standard_pdf_pipeline import ThreadedStandardPdfPipeline
+
+    _PDF_PIPELINE_CLS = ThreadedStandardPdfPipeline
+    _PDF_PIPELINE_OPTIONS_CLS = ThreadedPdfPipelineOptions
+    _PDF_PIPELINE_KIND = "threaded_standard"
+except ImportError:  # pragma: no cover - older docling
+    from docling.pipeline.standard_pdf_pipeline import StandardPdfPipeline
+
+    _PDF_PIPELINE_CLS = StandardPdfPipeline
+    _PDF_PIPELINE_OPTIONS_CLS = PdfPipelineOptions
+    _PDF_PIPELINE_KIND = "standard"
 
 
 app = FastAPI(title="Docling PDF-to-text node")
@@ -24,6 +39,10 @@ _ASYNC_JOBS: Dict[str, Dict[str, Any]] = {}
 _ASYNC_QUEUE: "deque[tuple[str, ConvertAlignmentRequest]]" = deque()
 _ASYNC_LOCK = threading.Lock()
 _ASYNC_WORKER_STARTED = False
+
+_DOC_CONVERTER: Optional[DocumentConverter] = None
+_DOC_CONVERTER_LOCK = threading.Lock()
+_DOC_CONVERTER_INFO: Dict[str, Any] = {}
 
 
 class Constraints(BaseModel):
@@ -58,11 +77,118 @@ def _ensure_dir(path: str) -> None:
     os.makedirs(path, exist_ok=True)
 
 
-_DOC_CONVERTER = DocumentConverter(
-    format_options={
-        InputFormat.PDF: PdfFormatOption(),
-    }
-)
+def _int_env(name: str, default: int) -> int:
+    try:
+        return max(1, int(str(os.environ.get(name, str(default))).strip()))
+    except ValueError:
+        return default
+
+
+def _parse_ocr_langs() -> List[str]:
+    raw = os.environ.get("DOCLING_OCR_LANGS", "english").strip()
+    if not raw:
+        return ["english"]
+    return [x.strip() for x in raw.split(",") if x.strip()]
+
+
+def _default_accelerator_device() -> Union[str, AcceleratorDevice]:
+    """
+    Prefer CUDA when PyTorch sees a GPU unless DOCLING_DEVICE is set (Docling reads this too).
+    """
+    explicit = os.environ.get("DOCLING_DEVICE", "").strip()
+    if explicit:
+        return explicit
+    try:
+        import torch  # type: ignore
+
+        if torch.cuda.is_available():
+            return AcceleratorDevice.CUDA
+    except Exception:
+        pass
+    return AcceleratorDevice.AUTO
+
+
+def _rapidocr_backend() -> str:
+    raw = os.environ.get("DOCLING_RAPIDOCR_BACKEND", "torch").strip().lower()
+    if raw in ("torch", "onnxruntime", "paddle", "openvino"):
+        return raw
+    return "torch"
+
+
+def _make_pdf_format_option(
+    device: Union[str, AcceleratorDevice],
+    ocr_backend: str,
+) -> PdfFormatOption:
+    opts = _PDF_PIPELINE_OPTIONS_CLS(
+        accelerator_options=AcceleratorOptions(device=device),
+        ocr_batch_size=_int_env("DOCLING_OCR_BATCH_SIZE", 8),
+        layout_batch_size=_int_env("DOCLING_LAYOUT_BATCH_SIZE", 32),
+        table_batch_size=_int_env("DOCLING_TABLE_BATCH_SIZE", 4),
+        ocr_options=RapidOcrOptions(
+            backend=ocr_backend,  # type: ignore[arg-type]
+            lang=_parse_ocr_langs(),
+        ),
+    )
+    return PdfFormatOption(pipeline_cls=_PDF_PIPELINE_CLS, pipeline_options=opts)
+
+
+def _create_document_converter(
+    device: Union[str, AcceleratorDevice],
+    ocr_backend: str,
+) -> DocumentConverter:
+    fmt = _make_pdf_format_option(device, ocr_backend)
+    conv = DocumentConverter(format_options={InputFormat.PDF: fmt})
+    try:
+        conv.initialize_pipeline(InputFormat.PDF)
+    except Exception as e:
+        logger.warning("Docling initialize_pipeline: {}", e)
+    return conv
+
+
+def _get_document_converter() -> DocumentConverter:
+    """
+    Lazy singleton: CUDA + RapidOCR torch by default; CPU/onnxruntime fallback if init fails.
+    """
+    global _DOC_CONVERTER, _DOC_CONVERTER_INFO
+    with _DOC_CONVERTER_LOCK:
+        if _DOC_CONVERTER is not None:
+            return _DOC_CONVERTER
+        device = _default_accelerator_device()
+        ocr_backend = _rapidocr_backend()
+        try:
+            _DOC_CONVERTER = _create_document_converter(device, ocr_backend)
+            _DOC_CONVERTER_INFO = {
+                "accelerator_device": str(device),
+                "rapidocr_backend": ocr_backend,
+                "pdf_pipeline": _PDF_PIPELINE_KIND,
+                "ocr_batch_size": _int_env("DOCLING_OCR_BATCH_SIZE", 8),
+                "layout_batch_size": _int_env("DOCLING_LAYOUT_BATCH_SIZE", 32),
+            }
+            logger.info(
+                "Docling converter ready: pipeline={} device={} rapidocr_backend={} "
+                "ocr_batch={} layout_batch={}",
+                _PDF_PIPELINE_KIND,
+                device,
+                ocr_backend,
+                _DOC_CONVERTER_INFO["ocr_batch_size"],
+                _DOC_CONVERTER_INFO["layout_batch_size"],
+            )
+        except Exception as e:
+            logger.error(
+                "Docling GPU init failed ({}); falling back to CPU + RapidOCR onnxruntime",
+                e,
+            )
+            _DOC_CONVERTER = _create_document_converter(
+                AcceleratorDevice.CPU, "onnxruntime"
+            )
+            _DOC_CONVERTER_INFO = {
+                "accelerator_device": "cpu",
+                "rapidocr_backend": "onnxruntime",
+                "pdf_pipeline": _PDF_PIPELINE_KIND,
+                "init_error": str(e)[:500],
+            }
+        return _DOC_CONVERTER
+
 
 def _best_effort_free_memory() -> None:
     """
@@ -92,7 +218,11 @@ def _extract_text_pypdf(pdf_path: str) -> str:
     except Exception:
         return ""
     parts: List[str] = []
-    for page in reader.pages:
+    try:
+        pages = list(reader.pages)
+    except Exception:
+        return ""
+    for page in pages:
         try:
             t = page.extract_text() or ""
         except Exception:
@@ -135,6 +265,14 @@ def _load_docling_required_pdf_basenames(
     except Exception as e:
         logger.warning(f"Could not parse evaluation manifest {manifest_path}: {e}")
         return None
+    if not out:
+        # Empty set is not "no filter": it would skip every PDF and fail the job.
+        # Stale manifests (e.g. resume without refreshed rows) have this shape.
+        logger.warning(
+            f"Manifest {manifest_path} has no pdf_docling_required rows; "
+            "ignoring filter (convert eligible PDFs in pdf_dir)"
+        )
+        return None
     logger.info(
         f"Loaded {len(out)} docling-required PDFs from manifest {manifest_path}"
     )
@@ -142,7 +280,10 @@ def _load_docling_required_pdf_basenames(
 
 
 def _convert_pdfs_to_text(
-    pdf_dir: str, papers_dir: str, allowed_pdf_basenames: Optional[set[str]] = None
+    pdf_dir: str,
+    papers_dir: str,
+    allowed_pdf_basenames: Optional[set[str]] = None,
+    alignment_id: str = "",
 ) -> List[str]:
     if not os.path.isdir(pdf_dir):
         raise HTTPException(
@@ -166,17 +307,24 @@ def _convert_pdfs_to_text(
         txt_path = os.path.join(papers_dir, f"{base}.txt")
         if os.path.isfile(txt_path) and os.path.getsize(txt_path) > 0:
             txt_paths.append(txt_path)
+            if alignment_id:
+                logger.info(
+                    "docling_pdf_skip_cached alignment_id={} basename={} reason=non_empty_txt",
+                    alignment_id,
+                    base,
+                )
             continue
         attempted += 1
         text = ""
         result = None
         doc = None
+        docling_err = ""
         try:
-            result = _DOC_CONVERTER.convert(source=pdf_path)
+            result = _get_document_converter().convert(source=pdf_path)
             doc = result.document
-            text = doc.export_to_markdown()
+            text = (doc.export_to_markdown() or "").strip()
         except Exception as e:
-            logger.warning(f"Docling failed for {pdf_path}: {e}")
+            docling_err = str(e)[:500]
             text = ""
         finally:
             # Ensure large objects are dereferenced between PDFs.
@@ -189,24 +337,52 @@ def _convert_pdfs_to_text(
             except Exception:
                 pass
             _best_effort_free_memory()
-        if not (text or "").strip():
+        mode = "docling"
+        if not text:
             fallback = _extract_text_pypdf(pdf_path)
-            if fallback.strip():
-                text = fallback
-                logger.info(
-                    f"Used pypdf fallback for {pdf_path} ({len(fallback)} chars)"
-                )
+            if (fallback or "").strip():
+                text = fallback.strip()
+                mode = "pypdf_fallback"
+                if alignment_id:
+                    logger.info(
+                        "docling_pdf_fallback alignment_id={} basename={} chars={}",
+                        alignment_id,
+                        base,
+                        len(fallback),
+                    )
             else:
+                if alignment_id:
+                    detail = docling_err or "no_markdown_no_pypdf"
+                    logger.warning(
+                        "docling_pdf_convert_failed alignment_id={} basename={} detail={}",
+                        alignment_id,
+                        base,
+                        detail,
+                    )
                 continue
         try:
             with open(txt_path, "w", encoding="utf-8", errors="replace") as f:
                 f.write(text)
         except Exception as e:
-            logger.warning(f"Could not write text for {pdf_path} -> {txt_path}: {e}")
+            if alignment_id:
+                logger.warning(
+                    "docling_pdf_write_failed alignment_id={} basename={} error={}",
+                    alignment_id,
+                    base,
+                    str(e)[:300],
+                )
             continue
         txt_paths.append(txt_path)
+        if alignment_id:
+            logger.info(
+                "docling_pdf_convert_ok alignment_id={} basename={} mode={} chars={}",
+                alignment_id,
+                base,
+                mode,
+                len(text),
+            )
 
-    if allowed_pdf_basenames is not None and attempted == 0:
+    if allowed_pdf_basenames is not None and attempted == 0 and not txt_paths:
         logger.info("No PDFs selected for Docling conversion from manifest filter")
         return []
 
@@ -263,7 +439,9 @@ def _eligible_pdf_basenames(
 
 def _convert_alignment_sync(req: ConvertAlignmentRequest) -> ConvertAlignmentResponse:
     allowed = _load_docling_required_pdf_basenames(req.evaluation_manifest_path)
-    txt_paths = _convert_pdfs_to_text(req.pdf_dir, req.papers_dir, allowed)
+    txt_paths = _convert_pdfs_to_text(
+        req.pdf_dir, req.papers_dir, allowed, req.alignment_id
+    )
     logger.info(
         f"Docling node converted {len(txt_paths)} PDFs for {req.alignment_id} "
         f"into {req.papers_dir}"
@@ -307,9 +485,22 @@ def _async_worker_loop() -> None:
             converted_total = 0
             for idx, chunk in enumerate(chunks, start=1):
                 converted = _convert_pdfs_to_text(
-                    req.pdf_dir, req.papers_dir, set(chunk)
+                    req.pdf_dir,
+                    req.papers_dir,
+                    set(chunk),
+                    req.alignment_id,
                 )
                 converted_total += len(converted)
+                logger.info(
+                    "docling_chunk_summary alignment_id={} chunk={}/{} "
+                    "chunk_pdfs={} txt_paths_returned={} cumulative_txt_paths={}",
+                    req.alignment_id,
+                    idx,
+                    len(chunks),
+                    len(chunk),
+                    len(converted),
+                    converted_total,
+                )
                 with _ASYNC_LOCK:
                     job = _ASYNC_JOBS.get(job_id) or {}
                     job["chunks_total"] = len(chunks)
@@ -436,8 +627,11 @@ def convert_alignment_status(job_id: str) -> Dict[str, Any]:
 
 
 @app.get("/healthz")
-def healthz() -> Dict[str, str]:
-    return {"status": "ok", "detail": "ready"}
+def healthz() -> Dict[str, Any]:
+    out: Dict[str, Any] = {"status": "ok", "detail": "ready"}
+    if _DOC_CONVERTER_INFO:
+        out["docling"] = dict(_DOC_CONVERTER_INFO)
+    return out
 
 
 if __name__ == "__main__":
