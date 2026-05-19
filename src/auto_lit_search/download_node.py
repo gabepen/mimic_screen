@@ -6,14 +6,17 @@ Run inside the lit-download container with env: DATA_ROOT, PAPER_IDS_PATH, GPU_H
 import csv
 import json
 import os
+import re
 import sys
+import tempfile
+import threading
 import time
 from typing import Any, Dict, List, Tuple
 
 import requests
 from loguru import logger
 
-from auto_lit_search.collect import download_papers_to_dir
+from auto_lit_search.collect import _extract_doi_from_identifier, download_papers_to_dir
 
 logger.remove()
 logger.add(
@@ -21,6 +24,170 @@ logger.add(
     level=os.environ.get("LOG_LEVEL", "INFO"),
     format="<green>{time:HH:mm:ss}</green> | <level>{level:<7}</level> | {message}",
 )
+
+DOWNLOAD_MANIFEST_FILENAME = "download_manifest.jsonl"
+
+
+def _only_download_progress_log(record: Dict[str, Any]) -> bool:
+    return record["extra"].get("download_progress") is True
+
+
+def _paper_pair_key(paper_id: str, source: str) -> Tuple[str, str]:
+    return (str(paper_id).strip(), str(source).strip())
+
+
+def _load_download_manifest(manifest_path: str) -> Dict[Tuple[str, str], Dict[str, Any]]:
+    out: Dict[Tuple[str, str], Dict[str, Any]] = {}
+    if not manifest_path or not os.path.isfile(manifest_path):
+        return out
+    try:
+        with open(manifest_path, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    rec = json.loads(line)
+                except Exception:
+                    continue
+                pid = str(rec.get("paper_id") or "").strip()
+                src = str(rec.get("source") or "").strip()
+                if not pid:
+                    continue
+                out[_paper_pair_key(pid, src)] = rec
+    except Exception:
+        return out
+    return out
+
+
+def _manifest_file_stem(row: Dict[str, Any]) -> str:
+    stem = str(row.get("file_stem") or "").strip()
+    if stem:
+        return stem
+    tp = str(row.get("text_path") or "").strip()
+    if tp:
+        return os.path.splitext(os.path.basename(tp))[0]
+    pp = str(row.get("pdf_path") or "").strip()
+    if pp:
+        return os.path.splitext(os.path.basename(pp))[0]
+    return ""
+
+
+def _manifest_row_satisfied(row: Dict[str, Any], papers_dir: str) -> bool:
+    st = str(row.get("status") or "").strip().lower()
+    if st == "failed":
+        return False
+    if st == "skipped":
+        return True
+    stem = _manifest_file_stem(row)
+    if not stem:
+        return False
+    txt_path = os.path.join(papers_dir, f"{stem}.txt")
+    if os.path.isfile(txt_path) and os.path.getsize(txt_path) > 0:
+        return True
+    if st == "partial":
+        pdf_path = os.path.join(papers_dir, "pdf", f"{stem}.pdf")
+        return os.path.isfile(pdf_path) and os.path.getsize(pdf_path) > 0
+    return False
+
+
+def _download_record_to_manifest_row(rec: Any, updated_at: float) -> Dict[str, Any]:
+    d = getattr(rec, "details", None) or {}
+    doi = d.get("doi") or _extract_doi_from_identifier(getattr(rec, "paper_id", "") or "")
+    stem = str(d.get("file_stem") or "").strip()
+    if not stem:
+        tp = getattr(rec, "text_path", None) or ""
+        if tp:
+            stem = os.path.splitext(os.path.basename(str(tp)))[0]
+    if not stem:
+        pp = getattr(rec, "pdf_path", None) or ""
+        if pp:
+            stem = os.path.splitext(os.path.basename(str(pp)))[0]
+    return {
+        "paper_id": getattr(rec, "paper_id", "") or "",
+        "source": getattr(rec, "source", "") or "",
+        "doi": doi or "",
+        "file_stem": stem,
+        "status": getattr(rec, "status", "") or "",
+        "selected_text_source": str(d.get("selected_text_source") or ""),
+        "pdf_docling_required": bool(d.get("pdf_docling_required")),
+        "text_path": getattr(rec, "text_path", None) or "",
+        "pdf_path": getattr(rec, "pdf_path", None) or "",
+        "message": getattr(rec, "message", None) or "",
+        "updated_at": updated_at,
+    }
+
+
+def _merge_recs_into_manifest(
+    existing: Dict[Tuple[str, str], Dict[str, Any]], recs: List[Any]
+) -> Dict[Tuple[str, str], Dict[str, Any]]:
+    merged = dict(existing)
+    ts = time.time()
+    for rec in recs:
+        key = _paper_pair_key(getattr(rec, "paper_id", ""), getattr(rec, "source", ""))
+        merged[key] = _download_record_to_manifest_row(rec, ts)
+    return merged
+
+
+def _write_download_manifest_atomic(
+    manifest_path: str, rows_by_key: Dict[Tuple[str, str], Dict[str, Any]]
+) -> None:
+    d = os.path.dirname(manifest_path) or "."
+    os.makedirs(d, exist_ok=True)
+    keys = sorted(rows_by_key.keys(), key=lambda k: (k[0], k[1]))
+    fd, tmp = tempfile.mkstemp(
+        prefix=".download_manifest_", suffix=".tmp", dir=d, text=True
+    )
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as wf:
+            for k in keys:
+                wf.write(json.dumps(rows_by_key[k], ensure_ascii=False) + "\n")
+        os.replace(tmp, manifest_path)
+    except Exception:
+        try:
+            os.unlink(tmp)
+        except Exception:
+            pass
+        raise
+
+
+def _emit_download_progress_summary(
+    alignment_id: str,
+    expected: List[Tuple[str, str]],
+    manifest_map: Dict[Tuple[str, str], Dict[str, Any]],
+    papers_dir: str,
+    phase: str,
+) -> List[Tuple[str, str]]:
+    total = len(expected)
+    satisfied = 0
+    missing: List[Tuple[str, str]] = []
+    for pid, src in expected:
+        key = _paper_pair_key(pid, src)
+        row = manifest_map.get(key)
+        if row and _manifest_row_satisfied(row, papers_dir):
+            satisfied += 1
+        else:
+            missing.append((pid, src))
+    cap = 20
+    parts: List[str] = []
+    for pid, src in missing[:cap]:
+        doi = _extract_doi_from_identifier(pid) or pid
+        parts.append(f"{doi}:{src}")
+    tail = ""
+    if len(missing) > cap:
+        tail = f" …(+{len(missing) - cap} more)"
+    preview = ",".join(parts) + tail
+    logger.bind(download_progress=True).info(
+        "alignment_download_summary alignment_id={} phase={} total_expected={} "
+        "satisfied={} missing_count={} missing_preview=[{}]",
+        alignment_id,
+        phase,
+        total,
+        satisfied,
+        len(missing),
+        preview,
+    )
+    return missing
 
 
 def _load_search_json(path: str) -> Dict[str, List[Dict[str, Any]]]:
@@ -223,6 +390,7 @@ def _submit_docling_async(
     submit_timeout: int,
 ) -> str:
     deadline = time.monotonic() + max(1, submit_timeout)
+    sleep_seconds = 2
     while True:
         try:
             r = session.post(
@@ -236,13 +404,23 @@ def _submit_docling_async(
             if not job_id:
                 raise RuntimeError("docling async submit returned empty job_id")
             return job_id
+        except (
+            requests.exceptions.ReadTimeout,
+            requests.exceptions.ConnectTimeout,
+            requests.exceptions.ConnectionError,
+        ):
+            if time.monotonic() >= deadline:
+                raise
+            time.sleep(sleep_seconds)
+            sleep_seconds = min(sleep_seconds * 2, 15)
         except requests.exceptions.HTTPError as e:
             resp = getattr(e, "response", None)
             if resp is None or resp.status_code != 429:
                 raise
             if time.monotonic() >= deadline:
                 raise
-            time.sleep(2)
+            time.sleep(sleep_seconds)
+            sleep_seconds = min(sleep_seconds * 2, 15)
 
 
 def _docling_status_once(
@@ -256,6 +434,17 @@ def _docling_status_once(
     )
     r.raise_for_status()
     return r.json()
+
+
+def _canonical_alignment_text_key(fname: str) -> str:
+    """Map source-tagged names to one canonical key for dedupe/logging."""
+    low = fname.lower()
+    if not low.endswith(".txt"):
+        return low
+    m = re.match(r"^(.*__(?:query|target))(?:__[^.]*)?\.txt$", low)
+    if m:
+        return f"{m.group(1)}.txt"
+    return low
 
 
 def run(
@@ -386,12 +575,43 @@ def run(
     scheduler_state_dir = os.path.join(logs_base, "scheduler_state")
     os.makedirs(scheduler_state_dir, exist_ok=True)
 
+    if os.environ.get("DOWNLOAD_PROGRESS_LOG", "1").strip().lower() not in (
+        "0",
+        "false",
+        "no",
+    ):
+        _p_path = (
+            os.environ.get("DOWNLOAD_PROGRESS_LOG_PATH", "").strip()
+            or os.path.join(logs_base, "download_progress.log")
+        )
+        try:
+            os.makedirs(os.path.dirname(_p_path) or ".", exist_ok=True)
+            logger.add(
+                _p_path,
+                level="INFO",
+                format="{time:YYYY-MM-DD HH:mm:ss} | {level} | {message}",
+                filter=_only_download_progress_log,
+                enqueue=True,
+            )
+        except Exception as e:
+            logger.warning("Could not add download_progress log sink: {}", e)
+
     session = requests.Session()
+    # Docling/grader polling runs on a background thread; use a separate Session
+    # because requests.Session is not documented as thread-safe.
+    scheduler_session = requests.Session()
+    # Avoid stale pooled connections through NATs / proxies (intermittent
+    # ConnectionResetError on status polls when the lock previously wrapped HTTP).
+    scheduler_session.headers["Connection"] = "close"
     pmcid_cache: Dict[str, str | None] = {}
+    scheduler_lock = threading.Lock()
     total_done = 0
     failed_count = 0
     docling_inflight_cap = max(1, int(os.environ.get("DOCLING_INFLIGHT_CAP", "1")))
     grader_inflight_cap = max(1, int(os.environ.get("GRADER_INFLIGHT_CAP", "1")))
+    docling_submit_max_attempts = max(
+        1, int(os.environ.get("DOCLING_SUBMIT_MAX_ATTEMPTS", "4"))
+    )
     scheduler_tick_seconds = max(
         1, int(os.environ.get("SCHEDULER_TICK_SECONDS", "5"))
     )
@@ -433,18 +653,24 @@ def run(
                 return False
         return True
 
+    def _papers_dir_has_nonempty_txt(papers_dir: str) -> bool:
+        if not papers_dir or not os.path.isdir(papers_dir):
+            return False
+        for fname in os.listdir(papers_dir):
+            if not fname.endswith(".txt"):
+                continue
+            p = os.path.join(papers_dir, fname)
+            if os.path.isfile(p) and os.path.getsize(p) > 0:
+                return True
+        return False
+
     def _is_grader_ready(st: Dict[str, Any]) -> bool:
         if _outputs_done(st["alignment_id"]):
             return False
         papers_dir = str(st.get("papers_dir") or "")
-        if not os.path.isdir(papers_dir):
+        if not _papers_dir_has_nonempty_txt(papers_dir):
             return False
-        has_text = any(
-            fname.endswith(".txt")
-            for fname in os.listdir(papers_dir)
-            if os.path.isfile(os.path.join(papers_dir, fname))
-        )
-        return has_text and _required_docling_txt_done(st)
+        return _required_docling_txt_done(st)
 
     def _infer_docling_required_basenames_from_disk(papers_dir: str) -> List[str]:
         """Best-effort resume helper when a prior run already downloaded artifacts."""
@@ -452,7 +678,7 @@ def run(
         if not os.path.isdir(pdf_dir):
             return []
         txt_basenames = {
-            os.path.splitext(fname)[0]
+            os.path.splitext(_canonical_alignment_text_key(fname))[0]
             for fname in os.listdir(papers_dir)
             if fname.endswith(".txt")
             and os.path.isfile(os.path.join(papers_dir, fname))
@@ -491,81 +717,158 @@ def run(
 
     def _poll_inflight() -> None:
         nonlocal total_done, failed_count
-        for aid, meta in list(docling_inflight.items()):
-            st = alignment_states.get(aid)
-            if not st:
-                docling_inflight.pop(aid, None)
-                continue
-            if time.monotonic() - float(meta.get("started_monotonic", 0)) > stage_watchdog_seconds:
-                st["state"] = STATE_FAILED
-                st["last_error"] = "docling watchdog timeout"
-                failed_count += 1
-                docling_inflight.pop(aid, None)
-                _write_state(aid)
-                continue
-            try:
-                status = _docling_status_once(session, docling_url_base, meta["job_id"])
-            except Exception:
-                continue
-            s = str(status.get("status") or "").strip().lower()
-            if s not in {"succeeded", "failed"}:
-                continue
-            docling_inflight.pop(aid, None)
-            if s == "failed":
-                st["state"] = STATE_FAILED
-                st["last_error"] = str(status.get("error") or "docling failed")
-                failed_count += 1
-            elif _outputs_done(aid):
-                st["state"] = STATE_DONE
-                total_done += 1
-            elif _is_grader_ready(st):
-                st["state"] = STATE_GRADER_READY
-            else:
-                st["state"] = STATE_FAILED
-                st["last_error"] = "docling succeeded but package not grader-ready"
-                failed_count += 1
-            _write_state(aid)
+        docling_poll: List[Tuple[str, str]] = []
+        with scheduler_lock:
+            for aid, meta in list(docling_inflight.items()):
+                st = alignment_states.get(aid)
+                if not st:
+                    docling_inflight.pop(aid, None)
+                    continue
+                if time.monotonic() - float(meta.get("started_monotonic", 0)) > stage_watchdog_seconds:
+                    st["state"] = STATE_FAILED
+                    st["last_error"] = "docling watchdog timeout"
+                    failed_count += 1
+                    docling_inflight.pop(aid, None)
+                    _write_state(aid)
+                    continue
+                jid = str(meta.get("job_id") or "").strip()
+                if jid:
+                    docling_poll.append((aid, jid))
 
-        for aid, meta in list(grader_inflight.items()):
-            st = alignment_states.get(aid)
-            if not st:
-                grader_inflight.pop(aid, None)
-                continue
-            if time.monotonic() - float(meta.get("started_monotonic", 0)) > stage_watchdog_seconds:
-                st["state"] = STATE_FAILED
-                st["last_error"] = "grader watchdog timeout"
-                failed_count += 1
-                grader_inflight.pop(aid, None)
-                _write_state(aid)
-                continue
+        for aid, job_id in docling_poll:
             try:
-                status = _grader_status_once(session, grader_url_base, meta["job_id"])
+                status = _docling_status_once(
+                    scheduler_session, docling_url_base, job_id
+                )
+            except Exception as e:
+                with scheduler_lock:
+                    meta2 = docling_inflight.get(aid)
+                    if not meta2 or str(meta2.get("job_id")) != job_id:
+                        continue
+                    errs = int(meta2.get("status_errors", 0)) + 1
+                    meta2["status_errors"] = errs
+                    if errs == 1 or errs % 5 == 0:
+                        logger.warning(
+                            "Alignment {} docling status poll failed (job_id={}, errors={}): {}",
+                            aid,
+                            job_id,
+                            errs,
+                            e,
+                        )
+                continue
+
+            s = str(status.get("status") or "").strip().lower()
+            with scheduler_lock:
+                meta2 = docling_inflight.get(aid)
+                if not meta2 or str(meta2.get("job_id")) != job_id:
+                    continue
+                meta2["status_errors"] = 0
+                if s not in {"succeeded", "failed"}:
+                    continue
+                st = alignment_states.get(aid)
+                if not st:
+                    docling_inflight.pop(aid, None)
+                    continue
+                docling_inflight.pop(aid, None)
+                if s == "failed":
+                    st["state"] = STATE_FAILED
+                    st["last_error"] = str(status.get("error") or "docling failed")
+                    failed_count += 1
+                elif _outputs_done(aid):
+                    st["state"] = STATE_DONE
+                    total_done += 1
+                elif _is_grader_ready(st):
+                    st["state"] = STATE_GRADER_READY
+                else:
+                    pd = str(st.get("papers_dir") or "")
+                    missing_txt: List[str] = []
+                    for b in st.get("docling_required_basenames") or []:
+                        tp = os.path.join(pd, f"{b}.txt")
+                        if not (os.path.isfile(tp) and os.path.getsize(tp) > 0):
+                            missing_txt.append(b)
+                    if _papers_dir_has_nonempty_txt(pd):
+                        st["state"] = STATE_GRADER_READY
+                        if missing_txt:
+                            logger.warning(
+                                "Alignment {}: docling succeeded but {} required basenames "
+                                "still lack non-empty .txt (sample={}); "
+                                "proceeding to grader with partial text",
+                                aid,
+                                len(missing_txt),
+                                missing_txt[:12],
+                            )
+                    else:
+                        st["state"] = STATE_FAILED
+                        st["last_error"] = "docling succeeded but package not grader-ready"
+                        failed_count += 1
+                        logger.error(
+                            "Alignment {}: docling finished but not grader-ready "
+                            "(expected non-empty {{base}}.txt for each docling_required basename; "
+                            "missing count={}, sample={})",
+                            aid,
+                            len(missing_txt),
+                            missing_txt[:12],
+                        )
+                _write_state(aid)
+
+        grader_poll: List[Tuple[str, str]] = []
+        with scheduler_lock:
+            for aid, meta in list(grader_inflight.items()):
+                st = alignment_states.get(aid)
+                if not st:
+                    grader_inflight.pop(aid, None)
+                    continue
+                if time.monotonic() - float(meta.get("started_monotonic", 0)) > stage_watchdog_seconds:
+                    st["state"] = STATE_FAILED
+                    st["last_error"] = "grader watchdog timeout"
+                    failed_count += 1
+                    grader_inflight.pop(aid, None)
+                    _write_state(aid)
+                    continue
+                gj = str(meta.get("job_id") or "").strip()
+                if gj:
+                    grader_poll.append((aid, gj))
+
+        for aid, job_id in grader_poll:
+            try:
+                status = _grader_status_once(
+                    scheduler_session, grader_url_base, job_id
+                )
             except Exception:
                 continue
             s = str(status.get("status") or "").strip().lower()
-            if s not in {"succeeded", "failed"}:
-                continue
-            grader_inflight.pop(aid, None)
-            if s == "failed":
-                st["state"] = STATE_FAILED
-                st["last_error"] = str(status.get("error") or "grader failed")
-                failed_count += 1
-            elif _outputs_done(aid):
-                st["state"] = STATE_DONE
-                total_done += 1
-            else:
-                st["state"] = STATE_FAILED
-                st["last_error"] = "grader succeeded but results file missing"
-                failed_count += 1
-            _write_state(aid)
+            with scheduler_lock:
+                meta2 = grader_inflight.get(aid)
+                if not meta2 or str(meta2.get("job_id")) != job_id:
+                    continue
+                if s not in {"succeeded", "failed"}:
+                    continue
+                st = alignment_states.get(aid)
+                if not st:
+                    grader_inflight.pop(aid, None)
+                    continue
+                grader_inflight.pop(aid, None)
+                if s == "failed":
+                    st["state"] = STATE_FAILED
+                    st["last_error"] = str(status.get("error") or "grader failed")
+                    failed_count += 1
+                elif _outputs_done(aid):
+                    st["state"] = STATE_DONE
+                    total_done += 1
+                else:
+                    st["state"] = STATE_FAILED
+                    st["last_error"] = "grader succeeded but results file missing"
+                    failed_count += 1
+                _write_state(aid)
 
     def _dispatch_docling() -> None:
         if not docling_url_base:
             return
-        if len(docling_inflight) >= docling_inflight_cap:
-            return
+        with scheduler_lock:
+            if len(docling_inflight) >= docling_inflight_cap:
+                return
         if not _wait_service_capacity(
-            session=session,
+            session=scheduler_session,
             base_url=docling_url_base,
             endpoint="docling_capacity",
             service_name="Docling",
@@ -574,35 +877,82 @@ def run(
             warn_on_timeout=False,
         ):
             return
-        for aid, st in alignment_states.items():
-            if st.get("state") != STATE_DOCLING_PENDING:
-                continue
-            try:
-                job_id = _submit_docling_async(
-                    session=session,
-                    docling_url_base=docling_url_base,
-                    payload=st["docling_payload"],
-                    submit_timeout=30,
+        pending_aid: str | None = None
+        pending_payload: Dict[str, Any] | None = None
+        submit_attempt = 0
+        with scheduler_lock:
+            for aid, st in alignment_states.items():
+                if st.get("state") != STATE_DOCLING_PENDING:
+                    continue
+                submit_attempt = int(st.get("docling_submit_attempt", 0)) + 1
+                st["docling_submit_attempt"] = submit_attempt
+                pending_aid = aid
+                pending_payload = st["docling_payload"]
+                break
+        if not pending_aid or pending_payload is None:
+            return
+        try:
+            job_id = _submit_docling_async(
+                session=scheduler_session,
+                docling_url_base=docling_url_base,
+                payload=pending_payload,
+                submit_timeout=30,
+            )
+        except Exception as e:
+            with scheduler_lock:
+                st = alignment_states.get(pending_aid)
+                if not st or st.get("state") != STATE_DOCLING_PENDING:
+                    return
+                st["last_error"] = (
+                    f"docling submit failed (attempt {submit_attempt}): {e}"
                 )
-                st["state"] = STATE_DOCLING_INFLIGHT
-                st["docling_job_id"] = job_id
-                st["docling_submitted_at"] = time.time()
-                docling_inflight[aid] = {
-                    "job_id": job_id,
-                    "started_monotonic": time.monotonic(),
-                }
-                _write_state(aid)
-            except Exception as e:
-                st["state"] = STATE_FAILED
-                st["last_error"] = f"docling submit failed: {e}"
-                _write_state(aid)
-            break
+                if submit_attempt >= docling_submit_max_attempts:
+                    st["state"] = STATE_FAILED
+                    logger.error(
+                        "Alignment {}: docling submit exhausted after {} attempts: {}",
+                        pending_aid,
+                        submit_attempt,
+                        e,
+                    )
+                else:
+                    st["state"] = STATE_DOCLING_PENDING
+                    logger.warning(
+                        "Alignment {}: docling submit failed (attempt {}/{}), will retry: {}",
+                        pending_aid,
+                        submit_attempt,
+                        docling_submit_max_attempts,
+                        e,
+                    )
+                _write_state(pending_aid)
+            return
+
+        with scheduler_lock:
+            st = alignment_states.get(pending_aid)
+            if not st or st.get("state") != STATE_DOCLING_PENDING:
+                return
+            st["state"] = STATE_DOCLING_INFLIGHT
+            st["docling_job_id"] = job_id
+            st["docling_submitted_at"] = time.time()
+            docling_inflight[pending_aid] = {
+                "job_id": job_id,
+                "started_monotonic": time.monotonic(),
+                "status_errors": 0,
+            }
+            logger.info(
+                "Alignment {}: docling submitted (attempt={}, job_id={}, host={})",
+                pending_aid,
+                submit_attempt,
+                job_id,
+                docling_url_base,
+            )
+            _write_state(pending_aid)
 
     def _dispatch_grader() -> None:
-        if len(grader_inflight) >= grader_inflight_cap:
-            return
+        with scheduler_lock:
+            if len(grader_inflight) >= grader_inflight_cap:
+                return
         if not _wait_service_capacity(
-            session=session,
+            session=scheduler_session,
             base_url=grader_url_base,
             endpoint="grader_capacity",
             service_name="Grader",
@@ -611,34 +961,79 @@ def run(
             warn_on_timeout=False,
         ):
             return
-        for aid, st in alignment_states.items():
-            if st.get("state") != STATE_GRADER_READY:
-                continue
-            try:
-                job_id = _submit_grader_async(
-                    session=session,
-                    grader_url_base=grader_url_base,
-                    payload=st["grader_payload"],
-                    submit_timeout=30,
-                )
-                st["state"] = STATE_GRADER_INFLIGHT
-                st["grader_job_id"] = job_id
-                st["grader_submitted_at"] = time.time()
-                grader_inflight[aid] = {
-                    "job_id": job_id,
-                    "started_monotonic": time.monotonic(),
-                }
-                _write_state(aid)
-            except Exception as e:
-                st["state"] = STATE_FAILED
-                st["last_error"] = f"grader submit failed: {e}"
-                _write_state(aid)
-            break
+        pending_aid: str | None = None
+        pending_payload: Dict[str, Any] | None = None
+        with scheduler_lock:
+            for aid, st in alignment_states.items():
+                if st.get("state") != STATE_GRADER_READY:
+                    continue
+                pending_aid = aid
+                pending_payload = st["grader_payload"]
+                break
+        if not pending_aid or pending_payload is None:
+            return
+        try:
+            job_id = _submit_grader_async(
+                session=scheduler_session,
+                grader_url_base=grader_url_base,
+                payload=pending_payload,
+                submit_timeout=30,
+            )
+        except Exception as e:
+            with scheduler_lock:
+                st = alignment_states.get(pending_aid)
+                if st and st.get("state") == STATE_GRADER_READY:
+                    st["state"] = STATE_FAILED
+                    st["last_error"] = f"grader submit failed: {e}"
+                    _write_state(pending_aid)
+            return
+
+        with scheduler_lock:
+            st = alignment_states.get(pending_aid)
+            if not st or st.get("state") != STATE_GRADER_READY:
+                return
+            st["state"] = STATE_GRADER_INFLIGHT
+            st["grader_job_id"] = job_id
+            st["grader_submitted_at"] = time.time()
+            grader_inflight[pending_aid] = {
+                "job_id": job_id,
+                "started_monotonic": time.monotonic(),
+            }
+            logger.info(
+                "Alignment {}: async grader job submitted (job_id={})",
+                pending_aid,
+                job_id,
+            )
+            _write_state(pending_aid)
 
     def _tick_scheduler() -> None:
         _poll_inflight()
         _dispatch_docling()
         _dispatch_grader()
+
+    scheduler_stop = threading.Event()
+
+    def _bg_scheduler_loop() -> None:
+        logger.info(
+            "download_node: background Docling/Grader scheduler (tick every {}s); "
+            "main thread only registers alignments after each collect",
+            scheduler_tick_seconds,
+        )
+        while not scheduler_stop.is_set():
+            try:
+                _tick_scheduler()
+            except Exception:
+                logger.exception("Background scheduler tick failed")
+            if scheduler_stop.wait(timeout=float(scheduler_tick_seconds)):
+                break
+        logger.info("download_node: background scheduler loop exited")
+
+    bg_scheduler_thread = threading.Thread(
+        target=_bg_scheduler_loop,
+        name="lit-docling-grader-scheduler",
+        daemon=True,
+    )
+    bg_scheduler_thread.start()
 
     for query_id, alignments in data.items():
         if not isinstance(alignments, list):
@@ -678,7 +1073,68 @@ def run(
                     for fname in os.listdir(existing_pdf_dir)
                 )
                 can_resume_from_disk = bool(existing_txt or existing_pdf) and not no_cache
-                if can_resume_from_disk:
+                manifest_path = os.path.join(papers_dir, DOWNLOAD_MANIFEST_FILENAME)
+                manifest_map = _load_download_manifest(manifest_path)
+                _emit_download_progress_summary(
+                    alignment_id,
+                    paper_ids_src,
+                    manifest_map,
+                    papers_dir,
+                    "before_collect",
+                )
+                missing_pre: List[Tuple[str, str]] = []
+                for pid, src in paper_ids_src:
+                    key = _paper_pair_key(pid, src)
+                    row = manifest_map.get(key)
+                    if row is None or not _manifest_row_satisfied(row, papers_dir):
+                        missing_pre.append((pid, src))
+
+                if no_cache:
+                    logger.info(
+                        "Alignment {}: no_cache re-downloading all {} papers",
+                        alignment_id,
+                        len(paper_ids_src),
+                    )
+                    recs = download_papers_to_dir(
+                        paper_ids_src,
+                        papers_dir,
+                        session=session,
+                        pmcid_cache=pmcid_cache,
+                        no_cache=True,
+                        force_pdfs=True,
+                        prefer_pdf_text=True,
+                        collection_org=collection_org,
+                        auth_scope=collection_auth_scope,
+                        collector_email=collector_email or None,
+                        max_workers=collect_max_workers,
+                        disable_semantic_scholar=collect_disable_s2,
+                    )
+                    manifest_map = _merge_recs_into_manifest({}, recs)
+                    _write_download_manifest_atomic(manifest_path, manifest_map)
+                elif missing_pre:
+                    logger.info(
+                        "Alignment {}: collecting {} missing papers ({} already satisfied)",
+                        alignment_id,
+                        len(missing_pre),
+                        len(paper_ids_src) - len(missing_pre),
+                    )
+                    recs = download_papers_to_dir(
+                        missing_pre,
+                        papers_dir,
+                        session=session,
+                        pmcid_cache=pmcid_cache,
+                        no_cache=no_cache,
+                        force_pdfs=True,
+                        prefer_pdf_text=True,
+                        collection_org=collection_org,
+                        auth_scope=collection_auth_scope,
+                        collector_email=collector_email or None,
+                        max_workers=collect_max_workers,
+                        disable_semantic_scholar=collect_disable_s2,
+                    )
+                    manifest_map = _merge_recs_into_manifest(manifest_map, recs)
+                    _write_download_manifest_atomic(manifest_path, manifest_map)
+                elif can_resume_from_disk:
                     docling_required_basenames = _infer_docling_required_basenames_from_disk(
                         papers_dir
                     )
@@ -686,13 +1142,17 @@ def run(
                     has_pdf = existing_pdf
                     recs = []
                     logger.info(
-                        "Alignment {} reusing existing artifacts (txt={} pending_docling={}): skipping re-download",
+                        "Alignment {} reusing existing artifacts (txt={} pending_docling={}): download manifest complete",
                         alignment_id,
                         len(existing_txt),
                         n_docling_required,
                     )
                 else:
-                    logger.info(f"Downloading {len(paper_ids_src)} papers for {alignment_id}")
+                    logger.info(
+                        "Downloading {} papers for {}",
+                        len(paper_ids_src),
+                        alignment_id,
+                    )
                     recs = download_papers_to_dir(
                         paper_ids_src,
                         papers_dir,
@@ -700,24 +1160,42 @@ def run(
                         pmcid_cache=pmcid_cache,
                         no_cache=no_cache,
                         force_pdfs=True,
-                        prefer_pdf_text=False,
+                        prefer_pdf_text=True,
                         collection_org=collection_org,
                         auth_scope=collection_auth_scope,
                         collector_email=collector_email or None,
                         max_workers=collect_max_workers,
                         disable_semantic_scholar=collect_disable_s2,
                     )
-                    has_pdf = any(r.pdf_path for r in recs)
-                    n_docling_required = sum(
-                        1 for r in recs if ((r.details or {}).get("pdf_docling_required"))
+                    manifest_map = _merge_recs_into_manifest(manifest_map, recs)
+                    _write_download_manifest_atomic(manifest_path, manifest_map)
+
+                if recs:
+                    has_pdf = any(r.pdf_path for r in recs) or existing_pdf
+                    from_recs = {
+                        os.path.splitext(os.path.basename(str(r.pdf_path)))[0]
+                        for r in recs
+                        if ((r.details or {}).get("pdf_docling_required")) and r.pdf_path
+                    }
+                    from_disk = set(
+                        _infer_docling_required_basenames_from_disk(papers_dir)
                     )
-                    docling_required_basenames = sorted(
-                        {
-                            os.path.splitext(os.path.basename(str(r.pdf_path)))[0]
-                            for r in recs
-                            if ((r.details or {}).get("pdf_docling_required")) and r.pdf_path
-                        }
+                    docling_required_basenames = sorted(from_recs | from_disk)
+                    n_docling_required = len(docling_required_basenames)
+                elif not already_done:
+                    docling_required_basenames = _infer_docling_required_basenames_from_disk(
+                        papers_dir
                     )
+                    n_docling_required = len(docling_required_basenames)
+                    has_pdf = existing_pdf
+
+                _emit_download_progress_summary(
+                    alignment_id,
+                    paper_ids_src,
+                    manifest_map,
+                    papers_dir,
+                    "after_collect",
+                )
             query_meta = al.get("query_meta")
             target_meta = al.get("target_meta")
             gene_context: Dict[str, Any] | None = None
@@ -734,18 +1212,62 @@ def run(
 
             eval_manifest_path = os.path.join(papers_dir, "docling_eval_manifest.jsonl")
             try:
-                with open(eval_manifest_path, "w", encoding="utf-8") as mf:
-                    for rrec in recs:
-                        mf.write(
-                            json.dumps(
-                                {
-                                    "paper_id": rrec.paper_id,
-                                    "pdf_path": rrec.pdf_path,
-                                    "details": rrec.details or {},
-                                }
+                if recs:
+                    # Manifest must list every basename in docling_required_basenames, not only
+                    # rows from this collect. from_disk can add PDFs already on disk that still
+                    # need Docling; omitting them leaves the Docling filter incomplete while the
+                    # scheduler still waits on those .txt files (no GRADER_READY, no grader POST).
+                    pdf_dir_m = os.path.join(papers_dir, "pdf")
+                    seen_pdf_bases: set[str] = set()
+                    with open(eval_manifest_path, "w", encoding="utf-8") as mf:
+                        for rrec in recs:
+                            mf.write(
+                                json.dumps(
+                                    {
+                                        "paper_id": rrec.paper_id,
+                                        "pdf_path": rrec.pdf_path,
+                                        "details": rrec.details or {},
+                                    }
+                                )
+                                + "\n"
                             )
-                            + "\n"
-                        )
+                            pp = rrec.pdf_path
+                            if pp:
+                                seen_pdf_bases.add(
+                                    os.path.splitext(os.path.basename(str(pp)))[0]
+                                )
+                        for base in docling_required_basenames:
+                            if base in seen_pdf_bases:
+                                continue
+                            pdf_path = os.path.join(pdf_dir_m, f"{base}.pdf")
+                            mf.write(
+                                json.dumps(
+                                    {
+                                        "paper_id": base,
+                                        "pdf_path": pdf_path,
+                                        "details": {"pdf_docling_required": True},
+                                    }
+                                )
+                                + "\n"
+                            )
+                elif docling_required_basenames:
+                    # Resume path: recs is empty but disk still has PDFs needing Docling.
+                    # Rewrite manifest so Docling's filter matches docling_required_basenames
+                    # (stale JSONL with no pdf_docling_required rows used to break GRADER_READY).
+                    pdf_dir_m = os.path.join(papers_dir, "pdf")
+                    with open(eval_manifest_path, "w", encoding="utf-8") as mf:
+                        for base in docling_required_basenames:
+                            pdf_path = os.path.join(pdf_dir_m, f"{base}.pdf")
+                            mf.write(
+                                json.dumps(
+                                    {
+                                        "paper_id": base,
+                                        "pdf_path": pdf_path,
+                                        "details": {"pdf_docling_required": True},
+                                    }
+                                )
+                                + "\n"
+                            )
             except Exception as e:
                 logger.warning(
                     f"Alignment {alignment_id}: could not write docling manifest: {e}"
@@ -807,19 +1329,38 @@ def run(
                     "updated_at": time.time(),
                 },
             )
-            alignment_states[alignment_id] = state_obj
-            _write_state(alignment_id)
-            _tick_scheduler()
+            with scheduler_lock:
+                alignment_states[alignment_id] = state_obj
+                _write_state(alignment_id)
 
     while True:
-        _tick_scheduler()
-        terminal = {STATE_DONE, STATE_FAILED}
-        non_terminal = [
-            st for st in alignment_states.values() if st.get("state") not in terminal
-        ]
-        if not non_terminal and not docling_inflight and not grader_inflight:
+        with scheduler_lock:
+            terminal = {STATE_DONE, STATE_FAILED}
+            non_terminal = [
+                st for st in alignment_states.values()
+                if st.get("state") not in terminal
+            ]
+            docling_n = len(docling_inflight)
+            grader_n = len(grader_inflight)
+        if not non_terminal and docling_n == 0 and grader_n == 0:
             break
         time.sleep(scheduler_tick_seconds)
+
+    scheduler_stop.set()
+    join_timeout = max(600.0, 2.0 * float(stage_watchdog_seconds))
+    bg_scheduler_thread.join(timeout=join_timeout)
+    if bg_scheduler_thread.is_alive():
+        logger.error(
+            "Background scheduler thread still alive after {:.0f}s join; "
+            "skipping final on-main drain to avoid racing a stuck tick",
+            join_timeout,
+        )
+    else:
+        try:
+            with scheduler_lock:
+                _tick_scheduler()
+        except Exception:
+            logger.exception("Final scheduler drain failed")
 
     logger.info(
         "Scheduler complete: done={} failed={} total={}",
