@@ -1,10 +1,12 @@
 import json
 import os
+import re
 import threading
 import time
 import uuid
 from collections import deque
-from typing import Any, Dict, List, Optional, Tuple
+from dataclasses import dataclass
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import requests
 from fastapi import FastAPI, HTTPException
@@ -16,6 +18,7 @@ from auto_lit_search.analysis_packet import (
     RunAlignmentGradedRequest,
     RunAlignmentResponse,
 )
+from auto_lit_search.paper_names import load_paper_id_lookup, resolve_paper_id
 
 app = FastAPI(title="auto_lit_search Grader node")
 
@@ -26,6 +29,7 @@ _ASYNC_JOBS: Dict[str, Dict[str, Any]] = {}
 _ASYNC_QUEUE: "deque[Tuple[str, GradeAlignmentRequest]]" = deque()
 _ASYNC_LOCK = threading.Lock()
 _ASYNC_WORKER_STARTED = False
+_GRADER_LLM_JSONL_LOCK = threading.Lock()
 
 
 def _env_positive_float(name: str, default: float) -> float:
@@ -86,7 +90,37 @@ def _list_paper_files(papers_dir: str) -> List[str]:
         for f in files
         if "__query" in f.lower() or "__target" in f.lower()
     ]
-    return labeled if labeled else files
+    selected = labeled if labeled else files
+    if not labeled:
+        return selected
+
+    # Dedupe provider-tagged variants (e.g., __target__unpaywall.txt) against
+    # canonical role files (e.g., __target.txt).
+    grouped: Dict[str, List[str]] = {}
+    for f in selected:
+        low = f.lower()
+        m = re.match(r"^(.*__(?:query|target))(?:__[^.]*)?\.txt$", low)
+        key = f"{m.group(1)}.txt" if m else low
+        grouped.setdefault(key, []).append(f)
+
+    deduped: List[str] = []
+    for key in sorted(grouped.keys()):
+        candidates = grouped[key]
+        canonical = [
+            c
+            for c in candidates
+            if c.lower().endswith("__query.txt") or c.lower().endswith("__target.txt")
+        ]
+        suffixed = [c for c in candidates if c not in canonical]
+        # Prefer provider-suffixed variants first (typically PDF->text conversion),
+        # then fall back to canonical unsuffixed role files.
+        if suffixed:
+            deduped.append(sorted(suffixed)[0])
+        elif canonical:
+            deduped.append(sorted(canonical)[0])
+        else:
+            deduped.append(sorted(candidates)[0])
+    return deduped
 
 
 def _read_text(path: str, max_chars: int = MAX_PAPER_CHARS) -> str:
@@ -203,13 +237,44 @@ def _post_chat_completion(
     return r
 
 
+@dataclass
+class GraderLLMCallResult:
+    content: str
+    prompt_char_len: int
+    requested_model: str
+    finish_reason: Optional[str] = None
+    usage: Optional[Dict[str, Any]] = None
+    n_choices: int = 0
+    response_id: Optional[str] = None
+    response_model: Optional[str] = None
+    http_status: Optional[int] = None
+
+
+def _append_grader_llm_jsonl(output_root: str, alignment_id: str, record: Dict[str, Any]) -> None:
+    if not output_root or not str(output_root).strip():
+        return
+    logs_dir = os.path.join(output_root, "logs")
+    path = os.path.join(logs_dir, f"{alignment_id}_grader_llm.jsonl")
+    row = dict(record)
+    row.setdefault("ts_iso", time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()))
+    line = json.dumps(row, ensure_ascii=False) + "\n"
+    with _GRADER_LLM_JSONL_LOCK:
+        _ensure_dir(logs_dir)
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(line)
+
+
 def _call_llm(
     user_content: str,
     base_url: str,
     max_tokens: int,
     temperature: float,
     log_context: str = "",
-) -> str:
+    *,
+    emit_event: Optional[Callable[[Dict[str, Any]], None]] = None,
+    log_static: Optional[Dict[str, Any]] = None,
+) -> GraderLLMCallResult:
+    prompt_char_len = len(user_content)
     configured = (os.environ.get("VLLM_MODEL_NAME") or "").strip()
     root_url = base_url.rstrip("/")
     api_base = root_url
@@ -229,20 +294,115 @@ def _call_llm(
     backoff_base = _env_positive_float("VLLM_GRADER_RETRY_BACKOFF_SEC", 45.0)
     backoff_cap = _env_positive_float("VLLM_GRADER_RETRY_BACKOFF_CAP_SEC", 180.0)
 
+    def _emit_http_event(
+        *,
+        data: Dict[str, Any],
+        http_status: int,
+        content: str,
+        http_attempt: int,
+    ) -> None:
+        if emit_event is None:
+            return
+        choices = data.get("choices") or []
+        n_ch = len(choices) if isinstance(choices, list) else 0
+        fr: Optional[str] = None
+        if n_ch and isinstance(choices[0], dict):
+            fr = str(choices[0].get("finish_reason") or "") or None
+        ev: Dict[str, Any] = {
+            **(log_static or {}),
+            "log_context": log_context or None,
+            "phase": "chat_completion",
+            "prompt_char_len": prompt_char_len,
+            "max_tokens": max_tokens,
+            "temperature": temperature,
+            "requested_model": model_id,
+            "response_model": data.get("model"),
+            "response_id": data.get("id"),
+            "response_created": data.get("created"),
+            "system_fingerprint": data.get("system_fingerprint"),
+            "finish_reason": fr,
+            "usage": data.get("usage"),
+            "n_choices": n_ch,
+            "http_status": http_status,
+            "http_attempt_index": http_attempt,
+            "content_char_len": len(content),
+            "content_empty": not content.strip(),
+        }
+        emit_event(ev)
+
     last_exc: Optional[BaseException] = None
     for attempt in range(max_attempts):
         try:
             r = _post_chat_completion(url, payload, timeout, root_url)
-            r.raise_for_status()
-            data = r.json()
+            status = int(r.status_code)
+            try:
+                data = r.json()
+            except Exception:
+                data = {}
+            if not isinstance(data, dict):
+                data = {}
+            try:
+                r.raise_for_status()
+            except requests.HTTPError as e:
+                if emit_event is not None:
+                    emit_event(
+                        {
+                            **(log_static or {}),
+                            "log_context": log_context or None,
+                            "phase": "chat_completion",
+                            "prompt_char_len": prompt_char_len,
+                            "max_tokens": max_tokens,
+                            "temperature": temperature,
+                            "requested_model": model_id,
+                            "http_status": status,
+                            "http_attempt_index": attempt,
+                            "error": str(e),
+                            "response_text_excerpt": (r.text or "")[:2000],
+                        }
+                    )
+                raise
             choices = data.get("choices") or []
+            content = ""
             if choices and isinstance(choices[0], dict):
                 msg = choices[0].get("message") or {}
                 if isinstance(msg, dict):
-                    return str(msg.get("content") or "").strip()
-            return ""
+                    content = str(msg.get("content") or "").strip()
+            _emit_http_event(
+                data=data, http_status=status, content=content, http_attempt=attempt
+            )
+            return GraderLLMCallResult(
+                content=content,
+                prompt_char_len=prompt_char_len,
+                requested_model=model_id,
+                finish_reason=(
+                    str(choices[0].get("finish_reason") or "").strip() or None
+                    if choices and isinstance(choices[0], dict)
+                    else None
+                ),
+                usage=data.get("usage") if isinstance(data.get("usage"), dict) else None,
+                n_choices=len(choices) if isinstance(choices, list) else 0,
+                response_id=str(data.get("id") or "").strip() or None,
+                response_model=str(data.get("model") or "").strip() or None,
+                http_status=status,
+            )
         except (requests.exceptions.ReadTimeout, requests.exceptions.ConnectionError) as e:
             last_exc = e
+            if emit_event is not None:
+                emit_event(
+                    {
+                        **(log_static or {}),
+                        "log_context": log_context or None,
+                        "phase": "chat_completion",
+                        "prompt_char_len": prompt_char_len,
+                        "max_tokens": max_tokens,
+                        "temperature": temperature,
+                        "requested_model": model_id,
+                        "http_attempt_index": attempt,
+                        "error": str(e),
+                        "error_type": type(e).__name__,
+                        "will_retry": attempt + 1 < max_attempts,
+                    }
+                )
             if attempt + 1 >= max_attempts:
                 raise
             wait = min(backoff_base * (2**attempt), backoff_cap)
@@ -258,7 +418,12 @@ def _call_llm(
             time.sleep(wait)
     if last_exc:
         raise last_exc
-    return ""
+    return GraderLLMCallResult(
+        content="",
+        prompt_char_len=prompt_char_len,
+        requested_model=model_id,
+        http_status=None,
+    )
 
 
 def _extract_paper_role(fname: str) -> Optional[str]:
@@ -499,8 +664,14 @@ def _grade_single_paper(
     req: GradeAlignmentRequest,
     rubric: Dict[str, Any],
     llm_base_url: Optional[str],
+    paper_id_lookup: Optional[Tuple[Dict[str, str], Dict[str, str]]] = None,
 ) -> Tuple[GradedPaper, Dict[str, int]]:
     fname = os.path.basename(file_path)
+    by_basename: Dict[str, str] = {}
+    by_stem: Dict[str, str] = {}
+    if paper_id_lookup:
+        by_basename, by_stem = paper_id_lookup
+    canonical_paper_id = resolve_paper_id(fname, by_basename, by_stem)
     role = _extract_paper_role(fname)
     text = _read_text(file_path)
     dims = _rubric_dimensions(rubric)
@@ -552,6 +723,32 @@ def _grade_single_paper(
     repair_attempted = 0
     repair_succeeded = 0
     regrade_retry_used = 0
+
+    def _emit_llm_row(ev: Dict[str, Any]) -> None:
+        row = dict(ev)
+        row.setdefault("alignment_id", req.alignment_id)
+        row.setdefault("file_name", fname)
+        _append_grader_llm_jsonl(req.output_root, req.alignment_id, row)
+
+    excerpt_char_len = len(text)
+    excerpt_in_prompt_chars = min(100000, excerpt_char_len)
+
+    if not llm_base_url or not str(llm_base_url).strip():
+        _emit_llm_row(
+            {
+                "call_kind": "skipped_no_vllm_url",
+                "excerpt_char_len": excerpt_char_len,
+                "excerpt_in_prompt_chars": excerpt_in_prompt_chars,
+            }
+        )
+    elif not text.strip():
+        _emit_llm_row(
+            {
+                "call_kind": "skipped_no_excerpt",
+                "excerpt_char_len": excerpt_char_len,
+                "excerpt_in_prompt_chars": excerpt_in_prompt_chars,
+            }
+        )
     if llm_base_url and text.strip():
         max_tokens = (req.constraints and req.constraints.max_tokens) or 3072
         temperature = (
@@ -577,16 +774,37 @@ def _grade_single_paper(
                 if bad:
                     retry_extra += f"Invalid earlier reply (excerpt):\n{bad}\n"
             try:
-                raw = _call_llm(
+                llm_res = _call_llm(
                     prompt + retry_extra,
                     llm_base_url,
                     max_tokens=max_tokens,
                     temperature=temperature,
                     log_context=fname,
+                    emit_event=_emit_llm_row,
+                    log_static={
+                        "call_kind": "grade",
+                        "grade_attempt": attempt,
+                        "excerpt_char_len": excerpt_char_len,
+                        "excerpt_in_prompt_chars": excerpt_in_prompt_chars,
+                    },
                 )
+                raw = llm_res.content
             except Exception as e:
                 notes = str(e)
                 logger.warning(f"Grader LLM call failed for {fname}: {e}")
+                if not isinstance(e, requests.exceptions.RequestException):
+                    _emit_llm_row(
+                        {
+                            "call_kind": "grade",
+                            "grade_attempt": attempt,
+                            "phase": "client_exception",
+                            "error": str(e),
+                            "error_type": type(e).__name__,
+                            "prompt_char_len": len(prompt + retry_extra),
+                            "excerpt_char_len": excerpt_char_len,
+                            "excerpt_in_prompt_chars": excerpt_in_prompt_chars,
+                        }
+                    )
                 break
             candidate = _strip_markdown_json_fence(raw)
             maybe = _try_parse_grade_json(candidate, dims)
@@ -609,15 +827,36 @@ def _grade_single_paper(
                 )
                 repair_prompt = _build_grade_repair_prompt(raw, dim_names)
                 try:
-                    repaired_raw = _call_llm(
+                    repair_llm = _call_llm(
                         repair_prompt,
                         llm_base_url,
                         max_tokens=min(max_tokens, 2048),
                         temperature=0.0,
                         log_context=f"{fname}::repair",
+                        emit_event=_emit_llm_row,
+                        log_static={
+                            "call_kind": "repair",
+                            "grade_attempt": attempt,
+                            "excerpt_char_len": excerpt_char_len,
+                            "excerpt_in_prompt_chars": excerpt_in_prompt_chars,
+                        },
                     )
+                    repaired_raw = repair_llm.content
                 except Exception as e:
                     logger.warning(f"Grader repair LLM call failed for {fname}: {e}")
+                    if not isinstance(e, requests.exceptions.RequestException):
+                        _emit_llm_row(
+                            {
+                                "call_kind": "repair",
+                                "grade_attempt": attempt,
+                                "phase": "client_exception",
+                                "error": str(e),
+                                "error_type": type(e).__name__,
+                                "prompt_char_len": len(repair_prompt),
+                                "excerpt_char_len": excerpt_char_len,
+                                "excerpt_in_prompt_chars": excerpt_in_prompt_chars,
+                            }
+                        )
                     repaired_raw = ""
                 repaired_candidate = _strip_markdown_json_fence(repaired_raw)
                 repaired = _try_parse_grade_json(repaired_candidate, dims)
@@ -642,7 +881,7 @@ def _grade_single_paper(
     rdim = parsed["rubric_dimension_scores"]
     grade = _compute_relevance_grade(rdim)
     paper = GradedPaper(
-        paper_id=fname,
+        paper_id=canonical_paper_id,
         file_name=fname,
         paper_role=role,
         relevance_grade=_safe_float(grade),
@@ -675,6 +914,7 @@ def _grade_alignment_sync(req: GradeAlignmentRequest) -> RunAlignmentResponse:
     host_rubric = _load_json_file(req.host_rubric_path)
     microbe_rubric = _load_json_file(req.microbe_rubric_path)
     llm_base_url = os.environ.get("VLLM_BASE_URL")
+    paper_id_lookup = load_paper_id_lookup(req.papers_dir)
     graded: List[GradedPaper] = []
     n_repair_attempted = 0
     n_repair_succeeded = 0
@@ -687,6 +927,7 @@ def _grade_alignment_sync(req: GradeAlignmentRequest) -> RunAlignmentResponse:
             req=req,
             rubric=rubric,
             llm_base_url=llm_base_url,
+            paper_id_lookup=paper_id_lookup,
         )
         graded.append(gp)
         n_repair_attempted += int(retry_meta.get("repair_attempted", 0))
@@ -728,6 +969,7 @@ def _grade_alignment_sync(req: GradeAlignmentRequest) -> RunAlignmentResponse:
         "n_repair_attempted": n_repair_attempted,
         "n_repair_succeeded": n_repair_succeeded,
         "n_regrade_retry_used": n_regrade_retry_used,
+        "grader_llm_jsonl": os.path.join("logs", f"{req.alignment_id}_grader_llm.jsonl"),
     }
     with open(graded_path, "w", encoding="utf-8") as f:
         json.dump(

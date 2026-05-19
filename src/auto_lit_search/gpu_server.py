@@ -33,6 +33,31 @@ def _list_paper_files(papers_dir: str) -> List[str]:
     )
 
 
+def _dedupe_labeled_files(files: List[str]) -> List[str]:
+    grouped: Dict[str, List[str]] = {}
+    for f in files:
+        low = f.lower()
+        m = re.match(r"^(.*__(?:query|target))(?:__[^.]*)?\.txt$", low)
+        key = f"{m.group(1)}.txt" if m else low
+        grouped.setdefault(key, []).append(f)
+    out: List[str] = []
+    for key in sorted(grouped.keys()):
+        candidates = grouped[key]
+        canonical = [
+            c
+            for c in candidates
+            if c.lower().endswith("__query.txt") or c.lower().endswith("__target.txt")
+        ]
+        suffixed = [c for c in candidates if c not in canonical]
+        if suffixed:
+            out.append(sorted(suffixed)[0])
+        elif canonical:
+            out.append(sorted(canonical)[0])
+        else:
+            out.append(sorted(candidates)[0])
+    return out
+
+
 def _read_text(path: str, max_chars: int = MAX_PAPER_CHARS) -> str:
     with open(path, "r", encoding="utf-8", errors="replace") as f:
         s = f.read()
@@ -508,7 +533,7 @@ def _run_alignment_impl(req: RunAlignmentRequest) -> RunAlignmentResponse:
         if "__query" in f.lower() or "__target" in f.lower()
     ]
     if labeled:
-        files = labeled
+        files = _dedupe_labeled_files(labeled)
 
     llm_base_url = os.environ.get("VLLM_BASE_URL")
     started_at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
