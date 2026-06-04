@@ -12,11 +12,17 @@ import tempfile
 import threading
 import time
 from typing import Any, Dict, List, Tuple
+from urllib.parse import urlparse
 
 import requests
 from loguru import logger
 
 from auto_lit_search.collect import _extract_doi_from_identifier, download_papers_to_dir
+from auto_lit_search.slurm_utils import (
+    get_job_node,
+    get_job_state,
+    is_terminal_job_state,
+)
 
 logger.remove()
 logger.add(
@@ -26,6 +32,100 @@ logger.add(
 )
 
 DOWNLOAD_MANIFEST_FILENAME = "download_manifest.jsonl"
+_DEFAULT_GRADER_MAX_TOKENS = 8192
+
+
+def _grader_max_tokens_env() -> int:
+    raw = os.environ.get("GRADER_MAX_TOKENS", str(_DEFAULT_GRADER_MAX_TOKENS))
+    try:
+        return max(1, int(str(raw).strip() or _DEFAULT_GRADER_MAX_TOKENS))
+    except (TypeError, ValueError):
+        return _DEFAULT_GRADER_MAX_TOKENS
+
+
+def _refresh_grader_payload_constraints(payload: Dict[str, Any] | None) -> None:
+    """Apply current GRADER_MAX_TOKENS; persisted scheduler state must not pin 4096."""
+    if not payload or not isinstance(payload, dict):
+        return
+    constraints = payload.get("constraints")
+    if not isinstance(constraints, dict):
+        constraints = {}
+        payload["constraints"] = constraints
+    constraints["max_tokens"] = _grader_max_tokens_env()
+
+
+def _normalize_grader_url(entry: str, default_port: int) -> str:
+    """Return http://host:port base URL from a host, host:port, or full URL."""
+    raw = (entry or "").strip().rstrip("/")
+    if not raw:
+        return ""
+    if raw.startswith("http://") or raw.startswith("https://"):
+        return raw
+    if ":" in raw and not raw.startswith("["):
+        host, _, port_s = raw.rpartition(":")
+        if port_s.isdigit():
+            return f"http://{host}:{port_s}"
+    return f"http://{raw}:{default_port}"
+
+
+def _registered_grader_ports(urls: List[str]) -> set[int]:
+    """Ports present in normalized grader base URLs (e.g. 9200..9204)."""
+    from urllib.parse import urlparse
+
+    ports: set[int] = set()
+    for u in urls:
+        p = urlparse(u)
+        if p.port is not None:
+            ports.add(int(p.port))
+    return ports
+
+
+def _prune_grader_pending_specs(
+    pending: List[Dict[str, Any]],
+    registered_urls: List[str],
+) -> int:
+    """
+    Drop Slurm discovery entries whose API port is already listed in GRADER_URLS.
+
+    Returns the number of specs removed.
+    """
+    reg_ports = _registered_grader_ports(registered_urls)
+    if not reg_ports:
+        return 0
+    before = len(pending)
+    kept = [s for s in pending if int(s["port"]) not in reg_ports]
+    pending[:] = kept
+    return before - len(kept)
+
+
+def _resolve_grader_url_bases(grader_host: str, grader_port: int) -> List[str]:
+    """Grader endpoints in priority order: GRADER_URLS, GRADER_HOSTS, single --grader-host."""
+    seen: set[str] = set()
+    out: List[str] = []
+
+    def _add(entry: str) -> None:
+        url = _normalize_grader_url(entry, grader_port)
+        if url and url not in seen:
+            seen.add(url)
+            out.append(url)
+
+    raw_urls = os.environ.get("GRADER_URLS", "").strip()
+    if raw_urls:
+        for part in re.split(r"[;,]", raw_urls):
+            _add(part)
+        if out:
+            return out
+
+    raw_hosts = os.environ.get("GRADER_HOSTS", "").strip()
+    if raw_hosts:
+        for part in raw_hosts.split(","):
+            _add(part)
+        if out:
+            return out
+
+    if grader_host and str(grader_host).strip():
+        _add(str(grader_host).strip())
+    return out
 
 
 def _only_download_progress_log(record: Dict[str, Any]) -> bool:
@@ -261,6 +361,29 @@ def _load_idmap(csv_path: str) -> Dict[str, Dict[str, Any]]:
                 "target_meta": _meta("target"),
             }
     return out
+
+
+def _parse_grader_job_specs(grader_port: int) -> List[Tuple[str, int]]:
+    """Return (slurm_job_id, api_port) pairs from GRADER_JOB_IDS (colon- or comma-separated)."""
+    raw = os.environ.get("GRADER_JOB_IDS", "").strip()
+    if not raw:
+        return []
+    specs: List[Tuple[str, int]] = []
+    # Colon is required for Slurm sbatch --export (commas in values are truncated).
+    for i, part in enumerate(re.split(r"[:,]", raw)):
+        job_id = part.strip()
+        if job_id:
+            specs.append((job_id, grader_port + i))
+    return specs
+
+
+def _grader_health_ok(grader_url_base: str, timeout: int = 5) -> bool:
+    url = f"{grader_url_base.rstrip('/')}/healthz"
+    try:
+        r = requests.get(url, timeout=timeout)
+        return r.status_code == 200
+    except Exception:
+        return False
 
 
 def _wait_health(
@@ -505,21 +628,205 @@ def run(
             "Docling", docling_url_base, timeout=service_health_wait_seconds
         ):
             raise RuntimeError(f"Docling node not healthy at {docling_url_base}")
-    if not grader_host:
-        raise RuntimeError("GRADER_HOST is required for two-stage analysis flow")
+    grader_url_bases = _resolve_grader_url_bases(grader_host, grader_port)
+    if not grader_url_bases and not os.environ.get("GRADER_JOB_IDS", "").strip():
+        raise RuntimeError(
+            "At least one grader endpoint is required (GRADER_URLS, GRADER_HOSTS, "
+            "GRADER_JOB_IDS, or --grader-host)"
+        )
     if not host_rubric_path or not microbe_rubric_path:
         raise RuntimeError(
             "HOST_RUBRIC_PATH and MICROBE_RUBRIC_PATH are required for grading"
         )
-    grader_url_base = f"http://{grader_host}:{grader_port}"
+
+    grader_job_specs = _parse_grader_job_specs(grader_port)
+    grader_discovery_enabled = bool(grader_job_specs)
+    grader_pending_specs: List[Dict[str, Any]] = [
+        {"job_id": jid, "port": port, "failed": False, "failed_logged": False}
+        for jid, port in grader_job_specs
+    ]
+    _pruned = _prune_grader_pending_specs(grader_pending_specs, grader_url_bases)
+    if _pruned:
+        logger.info(
+            "download_node: {} grader Slurm job(s) skipped for discovery "
+            "(ports already in GRADER_URLS: {})",
+            _pruned,
+            sorted(_registered_grader_ports(grader_url_bases)),
+        )
+    _num_grader_nodes_raw = os.environ.get("NUM_GRADER_NODES", "").strip()
+    _num_grader_nodes_want = 0
+    if _num_grader_nodes_raw:
+        try:
+            _num_grader_nodes_want = max(0, int(_num_grader_nodes_raw))
+        except ValueError:
+            _num_grader_nodes_want = 0
+    if grader_job_specs:
+        grader_target = len(grader_job_specs)
+        if _num_grader_nodes_want and grader_target < _num_grader_nodes_want:
+            logger.warning(
+                "download_node: GRADER_JOB_IDS lists {} job(s) but NUM_GRADER_NODES={}; "
+                "check sbatch --export (use colon-separated GRADER_JOB_IDS, not commas)",
+                grader_target,
+                _num_grader_nodes_want,
+            )
+            grader_target = _num_grader_nodes_want
+    elif _num_grader_nodes_want:
+        grader_target = _num_grader_nodes_want
+    else:
+        grader_target = max(1, len(grader_url_bases) or 1)
+    _grader_limit_raw = os.environ.get("GRADER_INFLIGHT_CAP", "").strip()
+    grader_inflight_limit: int | None = None
+    if _grader_limit_raw:
+        try:
+            grader_inflight_limit = max(1, int(_grader_limit_raw))
+        except ValueError:
+            logger.warning(
+                "download_node: invalid GRADER_INFLIGHT_CAP={!r}; ignoring",
+                _grader_limit_raw,
+            )
+    scheduler_lock = threading.Lock()
+
+    def _drop_pending_specs_for_registered_port(port: int) -> None:
+        grader_pending_specs[:] = [
+            s for s in grader_pending_specs if int(s["port"]) != port
+        ]
+
+    def _register_grader_url(url: str, job_id: str = "") -> bool:
+        base = url.rstrip("/")
+        with scheduler_lock:
+            if base in grader_url_bases:
+                return False
+            grader_url_bases.append(base)
+        p = urlparse(base)
+        if p.port is not None:
+            _drop_pending_specs_for_registered_port(int(p.port))
+        logger.info(
+            "download_node: grader endpoint registered (job_id={}, url={})",
+            job_id or "n/a",
+            base,
+        )
+        return True
+
+    def _refresh_grader_endpoints_from_host_file() -> None:
+        """Register endpoints discovered by host-side squeue+curl (see grader_endpoints_discover.sh)."""
+        path = os.environ.get("GRADER_ENDPOINTS_FILE", "").strip()
+        if not path or not os.path.isfile(path):
+            return
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                lines = [ln.strip() for ln in f if ln.strip() and not ln.startswith("#")]
+        except OSError as e:
+            logger.warning(
+                "download_node: could not read GRADER_ENDPOINTS_FILE {}: {}",
+                path,
+                e,
+            )
+            return
+        for line in lines:
+            url = line.split()[0]
+            if url.startswith("http://") or url.startswith("https://"):
+                _register_grader_url(url, "host_discovery")
+
+    def _refresh_grader_endpoints() -> None:
+        _refresh_grader_endpoints_from_host_file()
+        if not grader_pending_specs:
+            return
+        still_pending: List[Dict[str, Any]] = []
+        for spec in grader_pending_specs:
+            if spec.get("failed"):
+                continue
+            jid = str(spec["job_id"])
+            port = int(spec["port"])
+            node = get_job_node(jid)
+            if not node:
+                st = get_job_state(jid)
+                if is_terminal_job_state(st):
+                    if not spec.get("failed_logged"):
+                        logger.warning(
+                            "Grader Slurm job {} entered terminal state {}",
+                            jid,
+                            st,
+                        )
+                        spec["failed_logged"] = True
+                    spec["failed"] = True
+                else:
+                    still_pending.append(spec)
+                continue
+            url = f"http://{node}:{port}".rstrip("/")
+            with scheduler_lock:
+                already_registered = url in grader_url_bases
+            if already_registered:
+                logger.info(
+                    "download_node: grader job {} already served at {}",
+                    jid,
+                    url,
+                )
+                continue
+            if not _grader_health_ok(url):
+                still_pending.append(spec)
+                continue
+            if not _register_grader_url(url, jid):
+                still_pending.append(spec)
+        grader_pending_specs[:] = still_pending
+
+    if grader_discovery_enabled:
+        logger.info(
+            "download_node: dynamic grader discovery enabled ({} Slurm job(s), "
+            "{} URL(s) at startup)",
+            len(grader_job_specs),
+            len(grader_url_bases),
+        )
+        deadline = time.monotonic() + service_health_wait_seconds
+        while time.monotonic() < deadline:
+            _refresh_grader_endpoints()
+            if any(_grader_health_ok(u) for u in grader_url_bases):
+                break
+            time.sleep(5)
+        else:
+            raise RuntimeError(
+                "No grader endpoint became healthy within "
+                f"{service_health_wait_seconds}s (GRADER_JOB_IDS discovery)"
+            )
+        for grader_url_base in grader_url_bases:
+            if not _grader_health_ok(grader_url_base):
+                logger.info(
+                    "download_node: waiting for Grader health at {}",
+                    grader_url_base.rstrip("/"),
+                )
+                if not _wait_health(
+                    "Grader",
+                    grader_url_base,
+                    timeout=min(120, service_health_wait_seconds),
+                    interval=5,
+                ):
+                    logger.warning(
+                        "Grader at {} not healthy yet; will retry via discovery",
+                        grader_url_base,
+                    )
+    else:
+        for grader_url_base in grader_url_bases:
+            logger.info(
+                "download_node: probing Grader health at {}/healthz",
+                grader_url_base.rstrip("/"),
+            )
+            if not _wait_health(
+                "Grader", grader_url_base, timeout=service_health_wait_seconds
+            ):
+                raise RuntimeError(f"Grader node not healthy at {grader_url_base}")
+
+    if grader_discovery_enabled:
+        _refresh_grader_endpoints()
     logger.info(
-        "download_node: probing Grader health at {}/healthz",
-        grader_url_base.rstrip("/"),
+        "download_node: {} grader endpoint(s) active: {}",
+        len(grader_url_bases),
+        ", ".join(grader_url_bases),
     )
-    if not _wait_health(
-        "Grader", grader_url_base, timeout=service_health_wait_seconds
-    ):
-        raise RuntimeError(f"Grader node not healthy at {grader_url_base}")
+    if grader_discovery_enabled and len(grader_url_bases) < grader_target:
+        logger.info(
+            "download_node: waiting for up to {} more grader endpoint(s) via "
+            "GRADER_JOB_IDS discovery",
+            grader_target - len(grader_url_bases),
+        )
 
     instructions_text = instructions
     if instructions_file and os.path.isfile(instructions_file):
@@ -604,19 +911,30 @@ def run(
     # ConnectionResetError on status polls when the lock previously wrapped HTTP).
     scheduler_session.headers["Connection"] = "close"
     pmcid_cache: Dict[str, str | None] = {}
-    scheduler_lock = threading.Lock()
     total_done = 0
     failed_count = 0
     docling_inflight_cap = max(1, int(os.environ.get("DOCLING_INFLIGHT_CAP", "1")))
-    grader_inflight_cap = max(1, int(os.environ.get("GRADER_INFLIGHT_CAP", "1")))
+    logger.info(
+        "download_node: {} grader endpoint(s) at startup, discovery target={}, "
+        "grader parallelism=one alignment per endpoint{}",
+        len(grader_url_bases),
+        grader_target,
+        (
+            f", GRADER_INFLIGHT_CAP={grader_inflight_limit} (manual ceiling)"
+            if grader_inflight_limit is not None
+            else ""
+        ),
+    )
     docling_submit_max_attempts = max(
         1, int(os.environ.get("DOCLING_SUBMIT_MAX_ATTEMPTS", "4"))
     )
     scheduler_tick_seconds = max(
         1, int(os.environ.get("SCHEDULER_TICK_SECONDS", "5"))
     )
+    # Grader and Docling jobs can legitimately run for hours on large packets.
+    # Keep a long watchdog by default; still user-overridable via env.
     stage_watchdog_seconds = max(
-        300, int(os.environ.get("STAGE_WATCHDOG_SECONDS", str(request_timeout)))
+        300, int(os.environ.get("STAGE_WATCHDOG_SECONDS", "14400"))
     )
 
     alignment_states: Dict[str, Dict[str, Any]] = {}
@@ -641,6 +959,27 @@ def run(
                 json.dump(st, f, indent=2)
         except Exception as e:
             logger.warning("Could not write scheduler state for {}: {}", alignment_id, e)
+
+    def _reconcile_outputs_into_state() -> None:
+        """Fix stale FAILED/INFLIGHT states when outputs already exist on disk."""
+        with scheduler_lock:
+            for aid, st in alignment_states.items():
+                if st.get("state") == STATE_DONE:
+                    continue
+                if not _outputs_done(aid):
+                    continue
+                prev = str(st.get("state") or "")
+                st["state"] = STATE_DONE
+                st.pop("last_error", None)
+                st["updated_at"] = time.time()
+                docling_inflight.pop(aid, None)
+                grader_inflight.pop(aid, None)
+                logger.info(
+                    "Alignment {}: outputs present on disk; reconciled state {} -> DONE",
+                    aid,
+                    prev or "UNKNOWN",
+                )
+                _write_state(aid)
 
     def _required_docling_txt_done(st: Dict[str, Any]) -> bool:
         req = st.get("docling_required_basenames") or []
@@ -707,6 +1046,7 @@ def run(
                     state.update(prev)
             except Exception:
                 pass
+        _refresh_grader_payload_constraints(state.get("grader_payload"))
         if _outputs_done(alignment_id):
             state["state"] = STATE_DONE
         elif _is_grader_ready(state):
@@ -811,7 +1151,7 @@ def run(
                         )
                 _write_state(aid)
 
-        grader_poll: List[Tuple[str, str]] = []
+        grader_poll: List[Tuple[str, str, str]] = []
         with scheduler_lock:
             for aid, meta in list(grader_inflight.items()):
                 st = alignment_states.get(aid)
@@ -826,13 +1166,18 @@ def run(
                     _write_state(aid)
                     continue
                 gj = str(meta.get("job_id") or "").strip()
-                if gj:
-                    grader_poll.append((aid, gj))
+                gu = str(
+                    meta.get("grader_url_base")
+                    or st.get("grader_url_base")
+                    or ""
+                ).strip()
+                if gj and gu:
+                    grader_poll.append((aid, gj, gu))
 
-        for aid, job_id in grader_poll:
+        for aid, job_id, poll_grader_url in grader_poll:
             try:
                 status = _grader_status_once(
-                    scheduler_session, grader_url_base, job_id
+                    scheduler_session, poll_grader_url, job_id
                 )
             except Exception:
                 continue
@@ -947,66 +1292,133 @@ def run(
             )
             _write_state(pending_aid)
 
-    def _dispatch_grader() -> None:
+    def _grader_inflight_count_for_url(url: str) -> int:
+        return sum(
+            1
+            for meta in grader_inflight.values()
+            if str(meta.get("grader_url_base") or "") == url
+        )
+
+    def _pick_grader_url_for_dispatch() -> str | None:
+        """Pick a grader endpoint with no inflight alignment and remote queue capacity."""
         with scheduler_lock:
-            if len(grader_inflight) >= grader_inflight_cap:
-                return
-        if not _wait_service_capacity(
-            session=scheduler_session,
-            base_url=grader_url_base,
-            endpoint="grader_capacity",
-            service_name="Grader",
-            timeout_seconds=1,
-            poll_interval_seconds=1,
-            warn_on_timeout=False,
-        ):
-            return
-        pending_aid: str | None = None
-        pending_payload: Dict[str, Any] | None = None
+            candidates = [
+                u
+                for u in grader_url_bases
+                if _grader_inflight_count_for_url(u) < 1
+            ]
+        if not candidates:
+            return None
+        candidates.sort(key=lambda u: (_grader_inflight_count_for_url(u), u))
+        for url in candidates:
+            if _wait_service_capacity(
+                session=scheduler_session,
+                base_url=url,
+                endpoint="grader_capacity",
+                service_name="Grader",
+                timeout_seconds=1,
+                poll_interval_seconds=1,
+                warn_on_timeout=False,
+            ):
+                return url
+        return None
+
+    def _next_grader_ready_alignment() -> Tuple[str | None, Dict[str, Any] | None]:
         with scheduler_lock:
             for aid, st in alignment_states.items():
                 if st.get("state") != STATE_GRADER_READY:
                     continue
-                pending_aid = aid
-                pending_payload = st["grader_payload"]
-                break
-        if not pending_aid or pending_payload is None:
-            return
-        try:
-            job_id = _submit_grader_async(
-                session=scheduler_session,
-                grader_url_base=grader_url_base,
-                payload=pending_payload,
-                submit_timeout=30,
+                payload = st.get("grader_payload")
+                if payload is None:
+                    continue
+                return aid, payload
+        return None, None
+
+    def _dispatch_grader() -> None:
+        """Send GRADER_READY alignments to any endpoint with a free slot and capacity."""
+        max_rounds = max(1, len(grader_url_bases))
+        for _ in range(max_rounds):
+            with scheduler_lock:
+                if not grader_url_bases:
+                    return
+                if (
+                    grader_inflight_limit is not None
+                    and len(grader_inflight) >= grader_inflight_limit
+                ):
+                    return
+            pending_aid, pending_payload = _next_grader_ready_alignment()
+            if not pending_aid or pending_payload is None:
+                return
+            grader_url_base = _pick_grader_url_for_dispatch()
+            if not grader_url_base:
+                return
+            _refresh_grader_payload_constraints(pending_payload)
+            grader_mt = (pending_payload.get("constraints") or {}).get("max_tokens")
+            logger.info(
+                "Alignment {}: grader submit max_tokens={} host={}",
+                pending_aid,
+                grader_mt,
+                grader_url_base,
             )
-        except Exception as e:
+            try:
+                job_id = _submit_grader_async(
+                    session=scheduler_session,
+                    grader_url_base=grader_url_base,
+                    payload=pending_payload,
+                    submit_timeout=30,
+                )
+            except Exception as e:
+                with scheduler_lock:
+                    st = alignment_states.get(pending_aid)
+                    if st and st.get("state") == STATE_GRADER_READY:
+                        st["state"] = STATE_FAILED
+                        st["last_error"] = f"grader submit failed: {e}"
+                        _write_state(pending_aid)
+                return
+
             with scheduler_lock:
                 st = alignment_states.get(pending_aid)
-                if st and st.get("state") == STATE_GRADER_READY:
-                    st["state"] = STATE_FAILED
-                    st["last_error"] = f"grader submit failed: {e}"
-                    _write_state(pending_aid)
-            return
+                if not st or st.get("state") != STATE_GRADER_READY:
+                    continue
+                st["state"] = STATE_GRADER_INFLIGHT
+                st["grader_job_id"] = job_id
+                st["grader_url_base"] = grader_url_base
+                st["grader_submitted_at"] = time.time()
+                grader_inflight[pending_aid] = {
+                    "job_id": job_id,
+                    "grader_url_base": grader_url_base,
+                    "started_monotonic": time.monotonic(),
+                }
+                logger.info(
+                    "Alignment {}: async grader job submitted (job_id={}, host={})",
+                    pending_aid,
+                    job_id,
+                    grader_url_base,
+                )
+                _write_state(pending_aid)
 
-        with scheduler_lock:
-            st = alignment_states.get(pending_aid)
-            if not st or st.get("state") != STATE_GRADER_READY:
-                return
-            st["state"] = STATE_GRADER_INFLIGHT
-            st["grader_job_id"] = job_id
-            st["grader_submitted_at"] = time.time()
-            grader_inflight[pending_aid] = {
-                "job_id": job_id,
-                "started_monotonic": time.monotonic(),
-            }
-            logger.info(
-                "Alignment {}: async grader job submitted (job_id={})",
-                pending_aid,
-                job_id,
-            )
-            _write_state(pending_aid)
+    _discovery_status_tick = 0
 
     def _tick_scheduler() -> None:
+        nonlocal _discovery_status_tick
+        _reconcile_outputs_into_state()
+        n_registered_before = len(grader_url_bases)
+        _refresh_grader_endpoints()
+        if grader_discovery_enabled and grader_pending_specs:
+            _discovery_status_tick += 1
+            if (
+                _discovery_status_tick == 1
+                or _discovery_status_tick % 12 == 0
+                or len(grader_url_bases) > n_registered_before
+            ):
+                logger.info(
+                    "download_node: grader discovery {}/{} endpoint(s) active, "
+                    "{} grading inflight, {} Slurm job(s) still pending",
+                    len(grader_url_bases),
+                    grader_target,
+                    len(grader_inflight),
+                    len(grader_pending_specs),
+                )
         _poll_inflight()
         _dispatch_docling()
         _dispatch_grader()
@@ -1299,12 +1711,14 @@ def run(
                 "papers_dir": papers_dir,
                 "query": query_id,
                 "target_id": target,
-                "constraints": {"max_tokens": max_tokens, "temperature": temperature},
+                "constraints": {
+                    "max_tokens": _grader_max_tokens_env(),
+                    "temperature": temperature,
+                },
                 "instructions": instructions_text
                 or (
-                    "Analyze the paper excerpt for relevance to the genes in this alignment. "
-                    "First give a brief justification (2-4 sentences). "
-                    "Then output a single line: relevance_score=<float between 0 and 1>."
+                    "Grade each paper with the rubric. This pair was selected for structural "
+                    "similarity; infection-naive host pathway overlap can still score positively."
                 ),
                 "output_root": output_root,
                 "host_rubric_path": host_rubric_path,
@@ -1331,6 +1745,17 @@ def run(
             )
             with scheduler_lock:
                 alignment_states[alignment_id] = state_obj
+                if state_obj.get("state") == STATE_GRADER_INFLIGHT:
+                    gj = str(state_obj.get("grader_job_id") or "").strip()
+                    gu = str(
+                        state_obj.get("grader_url_base") or grader_url_bases[0]
+                    ).strip()
+                    if gj and gu:
+                        grader_inflight[alignment_id] = {
+                            "job_id": gj,
+                            "grader_url_base": gu,
+                            "started_monotonic": time.monotonic(),
+                        }
                 _write_state(alignment_id)
 
     while True:

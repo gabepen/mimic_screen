@@ -1,9 +1,11 @@
+import csv
 import json
 import os
 import re
 import threading
 import time
 import uuid
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from collections import deque
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Optional, Tuple
@@ -18,11 +20,10 @@ from auto_lit_search.analysis_packet import (
     RunAlignmentGradedRequest,
     RunAlignmentResponse,
 )
-from auto_lit_search.paper_names import load_paper_id_lookup, resolve_paper_id
-
 app = FastAPI(title="auto_lit_search Grader node")
 
 TEXT_EXTENSIONS = (".txt",)
+DOWNLOAD_MANIFEST_FILENAME = "download_manifest.jsonl"
 MAX_PAPER_CHARS = 120000
 _MODEL_ID_CACHE: Dict[str, str] = {}
 _ASYNC_JOBS: Dict[str, Dict[str, Any]] = {}
@@ -30,6 +31,23 @@ _ASYNC_QUEUE: "deque[Tuple[str, GradeAlignmentRequest]]" = deque()
 _ASYNC_LOCK = threading.Lock()
 _ASYNC_WORKER_STARTED = False
 _GRADER_LLM_JSONL_LOCK = threading.Lock()
+_MODEL_ID_CACHE_LOCK = threading.Lock()
+_DEFAULT_GRADER_MAX_TOKENS = 8192
+_DEFAULT_GRADER_PAPER_WORKERS = 3
+
+
+def _grader_paper_workers() -> int:
+    raw = _env_positive_int("GRADER_PAPER_WORKERS", _DEFAULT_GRADER_PAPER_WORKERS)
+    return max(1, min(16, raw))
+
+
+def _grader_max_tokens(req: GradeAlignmentRequest) -> int:
+    env_cap = _env_positive_int("GRADER_MAX_TOKENS", _DEFAULT_GRADER_MAX_TOKENS)
+    if req.constraints and req.constraints.max_tokens:
+        req_cap = int(req.constraints.max_tokens)
+        # Stale CPU scheduler state often pins 4096; env is the floor for grading.
+        return max(env_cap, req_cap)
+    return env_cap
 
 
 def _env_positive_float(name: str, default: float) -> float:
@@ -76,6 +94,38 @@ def _grader_http_timeout_tuple() -> Tuple[float, float]:
 
 def _ensure_dir(path: str) -> None:
     os.makedirs(path, exist_ok=True)
+
+
+def _paper_id_by_artifact_basename(papers_dir: str) -> Dict[str, str]:
+    """Map artifact basename -> DOI paper_id from download_manifest.jsonl."""
+    path = os.path.join(papers_dir, DOWNLOAD_MANIFEST_FILENAME)
+    out: Dict[str, str] = {}
+    if not os.path.isfile(path):
+        return out
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    rec = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                pid = str(rec.get("doi") or rec.get("paper_id") or "").strip()
+                if not pid:
+                    continue
+                for key in ("text_path", "pdf_path"):
+                    p = str(rec.get(key) or "").strip()
+                    if not p:
+                        continue
+                    base = os.path.basename(p)
+                    out[base] = pid
+                    if base.lower().endswith(".pdf"):
+                        out.setdefault(f"{os.path.splitext(base)[0]}.txt", pid)
+    except OSError:
+        pass
+    return out
 
 
 def _list_paper_files(papers_dir: str) -> List[str]:
@@ -196,9 +246,10 @@ def _rubric_dimensions(rubric: Dict[str, Any]) -> List[Dict[str, Any]]:
 
 
 def _resolve_model_id(base_url: str) -> str:
-    cached = _MODEL_ID_CACHE.get(base_url)
-    if cached:
-        return cached
+    with _MODEL_ID_CACHE_LOCK:
+        cached = _MODEL_ID_CACHE.get(base_url)
+        if cached:
+            return cached
     models_url = f"{base_url.rstrip('/')}/v1/models"
     r = requests.get(models_url, timeout=30)
     r.raise_for_status()
@@ -209,7 +260,8 @@ def _resolve_model_id(base_url: str) -> str:
             if isinstance(model, dict) and model.get("id"):
                 model_id = str(model["id"]).strip()
                 if model_id:
-                    _MODEL_ID_CACHE[base_url] = model_id
+                    with _MODEL_ID_CACHE_LOCK:
+                        _MODEL_ID_CACHE[base_url] = model_id
                     return model_id
     raise RuntimeError(f"Could not resolve model id from {models_url}")
 
@@ -664,14 +716,11 @@ def _grade_single_paper(
     req: GradeAlignmentRequest,
     rubric: Dict[str, Any],
     llm_base_url: Optional[str],
-    paper_id_lookup: Optional[Tuple[Dict[str, str], Dict[str, str]]] = None,
+    paper_id_by_file: Optional[Dict[str, str]] = None,
 ) -> Tuple[GradedPaper, Dict[str, int]]:
     fname = os.path.basename(file_path)
-    by_basename: Dict[str, str] = {}
-    by_stem: Dict[str, str] = {}
-    if paper_id_lookup:
-        by_basename, by_stem = paper_id_lookup
-    canonical_paper_id = resolve_paper_id(fname, by_basename, by_stem)
+    lookup = paper_id_by_file or {}
+    paper_id = lookup.get(fname) or os.path.splitext(fname)[0]
     role = _extract_paper_role(fname)
     text = _read_text(file_path)
     dims = _rubric_dimensions(rubric)
@@ -750,7 +799,7 @@ def _grade_single_paper(
             }
         )
     if llm_base_url and text.strip():
-        max_tokens = (req.constraints and req.constraints.max_tokens) or 3072
+        max_tokens = _grader_max_tokens(req)
         temperature = (
             (req.constraints and req.constraints.temperature)
             if req.constraints is not None
@@ -830,7 +879,7 @@ def _grade_single_paper(
                     repair_llm = _call_llm(
                         repair_prompt,
                         llm_base_url,
-                        max_tokens=min(max_tokens, 2048),
+                        max_tokens=max_tokens,
                         temperature=0.0,
                         log_context=f"{fname}::repair",
                         emit_event=_emit_llm_row,
@@ -881,7 +930,7 @@ def _grade_single_paper(
     rdim = parsed["rubric_dimension_scores"]
     grade = _compute_relevance_grade(rdim)
     paper = GradedPaper(
-        paper_id=canonical_paper_id,
+        paper_id=paper_id,
         file_name=fname,
         paper_role=role,
         relevance_grade=_safe_float(grade),
@@ -899,6 +948,45 @@ def _grade_single_paper(
     }
 
 
+def _write_rubric_score_csvs(
+    alignment_id: str,
+    output_root: str,
+    graded: List[GradedPaper],
+    host_rubric: Dict[str, Any],
+    microbe_rubric: Dict[str, Any],
+) -> Tuple[str, str]:
+    """One CSV per rubric side: rows=papers, columns=axis scores."""
+    _ensure_dir(output_root)
+    host_path = os.path.join(output_root, f"{alignment_id}_host_rubric_scores.csv")
+    microbe_path = os.path.join(output_root, f"{alignment_id}_microbe_rubric_scores.csv")
+    host_axes = [d["name"] for d in _rubric_dimensions(host_rubric)]
+    microbe_axes = [d["name"] for d in _rubric_dimensions(microbe_rubric)]
+    base_cols = ["paper_id", "file_name", "relevance_grade"]
+
+    def _write(path: str, papers: List[GradedPaper], axis_cols: List[str]) -> None:
+        fieldnames = base_cols + axis_cols + ["rationale"]
+        with open(path, "w", encoding="utf-8", newline="") as f:
+            w = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
+            w.writeheader()
+            for gp in papers:
+                row: Dict[str, Any] = {
+                    "paper_id": gp.paper_id,
+                    "file_name": gp.file_name,
+                    "relevance_grade": gp.relevance_grade,
+                    "rationale": (gp.rationale or "")[:2000],
+                }
+                scores = gp.rubric_dimension_scores or {}
+                for ax in axis_cols:
+                    row[ax] = scores.get(ax, "")
+                w.writerow(row)
+
+    host_papers = [g for g in graded if g.paper_role == "target"]
+    microbe_papers = [g for g in graded if g.paper_role == "query"]
+    _write(host_path, host_papers, host_axes)
+    _write(microbe_path, microbe_papers, microbe_axes)
+    return host_path, microbe_path
+
+
 def _grade_alignment_sync(req: GradeAlignmentRequest) -> RunAlignmentResponse:
     if not os.path.isdir(req.papers_dir):
         raise HTTPException(
@@ -914,12 +1002,16 @@ def _grade_alignment_sync(req: GradeAlignmentRequest) -> RunAlignmentResponse:
     host_rubric = _load_json_file(req.host_rubric_path)
     microbe_rubric = _load_json_file(req.microbe_rubric_path)
     llm_base_url = os.environ.get("VLLM_BASE_URL")
-    paper_id_lookup = load_paper_id_lookup(req.papers_dir)
-    graded: List[GradedPaper] = []
-    n_repair_attempted = 0
-    n_repair_succeeded = 0
-    n_regrade_retry_used = 0
-    for fname in files:
+    paper_id_by_file = _paper_id_by_artifact_basename(req.papers_dir)
+    paper_workers = _grader_paper_workers()
+    logger.info(
+        "Grader {}: grading {} papers with {} parallel workers",
+        req.alignment_id,
+        len(files),
+        paper_workers,
+    )
+
+    def _grade_one(fname: str) -> Tuple[str, GradedPaper, Dict[str, int]]:
         role = _extract_paper_role(fname)
         rubric = microbe_rubric if role == "query" else host_rubric
         gp, retry_meta = _grade_single_paper(
@@ -927,12 +1019,41 @@ def _grade_alignment_sync(req: GradeAlignmentRequest) -> RunAlignmentResponse:
             req=req,
             rubric=rubric,
             llm_base_url=llm_base_url,
-            paper_id_lookup=paper_id_lookup,
+            paper_id_by_file=paper_id_by_file,
         )
-        graded.append(gp)
-        n_repair_attempted += int(retry_meta.get("repair_attempted", 0))
-        n_repair_succeeded += int(retry_meta.get("repair_succeeded", 0))
-        n_regrade_retry_used += int(retry_meta.get("regrade_retry_used", 0))
+        return fname, gp, retry_meta
+
+    graded_by_file: Dict[str, GradedPaper] = {}
+    n_repair_attempted = 0
+    n_repair_succeeded = 0
+    n_regrade_retry_used = 0
+    if paper_workers <= 1:
+        for fname in files:
+            _, gp, retry_meta = _grade_one(fname)
+            graded_by_file[fname] = gp
+            n_repair_attempted += int(retry_meta.get("repair_attempted", 0))
+            n_repair_succeeded += int(retry_meta.get("repair_succeeded", 0))
+            n_regrade_retry_used += int(retry_meta.get("regrade_retry_used", 0))
+    else:
+        with ThreadPoolExecutor(max_workers=paper_workers) as pool:
+            futures = {pool.submit(_grade_one, fname): fname for fname in files}
+            for fut in as_completed(futures):
+                fname = futures[fut]
+                try:
+                    fname_out, gp, retry_meta = fut.result()
+                except Exception as e:
+                    logger.exception(
+                        "Grader parallel task failed for {} paper {}: {}",
+                        req.alignment_id,
+                        fname,
+                        e,
+                    )
+                    raise
+                graded_by_file[fname_out] = gp
+                n_repair_attempted += int(retry_meta.get("repair_attempted", 0))
+                n_repair_succeeded += int(retry_meta.get("repair_succeeded", 0))
+                n_regrade_retry_used += int(retry_meta.get("regrade_retry_used", 0))
+    graded = [graded_by_file[fname] for fname in files]
 
     def _parse_fallback_paper(g: GradedPaper) -> bool:
         rax = g.rubric_axis_rationales or {}
@@ -969,8 +1090,18 @@ def _grade_alignment_sync(req: GradeAlignmentRequest) -> RunAlignmentResponse:
         "n_repair_attempted": n_repair_attempted,
         "n_repair_succeeded": n_repair_succeeded,
         "n_regrade_retry_used": n_regrade_retry_used,
+        "grader_paper_workers": paper_workers,
         "grader_llm_jsonl": os.path.join("logs", f"{req.alignment_id}_grader_llm.jsonl"),
     }
+    host_csv, microbe_csv = _write_rubric_score_csvs(
+        req.alignment_id,
+        req.output_root,
+        graded,
+        host_rubric,
+        microbe_rubric,
+    )
+    grading_meta["host_rubric_scores_csv"] = os.path.basename(host_csv)
+    grading_meta["microbe_rubric_scores_csv"] = os.path.basename(microbe_csv)
     with open(graded_path, "w", encoding="utf-8") as f:
         json.dump(
             {
