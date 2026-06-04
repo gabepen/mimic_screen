@@ -19,6 +19,93 @@ app = FastAPI(title="auto_lit_search GPU node")
 TEXT_EXTENSIONS = (".txt",)
 MAX_PAPER_CHARS = 120000
 _MODEL_ID_CACHE: Dict[str, str] = {}
+MIMICRY_QUALIFIERS = ("None", "Minimal", "Some", "High")
+_QUICK_SUMMARY_MIMICRY_LINE = (
+    "- Host manipulation / mimicry likelihood: <None|Minimal|Some|High>"
+)
+
+
+def _env_positive_float(name: str, default: float) -> float:
+    raw = os.environ.get(name)
+    if raw is None or not str(raw).strip():
+        return default
+    try:
+        v = float(str(raw).strip())
+        return v if v > 0 else default
+    except ValueError:
+        return default
+
+
+def _env_positive_int(name: str, default: int) -> int:
+    raw = os.environ.get(name)
+    if raw is None or not str(raw).strip():
+        return default
+    try:
+        v = int(str(raw).strip(), 10)
+        return v if v >= 1 else default
+    except ValueError:
+        return default
+
+
+def _synthesis_pair_context_block() -> str:
+    return (
+        "Pair context (apply to all synthesis steps):\n"
+        "- This query–target pair was selected for structural similarity; do not expect "
+        "papers to report explicit mimicry or direct query–target interaction.\n"
+        "- Semi-positive conclusions are appropriate when the target shows virulence, host "
+        "manipulation, or Legionella exploitation-pathway relevance (host Axis 2), and/or "
+        "the query shows effector / secretion / host-targeting evidence—even if genes are "
+        "never named together.\n"
+        "- Separate literature support for manipulation potential from proof of mimicry.\n\n"
+    )
+
+
+def _max_axis_score(gp: Any) -> float:
+    scores = getattr(gp, "rubric_dimension_scores", None) or {}
+    if not scores:
+        return 0.0
+    return max(float(v) for v in scores.values())
+
+
+def _paper_kept_for_synthesis(gp: Any, min_axis_score: float) -> bool:
+    if float(gp.relevance_grade) > 0.0:
+        return True
+    return _max_axis_score(gp) >= min_axis_score
+
+
+def _float_to_mimicry_qualifier(value: float) -> str:
+    if value <= 0.05:
+        return "None"
+    if value < 0.25:
+        return "Minimal"
+    if value < 0.6:
+        return "Some"
+    return "High"
+
+
+def _infer_mimicry_qualifier_from_graded(graded: List[Any]) -> str:
+    if not graded:
+        return "None"
+    max_grade = max(float(g.relevance_grade) for g in graded)
+    max_axis = max(_max_axis_score(g) for g in graded)
+    n_with_axis = sum(1 for g in graded if _max_axis_score(g) >= 0.25)
+    if max_grade >= 0.5 or (max_axis >= 0.5 and n_with_axis >= 2):
+        return "High"
+    if max_grade >= 0.2 or max_axis >= 0.35 or n_with_axis >= 1:
+        return "Some"
+    if max_grade > 0.0 or max_axis >= 0.15:
+        return "Minimal"
+    return "None"
+
+
+def _normalize_mimicry_qualifier(raw: str) -> Optional[str]:
+    s = (raw or "").strip()
+    if not s:
+        return None
+    for q in MIMICRY_QUALIFIERS:
+        if s.lower() == q.lower():
+            return q
+    return None
 
 
 def _ensure_dir(path: str) -> None:
@@ -365,43 +452,58 @@ def _fallback_synthesis_text(
         return (
             "No graded papers were available for synthesis.\n\n"
             "Quick results summary:\n"
-            "- Likelihood of host manipulation/mimicry (0..1): 0.0\n"
+            f"{_QUICK_SUMMARY_MIMICRY_LINE.replace('<None|Minimal|Some|High>', 'None')}\n"
             "- Best supporting paper(s): none\n"
             "- Main conflicts / uncertainties: No evidence was available."
         )
-    top = sorted(graded, key=lambda g: g.relevance_grade, reverse=True)[:5]
-    best_files = ", ".join(g.file_name for g in top if g.relevance_grade > 0)
+    top = sorted(
+        graded,
+        key=lambda g: (-float(g.relevance_grade), -_max_axis_score(g), g.file_name),
+    )[:5]
+    best_files = ", ".join(
+        g.paper_id or g.file_name
+        for g in top
+        if float(g.relevance_grade) > 0 or _max_axis_score(g) >= 0.25
+    )
     if not best_files:
-        best_files = "none"
+        best_files = top[0].paper_id or top[0].file_name if top else "none"
+    qualifier = _infer_mimicry_qualifier_from_graded(graded)
     max_grade = max(float(g.relevance_grade) for g in graded)
     mean_grade = sum(float(g.relevance_grade) for g in graded) / max(1, len(graded))
-    likelihood = max_grade * 0.7 + mean_grade * 0.3
     return (
-        "Synthesis fallback generated because the LLM returned empty output.\n"
+        "Synthesis fallback generated because the LLM returned empty or invalid output.\n"
         f"Processed {len(graded)} graded papers for {req.alignment_id}. "
         f"Max relevance grade={max_grade:.3f}, mean relevance grade={mean_grade:.3f}.\n\n"
         "Quick results summary:\n"
-        f"- Likelihood of host manipulation/mimicry (0..1): {likelihood:.3f}\n"
+        f"- Host manipulation / mimicry likelihood: {qualifier}\n"
         f"- Best supporting paper(s): {best_files}\n"
-        "- Main conflicts / uncertainties: The synthesis model response was empty, "
-        "so this conclusion is a conservative heuristic from rubric grades."
+        "- Main conflicts / uncertainties: Heuristic qualifier from rubric grades; "
+        "synthesis model did not return a parseable summary."
     )
 
 
 def _parse_quick_results_summary(synthesis_text: str) -> Dict[str, Any]:
     text = synthesis_text or ""
-    likelihood = None
+    qualifier: Optional[str] = None
     best_support = ""
     conflicts = ""
     m = re.search(
-        r"Likelihood of host manipulation/mimicry \(0\.\.1\):\s*([0-9]*\.?[0-9]+)",
+        r"Host manipulation / mimicry likelihood:\s*(\w+)",
         text,
+        re.IGNORECASE,
     )
     if m:
-        try:
-            likelihood = float(m.group(1))
-        except Exception:
-            likelihood = None
+        qualifier = _normalize_mimicry_qualifier(m.group(1))
+    if qualifier is None:
+        m = re.search(
+            r"Likelihood of host manipulation/mimicry \(0\.\.1\):\s*([0-9]*\.?[0-9]+)",
+            text,
+        )
+        if m:
+            try:
+                qualifier = _float_to_mimicry_qualifier(float(m.group(1)))
+            except Exception:
+                qualifier = None
     m = re.search(r"Best supporting paper\(s\):\s*(.+)", text)
     if m:
         best_support = m.group(1).strip()
@@ -409,7 +511,8 @@ def _parse_quick_results_summary(synthesis_text: str) -> Dict[str, Any]:
     if m:
         conflicts = m.group(1).strip()
     return {
-        "likelihood_host_manipulation_mimicry": likelihood,
+        "host_manipulation_mimicry_likelihood": qualifier,
+        "likelihood_host_manipulation_mimicry": qualifier,
         "best_supporting_papers": best_support,
         "main_conflicts_uncertainties": conflicts,
     }
@@ -419,8 +522,8 @@ def _synthesis_output_well_formed(synthesis_text: str) -> bool:
     text = (synthesis_text or "").strip()
     if not text or "Quick results summary:" not in text:
         return False
-    quick = _parse_quick_results_summary(text)
-    return quick.get("likelihood_host_manipulation_mimicry") is not None
+    quick = _parse_quick_results_summary(synthesis_text)
+    return quick.get("host_manipulation_mimicry_likelihood") is not None
 
 
 def _chunk_items(items: List[Any], chunk_size: int) -> List[List[Any]]:
@@ -600,14 +703,20 @@ def _run_alignment_graded_impl(
     if temperature is None:
         temperature = 0.0
 
-    # Filter synthesis inputs to non-zero aggregate relevance.
-    filtered_rule = "relevance_grade > 0.0"
+    min_axis_score = _env_positive_float("SYNTHESIS_MIN_AXIS_SCORE", 0.25)
+    filtered_rule = (
+        f"relevance_grade > 0.0 OR max(axis_score) >= {min_axis_score}"
+    )
     sorted_graded = sorted(
         req.graded_papers,
-        key=lambda g: (-float(g.relevance_grade), g.file_name),
+        key=lambda g: (-float(g.relevance_grade), -_max_axis_score(g), g.file_name),
     )
-    kept_for_synthesis = [gp for gp in sorted_graded if float(gp.relevance_grade) > 0.0]
-    filtered_out = [gp for gp in sorted_graded if float(gp.relevance_grade) <= 0.0]
+    kept_for_synthesis = [
+        gp for gp in sorted_graded if _paper_kept_for_synthesis(gp, min_axis_score)
+    ]
+    filtered_out = [
+        gp for gp in sorted_graded if not _paper_kept_for_synthesis(gp, min_axis_score)
+    ]
 
     # Per-paper axis evidence lines used for batch summarization.
     _per_axis_cap = 700
@@ -641,9 +750,12 @@ def _run_alignment_graded_impl(
 
         batch_prompt = (
             f"{req.instructions}\n\n"
+            f"{_synthesis_pair_context_block()}"
             f"{term_block}\n\n"
             f"Stateful synthesis step: summarize batch {batch_idx}/{len(batches)}.\n"
             "Use prior memory points to keep continuity across batches.\n"
+            "Do not require direct query–target co-mention; summarize pathway and "
+            "effector relevance from rubric axes.\n"
             "Return strict JSON only with keys:\n"
             "- paper_summaries: array of objects with keys "
             "(file_name, summary, important_points, confidence_notes)\n"
@@ -688,15 +800,25 @@ def _run_alignment_graded_impl(
 
     synth_prompt = (
         f"{req.instructions}\n\n"
+        f"{_synthesis_pair_context_block()}"
         f"{term_block}\n\n"
         "You are in final synthesis stage. Use ONLY the accumulated per-paper summaries and "
         "stateful memory points below to produce the final conclusion.\n\n"
         "Instruction: Write a running discussion (plain text, not JSON) that references "
-        "which summarized papers and axis patterns drive confidence or uncertainty.\n\n"
+        "which summarized papers and axis patterns drive confidence or uncertainty. "
+        "Weight host infection_process_relevance and microbe system_relevance even when "
+        "aggregate relevance_grade is low.\n\n"
+        "Assign host manipulation / mimicry likelihood using:\n"
+        "- None: no systematic connection between target biology and microbe manipulation "
+        "or query effector biology in the evidence.\n"
+        "- Minimal: transient or weak pathway overlap only.\n"
+        "- Some: decent rubric axis scores on exploitation pathways and/or effector biology.\n"
+        "- High: strong immediate link between target manipulation pathways and query "
+        "effector/host-targeting biology, or explicit bridge in literature.\n\n"
         "END WITH THIS EXACT SECTION HEADER:\n"
         "Quick results summary:\n"
-        "- Likelihood of host manipulation/mimicry (0..1): <float>\n"
-        "- Best supporting paper(s): <paper file_name(s)>\n"
+        f"{_QUICK_SUMMARY_MIMICRY_LINE}\n"
+        "- Best supporting paper(s): <paper_id or file_name>\n"
         "- Main conflicts / uncertainties: <1-3 sentences>\n\n"
         f"Alignment: {req.alignment_id}\n"
         f"Query={req.query}\n"
@@ -713,8 +835,8 @@ def _run_alignment_graded_impl(
         "Reply with plain text only (not JSON). Keep the running discussion, then end with "
         "this exact header and bullet lines (replace bracketed parts):\n\n"
         "Quick results summary:\n"
-        "- Likelihood of host manipulation/mimicry (0..1): <float>\n"
-        "- Best supporting paper(s): <paper file_name(s)>\n"
+        f"{_QUICK_SUMMARY_MIMICRY_LINE}\n"
+        "- Best supporting paper(s): <paper_id or file_name>\n"
         "- Main conflicts / uncertainties: <1-3 sentences>\n"
     )
     synthesis_text = ""
@@ -746,7 +868,7 @@ def _run_alignment_graded_impl(
                 reason = (
                     "empty synthesis response"
                     if not synthesis_text.strip()
-                    else "missing Quick results summary or unparseable likelihood line"
+                    else "missing Quick results summary or unparseable mimicry qualifier"
                 )
                 logger.warning(
                     f"Synthesis LLM ({req.alignment_id}): {reason}; resubmitting prompt once"
