@@ -237,10 +237,14 @@ def get_elsevier_fulltext_xml(
 ELSEVIER_ARTICLE_DOI_URL = "https://api.elsevier.com/content/article/doi"
 
 
+# ScienceDirect (10.1016) plus ASBMB journals hosted on Elsevier (JBC, MCP, etc.).
+ELSEVIER_DOI_PREFIXES = ("10.1016/", "10.1074/")
+
+
 def is_elsevier_primary_doi(doi: Optional[str]) -> bool:
-    """True for DOIs under Elsevier's main registrant prefix (ScienceDirect)."""
+    """True for DOIs on Elsevier-hosted journals (ScienceDirect and JBC/MCP)."""
     d = (doi or "").strip().lower()
-    return bool(d) and d.startswith("10.1016")
+    return bool(d) and any(d.startswith(prefix) for prefix in ELSEVIER_DOI_PREFIXES)
 
 
 def download_elsevier_article_pdf(

@@ -26,7 +26,6 @@ import requests
 from loguru import logger
 
 try:
-    from .paper_names import artifact_file_stem, artifact_stem_candidates
     from .ucsc_paper_collection_tools import (
         download_elsevier_article_pdf,
         download_asm_article_pdf,
@@ -43,7 +42,6 @@ try:
         is_wiley_primary_doi,
     )
 except ImportError:
-    from paper_names import artifact_file_stem, artifact_stem_candidates
     from ucsc_paper_collection_tools import (
         download_elsevier_article_pdf,
         download_asm_article_pdf,
@@ -335,33 +333,24 @@ class UCSCEmailOnlyProvider(BaseCollectionProvider):
         xml_path: Optional[str] = None
         pdf_path: Optional[str] = None
         text_path: Optional[str] = None
-        safe = artifact_file_stem(paper_id, doi, source, pmcid=pmcid)
+        safe = _doi_file_stem(paper_id, doi, source)
 
         if not context.no_cache:
-            for stem in artifact_stem_candidates(paper_id, doi, source, pmcid):
-                candidate_pdf = os.path.join(context.pdf_dir, f"{stem}.pdf")
-                candidate_text = os.path.join(context.text_dir, f"{stem}.txt")
-                if not pdf_path and os.path.exists(candidate_pdf):
-                    pdf_path = candidate_pdf
-                if (
-                    not text_path
-                    and os.path.exists(candidate_text)
-                    and os.path.getsize(candidate_text) > 0
-                ):
-                    text_path = candidate_text
-                if pdf_path and text_path:
-                    break
+            candidate_pdf = os.path.join(context.pdf_dir, f"{safe}.pdf")
+            candidate_text = os.path.join(context.text_dir, f"{safe}.txt")
+            if os.path.exists(candidate_pdf):
+                pdf_path = candidate_pdf
+            if (
+                os.path.exists(candidate_text)
+                and os.path.getsize(candidate_text) > 0
+            ):
+                text_path = candidate_text
             # Channel-suffixed PDFs (e.g. __unpaywall) from prior runs
-            if not pdf_path:
-                for stem in artifact_stem_candidates(paper_id, doi, source, pmcid):
-                    prefix = stem + "__"
-                    if not os.path.isdir(context.pdf_dir):
-                        break
-                    for fname in os.listdir(context.pdf_dir):
-                        if fname.startswith(prefix) and fname.lower().endswith(".pdf"):
-                            pdf_path = os.path.join(context.pdf_dir, fname)
-                            break
-                    if pdf_path:
+            if not pdf_path and os.path.isdir(context.pdf_dir):
+                prefix = safe + "__"
+                for fname in os.listdir(context.pdf_dir):
+                    if fname.startswith(prefix) and fname.lower().endswith(".pdf"):
+                        pdf_path = os.path.join(context.pdf_dir, fname)
                         break
 
         if pmcid and not text_path:
@@ -394,9 +383,7 @@ class UCSCEmailOnlyProvider(BaseCollectionProvider):
                 source_attempts["europe_pmc"]["success"] = True
                 source_attempts["europe_pmc"]["artifact"] = "pdf"
 
-        # Elsevier full-text XML is only defined for ScienceDirect DOIs; calling
-        # the Article API for unrelated prefixes wastes quota and looks like
-        # "Elsevier always fails" in manifests.
+        # Elsevier Article API: ScienceDirect (10.1016) and ASBMB journals (10.1074).
         if doi and not text_path and is_elsevier_primary_doi(doi):
             if context.throttle:
                 context.throttle.wait("elsevier")
@@ -672,6 +659,12 @@ def _extract_doi_from_identifier(paper_id: str) -> Optional[str]:
     if pid.startswith("10."):
         return pid
     return None
+
+
+def _doi_file_stem(paper_id: str, doi: Optional[str], source: str) -> str:
+    """On-disk stem: DOI with / -> _ plus alignment role (query|target)."""
+    id_base = (doi or _extract_doi_from_identifier(paper_id) or paper_id or "").strip()
+    return f"{id_base.replace('/', '_')}__{source.strip()}"
 
 
 def _extract_title_from_identifier(paper_id: str) -> Optional[str]:
