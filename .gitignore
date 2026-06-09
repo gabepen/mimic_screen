@@ -4,6 +4,9 @@
 **/*.db
 data/nltk_data/corpora/
 
+# publisher tokens (sourced by literature_analysis_launcher.sh)
+.env.publishers
+
 # python cache
 **/__pycache__
 
