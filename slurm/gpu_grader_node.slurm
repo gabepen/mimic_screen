@@ -16,7 +16,7 @@ set -x
 : "${MODEL_DIR:?MODEL_DIR must be set}"
 : "${OUTPUT_ROOT:?OUTPUT_ROOT must be set}"
 : "${GRADER_API_PORT:=9200}"
-: "${GRADER_MAX_TOKENS:=8192}"
+: "${GRADER_MAX_TOKENS:=4096}"
 : "${GRADER_PAPER_WORKERS:=3}"
 : "${VLLM_MAX_NUM_SEQS:=4}"
 : "${GRADER_IMAGE:?GRADER_IMAGE must be set (e.g. docker://user/auto-lit-gpu:latest or path to .sif)}"
@@ -76,6 +76,7 @@ export VLLM_BASE_URL=\"http://127.0.0.1:${VLLM_PORT}\"
 export GRADER_API_PORT=\"${GRADER_API_PORT}\"
 export GRADER_MAX_TOKENS=\"${GRADER_MAX_TOKENS}\"
 export GRADER_PAPER_WORKERS=\"${GRADER_PAPER_WORKERS}\"
+export GRADER_SKIP_SYNTHESIS=\"${GRADER_SKIP_SYNTHESIS:-1}\"
 
 \"\$PY\" -m uvicorn auto_lit_search.grader_server:app --host 0.0.0.0 --port \"${GRADER_API_PORT}\"
 

@@ -20,6 +20,8 @@ from docling.datamodel.base_models import InputFormat
 from docling.datamodel.pipeline_options import PdfPipelineOptions, RapidOcrOptions, ThreadedPdfPipelineOptions
 from docling.document_converter import DocumentConverter, PdfFormatOption
 
+from auto_lit_search.env_config import env_flag
+
 try:
     from docling.pipeline.threaded_standard_pdf_pipeline import ThreadedStandardPdfPipeline
 
@@ -437,6 +439,12 @@ def _eligible_pdf_basenames(
     return out
 
 
+def _call_analysis_enabled(req: ConvertAlignmentRequest) -> bool:
+    if not env_flag("DOCLING_ENABLE_CALL_ANALYSIS", False):
+        return False
+    return bool(req.call_analysis)
+
+
 def _convert_alignment_sync(req: ConvertAlignmentRequest) -> ConvertAlignmentResponse:
     allowed = _load_docling_required_pdf_basenames(req.evaluation_manifest_path)
     txt_paths = _convert_pdfs_to_text(
@@ -447,7 +455,7 @@ def _convert_alignment_sync(req: ConvertAlignmentRequest) -> ConvertAlignmentRes
         f"into {req.papers_dir}"
     )
     results_path = ""
-    if req.call_analysis:
+    if _call_analysis_enabled(req):
         results_path = _call_analysis_node(req)
     return ConvertAlignmentResponse(
         status="ok",
@@ -509,7 +517,7 @@ def _async_worker_loop() -> None:
                     _ASYNC_JOBS[job_id] = job
                 _best_effort_free_memory()
             results_path = ""
-            if req.call_analysis:
+            if _call_analysis_enabled(req):
                 results_path = _call_analysis_node(req)
             with _ASYNC_LOCK:
                 job = _ASYNC_JOBS.get(job_id) or {}
