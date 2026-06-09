@@ -90,7 +90,19 @@ def _node_from_scontrol_job(raw: str) -> str | None:
     return None
 
 
+def _try_get_node_name(job_id: str) -> str | None:
+    """Return allocated node name if the job already has one, else None."""
+    try:
+        raw = _scontrol_show_job(job_id)
+        return _node_from_scontrol_job(raw)
+    except Exception:
+        return None
+
+
 def _get_node_name(job_id: str, max_wait: int = 12 * 60 * 60) -> str | None:
+    node = _try_get_node_name(job_id)
+    if node:
+        return node
     start = time.monotonic()
     while time.monotonic() - start < max_wait:
         try:
@@ -189,7 +201,13 @@ def main() -> int:
         "--grader-port",
         type=int,
         default=9200,
-        help="Port for grader GPU service",
+        help="Base port for grader GPU services (instance i uses grader-port + i)",
+    )
+    p.add_argument(
+        "--num-grader-nodes",
+        type=int,
+        default=int(os.environ.get("NUM_GRADER_NODES", "1")),
+        help="Number of parallel grader GPU jobs (one alignment per grader at a time)",
     )
     p.add_argument(
         "--instructions-file",
@@ -304,6 +322,12 @@ def main() -> int:
     if not os.path.isfile(grader_script):
         print(f"Grader script not found: {grader_script}", file=sys.stderr)
         return 1
+    if args.num_grader_nodes < 1:
+        print("--num-grader-nodes must be >= 1", file=sys.stderr)
+        return 1
+    if args.num_grader_nodes > 1 and args.grader_port + args.num_grader_nodes - 1 > 65535:
+        print("grader-port + num-grader-nodes - 1 exceeds 65535", file=sys.stderr)
+        return 1
     if not os.path.isfile(args.paper_ids):
         print(f"Paper IDs file not found: {args.paper_ids}", file=sys.stderr)
         return 1
@@ -335,20 +359,7 @@ def main() -> int:
     docling_job_id = _sbatch(docling_script, docling_env, log_path=docling_log)
     print(f"Submitted Docling GPU job: {docling_job_id}")
 
-    # Launch Grader GPU node.
-    grader_env = {
-        "DATA_ROOT": args.data_root,
-        "MODEL_DIR": args.model_dir,
-        "OUTPUT_ROOT": output_root,
-        "GRADER_API_PORT": str(args.grader_port),
-        "GRADER_IMAGE": grader_image,
-        "REPO_ROOT": repo_root,
-    }
-    grader_log = os.path.join(logs_root, "auto_lit_grader_%j.log")
-    grader_job_id = _sbatch(grader_script, grader_env, log_path=grader_log)
-    print(f"Submitted Grader GPU job: {grader_job_id}")
-
-    # Launch LLM GPU node.
+    # LLM before graders so synthesis GPU is not stuck behind grader queue depth.
     gpu_env = {
         "DATA_ROOT": args.data_root,
         "MODEL_DIR": args.model_dir,
@@ -357,14 +368,35 @@ def main() -> int:
         "GPU_IMAGE": gpu_image,
         "REPO_ROOT": repo_root,
     }
-
     gpu_log = os.path.join(logs_root, "auto_lit_gpu_%j.log")
     gpu_job_id = _sbatch(gpu_script, gpu_env, log_path=gpu_log)
     print(f"Submitted LLM GPU job: {gpu_job_id}")
 
+    # Launch one or more Grader GPU nodes (distinct API ports when colocated on one host).
+    grader_job_ids: list[str] = []
+    for i in range(args.num_grader_nodes):
+        grader_port_i = args.grader_port + i
+        grader_env = {
+            "DATA_ROOT": args.data_root,
+            "MODEL_DIR": args.model_dir,
+            "OUTPUT_ROOT": output_root,
+            "GRADER_API_PORT": str(grader_port_i),
+            "GRADER_IMAGE": grader_image,
+            "REPO_ROOT": repo_root,
+            "GRADER_SKIP_SYNTHESIS": "1",
+        }
+        grader_log = os.path.join(logs_root, f"auto_lit_grader_{i}_%j.log")
+        grader_job_id = _sbatch(grader_script, grader_env, log_path=grader_log)
+        grader_job_ids.append(grader_job_id)
+        print(
+            f"Submitted Grader GPU job {i + 1}/{args.num_grader_nodes}: "
+            f"{grader_job_id} (port {grader_port_i})"
+        )
+
     gpu_host = None
     docling_host = None
     grader_host = None
+    grader_urls: list[str] = []
     if not args.no_wait:
         print("Waiting for LLM GPU job to run and get node name...")
         gpu_host = _get_node_name(gpu_job_id)
@@ -386,18 +418,25 @@ def main() -> int:
         else:
             print(f"Docling node: {docling_host}")
 
-        print("Waiting for Grader GPU job to run and get node name...")
-        grader_host = _get_node_name(grader_job_id)
-        if not grader_host:
+        print(
+            f"Waiting for first Grader GPU job ({grader_job_ids[0]}) to get a node name "
+            f"({len(grader_job_ids)} grader job(s) submitted; others discovered at runtime)..."
+        )
+        host = _get_node_name(grader_job_ids[0])
+        port = args.grader_port
+        if not host:
             print(
-                "Could not get Grader node name; submit CPU job manually with GRADER_HOST set.",
+                f"Could not get Grader node name for job {grader_job_ids[0]}; "
+                "submit CPU job manually with GRADER_URLS / GRADER_JOB_IDS set.",
                 file=sys.stderr,
             )
         else:
-            print(f"Grader node: {grader_host}")
+            grader_urls.append(f"http://{host}:{port}")
+            print(f"Grader node 1 (initial): {host}:{port}")
+            grader_host = host
     else:
         print(
-            "Not waiting for GPU/Docling nodes. Set GPU_HOST, DOCLING_HOST, and GRADER_HOST when "
+            "Not waiting for GPU/Docling nodes. Set GPU_HOST, DOCLING_HOST, and GRADER_URLS when "
             "submitting CPU job manually."
         )
 
@@ -424,6 +463,11 @@ def main() -> int:
         "DOCLING_API_PORT": str(args.docling_port),
         "GRADER_HOST": grader_host or "",
         "GRADER_API_PORT": str(args.grader_port),
+        # Semicolon-separated: commas break sbatch --export and are ambiguous in URLs.
+        "GRADER_URLS": ";".join(grader_urls),
+        # Colon-separated: sbatch --export splits on commas and would truncate job lists.
+        "GRADER_JOB_IDS": ":".join(grader_job_ids),
+        "NUM_GRADER_NODES": str(args.num_grader_nodes),
         "HOST_RUBRIC_PATH": os.path.abspath(args.host_rubric_path),
         "MICROBE_RUBRIC_PATH": os.path.abspath(args.microbe_rubric_path),
         "COLLECTION_ORG": args.collection_org,
@@ -441,8 +485,10 @@ def main() -> int:
 
     cpu_env.update(_publisher_env_from_os())
 
-    if gpu_host and docling_host and grader_host:
-        dep = f"{gpu_job_id}:{docling_job_id}:{grader_job_id}"
+    grader_hosts_ready = len(grader_urls) >= 1
+    if gpu_host and docling_host and grader_hosts_ready:
+        dep_ids = [gpu_job_id, docling_job_id, grader_job_ids[0]]
+        dep = ":".join(dep_ids)
         cpu_log = os.path.join(logs_root, "auto_lit_cpu_%j.log")
         cpu_job_id = _sbatch(
             cpu_script,
@@ -451,13 +497,16 @@ def main() -> int:
             dependency_kind="after",
             log_path=cpu_log,
         )
-        print(f"Submitted CPU job (after GPU+Docling+Grader start): {cpu_job_id}")
+        print(
+            f"Submitted CPU job (after GPU+Docling+first Grader start): {cpu_job_id}"
+        )
     else:
         print(
             "GPU and/or Docling and/or Grader node name not available. Submit the CPU job manually "
             "after all GPU jobs are RUNNING:"
         )
-        print(f"  squeue -j {gpu_job_id},{docling_job_id},{grader_job_id}   # then note the NODELIST values")
+        all_gpu_jobs = ",".join([gpu_job_id, docling_job_id, *grader_job_ids])
+        print(f"  squeue -j {all_gpu_jobs}   # then note the NODELIST values")
         export_str = (
             f"DATA_ROOT={args.data_root},"
             f"PAPER_IDS_PATH={os.path.abspath(args.paper_ids)},"
@@ -466,8 +515,11 @@ def main() -> int:
             f"GPU_API_PORT={args.gpu_port},"
             f"DOCLING_HOST=<DOCLING_NODELIST>,"
             f"DOCLING_API_PORT={args.docling_port},"
-            f"GRADER_HOST=<GRADER_NODELIST>,"
+            f"GRADER_URLS=<http://host0:{args.grader_port}>,"
+            f"GRADER_JOB_IDS=<job_id:job_id:...>,"
+            f"GRADER_HOST=<FIRST_GRADER_HOST>,"
             f"GRADER_API_PORT={args.grader_port},"
+            f"NUM_GRADER_NODES={args.num_grader_nodes},"
             f"HOST_RUBRIC_PATH={os.path.abspath(args.host_rubric_path)},"
             f"MICROBE_RUBRIC_PATH={os.path.abspath(args.microbe_rubric_path)},"
             f"COLLECTION_ORG={args.collection_org},"
@@ -485,8 +537,9 @@ def main() -> int:
         _extra = _publisher_env_from_os()
         if _extra:
             export_str += "," + ",".join(f"{k}={v}" for k, v in _extra.items())
+        first_grader = grader_job_ids[0] if grader_job_ids else "<GRADER_JOB_ID>"
         print(
-            f"  sbatch --dependency=after:{gpu_job_id}:{docling_job_id}:{grader_job_id} "
+            f"  sbatch --dependency=after:{gpu_job_id}:{docling_job_id}:{first_grader} "
             f"--export=ALL,{export_str} {cpu_script}"
         )
 
