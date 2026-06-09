@@ -18,6 +18,8 @@ import requests
 from loguru import logger
 
 from auto_lit_search.collect import _extract_doi_from_identifier, download_papers_to_dir
+from auto_lit_search.graded_request import build_run_alignment_graded_request
+from auto_lit_search.scheduler_http import post_run_alignment_graded
 from auto_lit_search.slurm_utils import (
     get_job_node,
     get_job_state,
@@ -32,7 +34,7 @@ logger.add(
 )
 
 DOWNLOAD_MANIFEST_FILENAME = "download_manifest.jsonl"
-_DEFAULT_GRADER_MAX_TOKENS = 8192
+_DEFAULT_GRADER_MAX_TOKENS = 4096
 
 
 def _grader_max_tokens_env() -> int:
@@ -44,7 +46,7 @@ def _grader_max_tokens_env() -> int:
 
 
 def _refresh_grader_payload_constraints(payload: Dict[str, Any] | None) -> None:
-    """Apply current GRADER_MAX_TOKENS; persisted scheduler state must not pin 4096."""
+    """Apply current GRADER_MAX_TOKENS on each grader submit/resume."""
     if not payload or not isinstance(payload, dict):
         return
     constraints = payload.get("constraints")
@@ -594,6 +596,8 @@ def run(
     STATE_DOCLING_INFLIGHT = "DOCLING_INFLIGHT"
     STATE_GRADER_READY = "GRADER_READY"
     STATE_GRADER_INFLIGHT = "GRADER_INFLIGHT"
+    STATE_SYNTHESIS_READY = "SYNTHESIS_READY"
+    STATE_SYNTHESIS_INFLIGHT = "SYNTHESIS_INFLIGHT"
     STATE_DONE = "DONE"
     STATE_FAILED = "FAILED"
 
@@ -940,12 +944,19 @@ def run(
     alignment_states: Dict[str, Dict[str, Any]] = {}
     docling_inflight: Dict[str, Dict[str, Any]] = {}
     grader_inflight: Dict[str, Dict[str, Any]] = {}
+    synthesis_inflight: Dict[str, Dict[str, Any]] = {}
+
+    def _graded_path(alignment_id: str) -> str:
+        return os.path.join(output_root, f"{alignment_id}_graded.json")
+
+    def _results_path(alignment_id: str) -> str:
+        return os.path.join(output_root, f"{alignment_id}_results.json")
+
+    def _graded_exists(alignment_id: str) -> bool:
+        return os.path.isfile(_graded_path(alignment_id))
 
     def _outputs_done(alignment_id: str) -> bool:
-        # Grader writes *_graded.json and synthesis (GPU node) writes *_results.json.
-        graded_path = os.path.join(output_root, f"{alignment_id}_graded.json")
-        results_path = os.path.join(output_root, f"{alignment_id}_results.json")
-        return os.path.isfile(graded_path) and os.path.isfile(results_path)
+        return _graded_exists(alignment_id) and os.path.isfile(_results_path(alignment_id))
 
     def _state_path(alignment_id: str) -> str:
         return os.path.join(scheduler_state_dir, f"{alignment_id}.json")
@@ -1004,7 +1015,10 @@ def run(
         return False
 
     def _is_grader_ready(st: Dict[str, Any]) -> bool:
-        if _outputs_done(st["alignment_id"]):
+        aid = st["alignment_id"]
+        if _outputs_done(aid):
+            return False
+        if _graded_exists(aid):
             return False
         papers_dir = str(st.get("papers_dir") or "")
         if not _papers_dir_has_nonempty_txt(papers_dir):
@@ -1049,6 +1063,10 @@ def run(
         _refresh_grader_payload_constraints(state.get("grader_payload"))
         if _outputs_done(alignment_id):
             state["state"] = STATE_DONE
+        elif _graded_exists(alignment_id) and not os.path.isfile(
+            _results_path(alignment_id)
+        ):
+            state["state"] = STATE_SYNTHESIS_READY
         elif _is_grader_ready(state):
             state["state"] = STATE_GRADER_READY
         elif (state.get("docling_required_basenames") or []) and not _required_docling_txt_done(state):
@@ -1200,11 +1218,112 @@ def run(
                 elif _outputs_done(aid):
                     st["state"] = STATE_DONE
                     total_done += 1
+                elif _graded_exists(aid):
+                    st["state"] = STATE_SYNTHESIS_READY
+                    st.pop("last_error", None)
+                    logger.info(
+                        "Alignment {}: grader finished; queued for CPU synthesis",
+                        aid,
+                    )
                 else:
                     st["state"] = STATE_FAILED
-                    st["last_error"] = "grader succeeded but results file missing"
+                    st["last_error"] = "grader succeeded but graded.json missing"
                     failed_count += 1
                 _write_state(aid)
+
+        synth_poll: List[str] = []
+        with scheduler_lock:
+            for aid, meta in list(synthesis_inflight.items()):
+                st = alignment_states.get(aid)
+                if not st:
+                    synthesis_inflight.pop(aid, None)
+                    continue
+                thread = meta.get("thread")
+                if thread is not None and thread.is_alive():
+                    if (
+                        time.monotonic() - float(meta.get("started_monotonic", 0))
+                        > stage_watchdog_seconds
+                    ):
+                        st["state"] = STATE_FAILED
+                        st["last_error"] = "synthesis watchdog timeout"
+                        failed_count += 1
+                        synthesis_inflight.pop(aid, None)
+                        _write_state(aid)
+                    continue
+                synth_poll.append(aid)
+
+        for aid in synth_poll:
+            with scheduler_lock:
+                meta2 = synthesis_inflight.pop(aid, None)
+                st = alignment_states.get(aid)
+                if not st:
+                    continue
+                err = (meta2 or {}).get("error")
+                if err:
+                    st["state"] = STATE_FAILED
+                    st["last_error"] = str(err)
+                    failed_count += 1
+                elif _outputs_done(aid):
+                    st["state"] = STATE_DONE
+                    total_done += 1
+                    st.pop("last_error", None)
+                else:
+                    st["state"] = STATE_FAILED
+                    st["last_error"] = "synthesis finished but results file missing"
+                    failed_count += 1
+                _write_state(aid)
+
+    def _dispatch_synthesis() -> None:
+        with scheduler_lock:
+            if synthesis_inflight:
+                return
+            pending_aid: str | None = None
+            for aid, st in alignment_states.items():
+                if st.get("state") != STATE_SYNTHESIS_READY:
+                    continue
+                pending_aid = aid
+                st["state"] = STATE_SYNTHESIS_INFLIGHT
+                st["synthesis_submitted_at"] = time.time()
+                break
+        if not pending_aid:
+            return
+
+        def _synthesis_worker(alignment_id: str) -> None:
+            err: str | None = None
+            try:
+                req = build_run_alignment_graded_request(
+                    alignment_id,
+                    output_root,
+                    instructions=instructions_text,
+                )
+                post_run_alignment_graded(gpu_url_base, req.dict())
+            except Exception as e:
+                err = f"synthesis failed: {e}"
+                logger.error("Alignment {}: {}", alignment_id, err)
+            with scheduler_lock:
+                meta = synthesis_inflight.get(alignment_id)
+                if meta is not None:
+                    meta["error"] = err
+
+        worker = threading.Thread(
+            target=_synthesis_worker,
+            args=(pending_aid,),
+            name=f"lit-synthesis-{pending_aid}",
+            daemon=True,
+        )
+        with scheduler_lock:
+            synthesis_inflight[pending_aid] = {
+                "thread": worker,
+                "started_monotonic": time.monotonic(),
+            }
+        logger.info(
+            "Alignment {}: synthesis worker started (host={})",
+            pending_aid,
+            gpu_url_base,
+        )
+        worker.start()
+        with scheduler_lock:
+            _write_state(pending_aid)
 
     def _dispatch_docling() -> None:
         if not docling_url_base:
@@ -1422,6 +1541,7 @@ def run(
         _poll_inflight()
         _dispatch_docling()
         _dispatch_grader()
+        _dispatch_synthesis()
 
     scheduler_stop = threading.Event()
 
@@ -1723,8 +1843,6 @@ def run(
                 "output_root": output_root,
                 "host_rubric_path": host_rubric_path,
                 "microbe_rubric_path": microbe_rubric_path,
-                "synthesis_host": gpu_host,
-                "synthesis_port": gpu_port,
             }
             if gene_context is not None:
                 grader_payload["gene_context"] = gene_context
@@ -1767,7 +1885,8 @@ def run(
             ]
             docling_n = len(docling_inflight)
             grader_n = len(grader_inflight)
-        if not non_terminal and docling_n == 0 and grader_n == 0:
+            synthesis_n = len(synthesis_inflight)
+        if not non_terminal and docling_n == 0 and grader_n == 0 and synthesis_n == 0:
             break
         time.sleep(scheduler_tick_seconds)
 

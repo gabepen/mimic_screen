@@ -20,11 +20,20 @@ from auto_lit_search.analysis_packet import (
     RunAlignmentGradedRequest,
     RunAlignmentResponse,
 )
-app = FastAPI(title="auto_lit_search Grader node")
+from auto_lit_search.env_config import env_flag
+from auto_lit_search.paper_io import (
+    DOWNLOAD_MANIFEST_FILENAME,
+    MAX_PAPER_CHARS,
+    ensure_dir as _ensure_dir,
+    extract_paper_role as _extract_paper_role,
+    identification_terms_block,
+    list_paper_files as _list_paper_files,
+    paper_id_by_artifact_basename as _paper_id_by_artifact_basename,
+    read_text as _read_text,
+)
+from auto_lit_search.scheduler_http import post_run_alignment_graded
 
-TEXT_EXTENSIONS = (".txt",)
-DOWNLOAD_MANIFEST_FILENAME = "download_manifest.jsonl"
-MAX_PAPER_CHARS = 120000
+app = FastAPI(title="auto_lit_search Grader node")
 _MODEL_ID_CACHE: Dict[str, str] = {}
 _ASYNC_JOBS: Dict[str, Dict[str, Any]] = {}
 _ASYNC_QUEUE: "deque[Tuple[str, GradeAlignmentRequest]]" = deque()
@@ -32,8 +41,10 @@ _ASYNC_LOCK = threading.Lock()
 _ASYNC_WORKER_STARTED = False
 _GRADER_LLM_JSONL_LOCK = threading.Lock()
 _MODEL_ID_CACHE_LOCK = threading.Lock()
-_DEFAULT_GRADER_MAX_TOKENS = 8192
+_DEFAULT_GRADER_MAX_TOKENS = 4096
 _DEFAULT_GRADER_PAPER_WORKERS = 3
+_GRADER_AXIS_RATIONALE_MAX_CHARS = 280
+_GRADER_CROSS_AXIS_RATIONALE_MAX_CHARS = 150
 
 
 def _grader_paper_workers() -> int:
@@ -42,12 +53,40 @@ def _grader_paper_workers() -> int:
 
 
 def _grader_max_tokens(req: GradeAlignmentRequest) -> int:
-    env_cap = _env_positive_int("GRADER_MAX_TOKENS", _DEFAULT_GRADER_MAX_TOKENS)
-    if req.constraints and req.constraints.max_tokens:
-        req_cap = int(req.constraints.max_tokens)
-        # Stale CPU scheduler state often pins 4096; env is the floor for grading.
-        return max(env_cap, req_cap)
-    return env_cap
+    # Grader GPU env is authoritative; CPU scheduler constraints are refreshed on submit.
+    del req
+    return _env_positive_int("GRADER_MAX_TOKENS", _DEFAULT_GRADER_MAX_TOKENS)
+
+
+def _grader_json_output_instructions() -> str:
+    return (
+        "OUTPUT (pipeline JSON schema; not part of the rubric file):\n"
+        "Return strict JSON only with keys:\n"
+        "rubric_dimension_scores (object: each axis id below → number 0..1),\n"
+        f"rubric_axis_rationales (object: SAME axis ids → string; per axis at most "
+        f"{_GRADER_AXIS_RATIONALE_MAX_CHARS} characters: one short quote or phrase from the excerpt "
+        "plus one sentence on how the axis score follows from rubric criteria; "
+        "do not enumerate sub-criteria or repeat rubric text; no empty strings),\n"
+        "rubric_tags (optional object: include mimicry_potential_flag and/or novelty_flag "
+        "when rubric criteria apply; values from rubric flag_values, else omit key),\n"
+        f"rationale (optional string: at most {_GRADER_CROSS_AXIS_RATIONALE_MAX_CHARS} characters; "
+        "one-sentence cross-axis takeaway; may be \"\").\n"
+        "Keep the JSON object compact. Do not output relevance_grade; it will be computed "
+        "server-side from axis scores (with rubric-specific aggregation rules).\n"
+    )
+
+
+def _clamp_parsed_rationales(parsed: Dict[str, Any], dims: List[Dict[str, Any]]) -> None:
+    rax = parsed.get("rubric_axis_rationales")
+    if isinstance(rax, dict):
+        for d in dims:
+            dn = d["name"]
+            if dn in rax:
+                rax[dn] = str(rax[dn] or "").strip()[:_GRADER_AXIS_RATIONALE_MAX_CHARS]
+    if parsed.get("rationale"):
+        parsed["rationale"] = str(parsed["rationale"]).strip()[
+            :_GRADER_CROSS_AXIS_RATIONALE_MAX_CHARS
+        ]
 
 
 def _env_positive_float(name: str, default: float) -> float:
@@ -90,95 +129,6 @@ def _grader_http_timeout_tuple() -> Tuple[float, float]:
     connect = _env_positive_float("VLLM_HTTP_CONNECT_TIMEOUT", 30.0)
     read = _grader_http_read_timeout_sec()
     return (connect, read)
-
-
-def _ensure_dir(path: str) -> None:
-    os.makedirs(path, exist_ok=True)
-
-
-def _paper_id_by_artifact_basename(papers_dir: str) -> Dict[str, str]:
-    """Map artifact basename -> DOI paper_id from download_manifest.jsonl."""
-    path = os.path.join(papers_dir, DOWNLOAD_MANIFEST_FILENAME)
-    out: Dict[str, str] = {}
-    if not os.path.isfile(path):
-        return out
-    try:
-        with open(path, "r", encoding="utf-8") as f:
-            for line in f:
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    rec = json.loads(line)
-                except json.JSONDecodeError:
-                    continue
-                pid = str(rec.get("doi") or rec.get("paper_id") or "").strip()
-                if not pid:
-                    continue
-                for key in ("text_path", "pdf_path"):
-                    p = str(rec.get(key) or "").strip()
-                    if not p:
-                        continue
-                    base = os.path.basename(p)
-                    out[base] = pid
-                    if base.lower().endswith(".pdf"):
-                        out.setdefault(f"{os.path.splitext(base)[0]}.txt", pid)
-    except OSError:
-        pass
-    return out
-
-
-def _list_paper_files(papers_dir: str) -> List[str]:
-    files = sorted(
-        f
-        for f in os.listdir(papers_dir)
-        if os.path.isfile(os.path.join(papers_dir, f))
-        and (f.endswith(TEXT_EXTENSIONS) or not f.endswith((".pdf", ".xml")))
-    )
-    labeled = [
-        f
-        for f in files
-        if "__query" in f.lower() or "__target" in f.lower()
-    ]
-    selected = labeled if labeled else files
-    if not labeled:
-        return selected
-
-    # Dedupe provider-tagged variants (e.g., __target__unpaywall.txt) against
-    # canonical role files (e.g., __target.txt).
-    grouped: Dict[str, List[str]] = {}
-    for f in selected:
-        low = f.lower()
-        m = re.match(r"^(.*__(?:query|target))(?:__[^.]*)?\.txt$", low)
-        key = f"{m.group(1)}.txt" if m else low
-        grouped.setdefault(key, []).append(f)
-
-    deduped: List[str] = []
-    for key in sorted(grouped.keys()):
-        candidates = grouped[key]
-        canonical = [
-            c
-            for c in candidates
-            if c.lower().endswith("__query.txt") or c.lower().endswith("__target.txt")
-        ]
-        suffixed = [c for c in candidates if c not in canonical]
-        # Prefer provider-suffixed variants first (typically PDF->text conversion),
-        # then fall back to canonical unsuffixed role files.
-        if suffixed:
-            deduped.append(sorted(suffixed)[0])
-        elif canonical:
-            deduped.append(sorted(canonical)[0])
-        else:
-            deduped.append(sorted(candidates)[0])
-    return deduped
-
-
-def _read_text(path: str, max_chars: int = MAX_PAPER_CHARS) -> str:
-    with open(path, "r", encoding="utf-8", errors="replace") as f:
-        s = f.read()
-    if len(s) > max_chars:
-        s = s[:max_chars] + "\n\n[truncated]"
-    return s
 
 
 def _load_json_file(path: str) -> Dict[str, Any]:
@@ -478,15 +428,6 @@ def _call_llm(
     )
 
 
-def _extract_paper_role(fname: str) -> Optional[str]:
-    lower = fname.lower()
-    if "__query" in lower:
-        return "query"
-    if "__target" in lower:
-        return "target"
-    return None
-
-
 def _dedupe_keep_order(items: List[str]) -> List[str]:
     seen = set()
     out: List[str] = []
@@ -535,21 +476,6 @@ def _gene_terms(meta: Dict[str, Any], fallback_id: str) -> Dict[str, Any]:
         "common_name": common_name or "none",
         "synonyms": syns,
     }
-
-
-def _identification_terms_block(req: GradeAlignmentRequest) -> str:
-    query_meta = (req.gene_context or {}).get("query") or {}
-    target_meta = (req.gene_context or {}).get("target") or {}
-    q = _gene_terms(query_meta, req.query)
-    t = _gene_terms(target_meta, req.target_id)
-    q_syn = ", ".join(q["synonyms"]) if q["synonyms"] else "none"
-    t_syn = ", ".join(t["synonyms"]) if t["synonyms"] else "none"
-    return (
-        "Paper identification terms used in retrieval (prioritize symbol/common name; "
-        "use synonyms as alternate mentions):\n"
-        f"- Query gene ({req.query}): symbol={q['symbol']}; common_name={q['common_name']}; synonyms={q_syn}\n"
-        f"- Target gene ({req.target_id}): symbol={t['symbol']}; common_name={t['common_name']}; synonyms={t_syn}\n"
-    )
 
 
 def _safe_float(v: Any, default: float = 0.0) -> float:
@@ -606,8 +532,9 @@ def _build_grade_repair_prompt(
         "Only reformat/recover the previous response into strict JSON.\n\n"
         "Return JSON only with keys:\n"
         "- rubric_dimension_scores (object: axis id -> number 0..1)\n"
-        "- rubric_axis_rationales (object: same axis ids -> non-empty string)\n"
-        "- rationale (optional string)\n\n"
+        "- rubric_axis_rationales (object: same axis ids -> non-empty string; "
+        f"keep each under {_GRADER_AXIS_RATIONALE_MAX_CHARS} characters)\n"
+        f"- rationale (optional string; at most {_GRADER_CROSS_AXIS_RATIONALE_MAX_CHARS} characters)\n\n"
         f"Axis ids must be exactly: {dim_names}\n\n"
         "Invalid output to repair:\n"
         f"{excerpt}\n"
@@ -683,13 +610,23 @@ def _try_parse_grade_json(raw: str, dims: List[Dict[str, Any]]) -> Optional[Dict
         if not rtext:
             return None
         axis_rationales[dn] = rtext
+    tags_raw = obj.get("rubric_tags")
+    rubric_tags: Dict[str, str] = {}
+    if isinstance(tags_raw, dict):
+        for k, v in tags_raw.items():
+            sv = str(v or "").strip()
+            if sv:
+                rubric_tags[str(k)] = sv
     grade = _compute_relevance_grade(dim_scores)
-    return {
+    parsed = {
         "relevance_grade": grade,
         "rubric_dimension_scores": dim_scores,
         "rubric_axis_rationales": axis_rationales,
         "rationale": str(obj.get("rationale") or "").strip(),
+        "rubric_tags": rubric_tags,
     }
+    _clamp_parsed_rationales(parsed, dims)
+    return parsed
 
 
 def _parse_grade_output(raw: str, dims: List[Dict[str, Any]]) -> Dict[str, Any]:
@@ -708,6 +645,7 @@ def _parse_grade_output(raw: str, dims: List[Dict[str, Any]]) -> Dict[str, Any]:
         "rubric_dimension_scores": dim_scores,
         "rubric_axis_rationales": axr,
         "rationale": stripped[:800],
+        "rubric_tags": {},
     }
 
 
@@ -724,7 +662,7 @@ def _grade_single_paper(
     role = _extract_paper_role(fname)
     text = _read_text(file_path)
     dims = _rubric_dimensions(rubric)
-    term_block = _identification_terms_block(req)
+    term_block = identification_terms_block(req.query, req.target_id, req.gene_context)
     dim_lines = "\n".join(
         f"- {d['name']}: {d['description']} (weight={d['weight']})" for d in dims
     )
@@ -747,14 +685,7 @@ def _grade_single_paper(
         f"- paper_role={role or 'unknown'} (query → microbe rubric; target → host rubric)\n"
         f"- gene_focus_for_this_paper: {gene_focus}\n"
         f"{term_block}\n"
-        "OUTPUT (pipeline JSON schema; not part of the rubric file):\n"
-        "Return strict JSON only with keys:\n"
-        "rubric_dimension_scores (object: each axis id below → number 0..1),\n"
-        "rubric_axis_rationales (object: SAME axis ids → string: cite evidence from the excerpt; "
-        "explain how you applied that axis’s criteria; no empty strings),\n"
-        "rationale (optional string: one-sentence cross-axis takeaway; may be \"\").\n"
-        "Do not output relevance_grade; it will be computed server-side from axis scores "
-        "(with rubric-specific aggregation rules).\n\n"
+        f"{_grader_json_output_instructions()}\n"
         f"RUBRIC:\n{json.dumps(rubric, ensure_ascii=False)}\n"
         f"rubric_dimension_scores and rubric_axis_rationales must each include exactly these "
         f"axis ids:\n{dim_lines}\n\n"
@@ -768,6 +699,7 @@ def _grade_single_paper(
         "rubric_dimension_scores": {d["name"]: 0.0 for d in dims},
         "rubric_axis_rationales": {d["name"]: "" for d in dims},
         "rationale": "",
+        "rubric_tags": {},
     }
     repair_attempted = 0
     repair_succeeded = 0
@@ -817,7 +749,9 @@ def _grade_single_paper(
                     "or missing required JSON keys). Follow rubric.grader_instructions and the axes, "
                     "then respond with ONLY one JSON object—no other text.\n"
                     "Required keys: rubric_dimension_scores (numbers 0..1), "
-                    "rubric_axis_rationales (strings; same keys), optional rationale (string). "
+                    f"rubric_axis_rationales (brief strings, max "
+                    f"{_GRADER_AXIS_RATIONALE_MAX_CHARS} chars per axis; same keys), "
+                    f"optional rationale (max {_GRADER_CROSS_AXIS_RATIONALE_MAX_CHARS} chars). "
                     f"Axis ids: {dim_names}.\n"
                 )
                 if bad:
@@ -938,6 +872,7 @@ def _grade_single_paper(
         rubric_axis_rationales=parsed.get("rubric_axis_rationales")
         or {d["name"]: "" for d in dims},
         rationale=parsed.get("rationale") or "",
+        rubric_tags=parsed.get("rubric_tags") or {},
         model_output=raw or None,
         notes=notes or None,
     )
@@ -1106,6 +1041,9 @@ def _grade_alignment_sync(req: GradeAlignmentRequest) -> RunAlignmentResponse:
         json.dump(
             {
                 "alignment_id": req.alignment_id,
+                "query": req.query,
+                "target_id": req.target_id,
+                "papers_dir": req.papers_dir,
                 "graded_papers": [g.dict() for g in graded],
                 "grading_meta": grading_meta,
             },
@@ -1124,6 +1062,14 @@ def _grade_alignment_sync(req: GradeAlignmentRequest) -> RunAlignmentResponse:
         f"n_regrade_retry_used={n_regrade_retry_used}"
     )
 
+    skip_synthesis = env_flag("GRADER_SKIP_SYNTHESIS", True)
+    if skip_synthesis or not (req.synthesis_host or "").strip():
+        return RunAlignmentResponse(
+            status="ok",
+            alignment_id=req.alignment_id,
+            results_path="",
+        )
+
     synth_payload = RunAlignmentGradedRequest(
         alignment_id=req.alignment_id,
         papers_dir=req.papers_dir,
@@ -1136,11 +1082,9 @@ def _grade_alignment_sync(req: GradeAlignmentRequest) -> RunAlignmentResponse:
         graded_papers=graded,
         grading_meta=grading_meta,
     )
-    synthesis_url = f"http://{req.synthesis_host}:{req.synthesis_port}/run_alignment_graded"
+    synthesis_url = f"http://{req.synthesis_host}:{req.synthesis_port}"
     try:
-        r = requests.post(synthesis_url, json=synth_payload.dict(), timeout=600)
-        r.raise_for_status()
-        out = r.json()
+        out = post_run_alignment_graded(synthesis_url, synth_payload.dict())
     except requests.RequestException as e:
         raise HTTPException(
             status_code=502,

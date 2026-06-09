@@ -16,6 +16,7 @@ class GradedPaper(BaseModel):
     rubric_dimension_scores: Dict[str, float]
     rubric_axis_rationales: Dict[str, str] = Field(default_factory=dict)
     rationale: str = ""  # optional brief cross-axis summary
+    rubric_tags: Dict[str, str] = Field(default_factory=dict)
     model_output: Optional[str] = None
     notes: Optional[str] = None
 
@@ -45,6 +46,6 @@ class RunAlignmentResponse(BaseModel):
 class GradeAlignmentRequest(RunAlignmentRequest):
     host_rubric_path: str
     microbe_rubric_path: str
-    synthesis_host: str
+    synthesis_host: Optional[str] = None
     synthesis_port: int = 9000
 
