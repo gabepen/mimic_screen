@@ -69,6 +69,7 @@ logger.add(
 
 EUROPEPMC_SEARCH_URL = "https://www.ebi.ac.uk/europepmc/webservices/rest/search"
 EUROPEPMC_FULLTEXT_BASE = "https://www.ebi.ac.uk/europepmc/webservices/rest"
+PMC_IDCONV_URL = "https://www.ncbi.nlm.nih.gov/pmc/utils/idconv/v1.0/"
 API_DELAY = 0.35
 
 # PMID from the same Europe PMC search row as pmcid_cache[paper_id]; used for /article/MED/{pmid}/fullText*
@@ -144,10 +145,94 @@ def _env_float(name: str, default: float) -> float:
         return default
 
 
+def _env_int(name: str, default: int, lo: int, hi: int) -> int:
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        return default
+    try:
+        return max(lo, min(hi, int(raw)))
+    except ValueError:
+        return default
+
+
+def _phased_download_enabled() -> bool:
+    return os.environ.get("COLLECT_PHASED_DOWNLOAD", "1").strip().lower() not in (
+        "0",
+        "false",
+        "no",
+    )
+
+
+def _pmcid_cache_path(output_dir: str) -> str:
+    custom = os.environ.get("COLLECT_PMCID_CACHE_PATH", "").strip()
+    if custom:
+        return custom
+    data_root = os.environ.get("DATA_ROOT", "").strip()
+    if data_root:
+        return os.path.join(data_root, "logs", "pmcid_cache.json")
+    # papers/<alignment_id> -> <data_root>/papers/...
+    parent = os.path.dirname(os.path.dirname(output_dir))
+    return os.path.join(parent, "logs", "pmcid_cache.json")
+
+
+def load_pmcid_cache(path: str) -> Dict[str, Optional[str]]:
+    if not path or not os.path.isfile(path):
+        return {}
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if isinstance(data, dict) and "pmcids" in data:
+            raw = data.get("pmcids") or {}
+        elif isinstance(data, dict):
+            raw = data
+        else:
+            return {}
+        return {str(k): (v if v else None) for k, v in raw.items()}
+    except Exception as e:
+        logger.warning("Could not load PMCID cache {}: {}", path, e)
+        return {}
+
+
+def save_pmcid_cache(path: str, cache: Dict[str, Optional[str]]) -> None:
+    if not path:
+        return
+    try:
+        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+        pmids = dict(_EUROPEPMC_PMID_BY_PAPER_ID)
+        payload = {"pmcids": cache, "pmids": pmids}
+        tmp = f"{path}.tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(payload, f, ensure_ascii=False, indent=2)
+            f.write("\n")
+        os.replace(tmp, path)
+    except Exception as e:
+        logger.warning("Could not save PMCID cache {}: {}", path, e)
+
+
+def _merge_pmcid_cache_from_disk(
+    cache: Dict[str, Optional[str]], path: str
+) -> None:
+    loaded = load_pmcid_cache(path)
+    for k, v in loaded.items():
+        if k not in cache:
+            cache[k] = v
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        pmids = data.get("pmids") if isinstance(data, dict) else None
+        if isinstance(pmids, dict):
+            for k, v in pmids.items():
+                if k not in _EUROPEPMC_PMID_BY_PAPER_ID:
+                    _EUROPEPMC_PMID_BY_PAPER_ID[k] = v
+    except Exception:
+        pass
+
+
 _ASM_THROTTLE_SECONDS = _env_float("ASM_THROTTLE_SECONDS", 6.0)
 
 # Minimum spacing between outbound calls per channel (shared across threads).
 _DEFAULT_THROTTLE_INTERVALS_S: Dict[str, float] = {
+    "pmc_oa_s3": 0.05,
     "europe_pmc": 0.35,
     "elsevier": 0.55,
     "wiley": 5.0,
@@ -216,6 +301,15 @@ class CollectionContext:
     throttle: Optional[CollectThrottle] = None
     cache_lock: Optional[threading.Lock] = None
     disable_semantic_scholar: bool = False
+    disable_pmc_oa_s3: bool = False
+
+
+def _env_disable_pmc_oa_s3() -> bool:
+    return os.environ.get("COLLECT_DISABLE_PMC_OA_S3", "").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+    )
 
 
 class BaseCollectionProvider:
@@ -239,6 +333,7 @@ def _collect_single_record(
     throttle: CollectThrottle,
     cache_lock: Optional[threading.Lock],
     disable_semantic_scholar: bool,
+    disable_pmc_oa_s3: bool = False,
 ) -> DownloadRecord:
     paper_id, source = item
     session = requests.Session()
@@ -259,6 +354,7 @@ def _collect_single_record(
         throttle=throttle,
         cache_lock=cache_lock,
         disable_semantic_scholar=disable_semantic_scholar,
+        disable_pmc_oa_s3=disable_pmc_oa_s3,
     )
     return provider.resolve_and_fetch(paper_id, source, ctx)
 
@@ -291,6 +387,12 @@ class UCSCEmailOnlyProvider(BaseCollectionProvider):
         doi = _extract_doi_from_identifier(paper_id)
         title = _extract_title_from_identifier(paper_id)
         source_attempts: Dict[str, Dict[str, Any]] = {
+            "pmc_oa_s3": {
+                "attempted": False,
+                "success": False,
+                "artifact": None,
+                "error": None,
+            },
             "europe_pmc": {"attempted": True, "success": False, "artifact": None, "error": None},
             "elsevier": {
                 "attempted": bool(doi and is_elsevier_primary_doi(doi)),
@@ -333,6 +435,8 @@ class UCSCEmailOnlyProvider(BaseCollectionProvider):
         xml_path: Optional[str] = None
         pdf_path: Optional[str] = None
         text_path: Optional[str] = None
+        selected_text_source_hint: Optional[str] = None
+        pmc_oa_s3_meta: Dict[str, Any] = {}
         safe = _doi_file_stem(paper_id, doi, source)
 
         if not context.no_cache:
@@ -345,6 +449,7 @@ class UCSCEmailOnlyProvider(BaseCollectionProvider):
                 and os.path.getsize(candidate_text) > 0
             ):
                 text_path = candidate_text
+                selected_text_source_hint = "cached_text"
             # Channel-suffixed PDFs (e.g. __unpaywall) from prior runs
             if not pdf_path and os.path.isdir(context.pdf_dir):
                 prefix = safe + "__"
@@ -352,6 +457,22 @@ class UCSCEmailOnlyProvider(BaseCollectionProvider):
                     if fname.startswith(prefix) and fname.lower().endswith(".pdf"):
                         pdf_path = os.path.join(context.pdf_dir, fname)
                         break
+
+        if pmcid and not text_path and not context.disable_pmc_oa_s3:
+            source_attempts["pmc_oa_s3"]["attempted"] = True
+            s3_out = _attempt_pmc_oa_s3(pmcid, context, safe)
+            source_attempts["pmc_oa_s3"] = s3_out["attempt"]
+            pmc_oa_s3_meta = s3_out.get("metadata_info") or {}
+            if s3_out.get("text_path"):
+                text_path = s3_out["text_path"]
+            if s3_out.get("xml_path"):
+                xml_path = s3_out["xml_path"]
+            if s3_out.get("xml_text"):
+                xml_text = s3_out["xml_text"]
+            if s3_out.get("pdf_path"):
+                pdf_path = s3_out["pdf_path"]
+            if s3_out.get("selected_text_source"):
+                selected_text_source_hint = s3_out["selected_text_source"]
 
         if pmcid and not text_path:
             xml_path = _fetch_fulltext_xml(
@@ -369,7 +490,7 @@ class UCSCEmailOnlyProvider(BaseCollectionProvider):
                 "xml" if xml_path else None
             )
 
-        if pmcid and (context.force_pdfs or not text_path):
+        if pmcid and (context.force_pdfs or not text_path) and not pdf_path:
             epmc_pdf = _fetch_fulltext_pdf(
                 pmcid,
                 context.session,
@@ -541,7 +662,7 @@ class UCSCEmailOnlyProvider(BaseCollectionProvider):
         selected_text_source = "none"
         pdf_docling_required = False
         if text_path:
-            selected_text_source = "cached_text"
+            selected_text_source = selected_text_source_hint or "cached_text"
         else:
             if pdf_path:
                 selected_text_source = "docling_pdf"
@@ -550,7 +671,7 @@ class UCSCEmailOnlyProvider(BaseCollectionProvider):
                 text_path = os.path.join(context.text_dir, f"{safe}.txt")
                 with open(text_path, "w", encoding="utf-8", errors="replace") as f:
                     f.write(xml_text)
-                selected_text_source = "xml"
+                selected_text_source = selected_text_source_hint or "xml"
 
         status = "ok" if text_path else ("partial" if pdf_path else "failed")
         successful_sources = sorted(
@@ -578,6 +699,7 @@ class UCSCEmailOnlyProvider(BaseCollectionProvider):
             "source_tag": source,
             "doi": doi,
             "title": title,
+            "pmc_oa_s3": pmc_oa_s3_meta,
             "europe_pmc": {
                 "search_endpoint": EUROPEPMC_SEARCH_URL,
                 "search_query": epmc_search_query,
@@ -856,6 +978,286 @@ def _pubtype_is_excluded(pubtypes: List[Any]) -> bool:
             if sub in norm:
                 return True
     return False
+
+
+def _epmc_search_query_for_paper_id(paper_id: str) -> str:
+    pid = paper_id.strip()
+    u = pid.upper()
+    if u.startswith("PMC:"):
+        pmcid_norm = u[4:].strip()
+        if not pmcid_norm.upper().startswith("PMC"):
+            pmcid_norm = f"PMC{pmcid_norm}"
+        return pmcid_norm
+    if u.startswith("PMC"):
+        return u
+    if u.startswith("PMID:"):
+        ext_id = u[5:].strip()
+    else:
+        ext_id = pid
+    if ext_id.startswith("10."):
+        return f"DOI:{ext_id}"
+    return f"EXT_ID:{ext_id}"
+
+
+def _normalize_pmcid_value(pmcid: str) -> str:
+    p = str(pmcid or "").strip()
+    if not p:
+        return ""
+    u = p.upper()
+    if not u.startswith("PMC"):
+        return f"PMC{p}" if p.isdigit() else p
+    return u
+
+
+def _pmcid_from_epmc_record(rec: Dict[str, Any]) -> Optional[Tuple[str, Optional[str]]]:
+    pmcid = rec.get("pmcid")
+    if not pmcid:
+        return None
+    pubtypes = (rec.get("pubTypeList") or {}).get("pubType") or []
+    if pubtypes and _pubtype_is_excluded(pubtypes):
+        return None
+    if pubtypes and not _pubtypes_look_like_research(pubtypes):
+        return None
+    pmcid_norm = _normalize_pmcid_value(str(pmcid))
+    pmid_raw = rec.get("pmid") or rec.get("id")
+    pmid_str = str(pmid_raw).strip() if pmid_raw is not None else ""
+    pmid_out: Optional[str] = pmid_str if pmid_str.isdigit() else None
+    return pmcid_norm, pmid_out
+
+
+def _store_pmcid_resolution(
+    paper_id: str,
+    pmcid: Optional[str],
+    pmid: Optional[str],
+    search_query: str,
+    cache: Dict[str, Optional[str]],
+    cache_lock: Optional[threading.Lock],
+) -> None:
+    if cache_lock:
+        with cache_lock:
+            cache[paper_id] = pmcid
+    else:
+        cache[paper_id] = pmcid
+    _europepmc_note_search_query(paper_id, search_query, cache_lock)
+    _europepmc_store_pmid(paper_id, pmid, cache_lock)
+
+
+def _pmcid_idconv_batch(
+    paper_ids: List[str],
+    session: requests.Session,
+    collector_email: str,
+) -> Dict[str, Tuple[Optional[str], Optional[str]]]:
+    """PMC ID Converter: up to 200 IDs per request."""
+    out: Dict[str, Tuple[Optional[str], Optional[str]]] = {}
+    if not paper_ids:
+        return out
+    params: Dict[str, str] = {
+        "ids": ",".join(paper_ids),
+        "format": "json",
+        "tool": "auto_lit_search",
+    }
+    if collector_email:
+        params["email"] = collector_email
+    try:
+        resp = session.get(PMC_IDCONV_URL, params=params, timeout=60)
+        resp.raise_for_status()
+        data = resp.json()
+    except Exception as e:
+        logger.debug("PMC ID converter batch failed: {}", e)
+        return out
+    for rec in data.get("records") or []:
+        if not isinstance(rec, dict):
+            continue
+        req_id = str(rec.get("requested-id") or rec.get("doi") or "").strip()
+        if not req_id:
+            continue
+        err = str(rec.get("errmsg") or rec.get("error") or "").strip()
+        if err:
+            out[req_id] = (None, None)
+            continue
+        pmcid_raw = rec.get("pmcid")
+        if not pmcid_raw:
+            out[req_id] = (None, None)
+            continue
+        pmcid = _normalize_pmcid_value(str(pmcid_raw))
+        pmid_raw = rec.get("pmid")
+        pmid = str(pmid_raw).strip() if pmid_raw is not None else ""
+        pmid_out: Optional[str] = pmid if pmid.isdigit() else None
+        out[req_id] = (pmcid, pmid_out)
+    return out
+
+
+def _pmcid_epmc_or_batch(
+    paper_ids: List[str],
+    session: requests.Session,
+    cache: Dict[str, Optional[str]],
+    throttle: Optional[CollectThrottle],
+    cache_lock: Optional[threading.Lock],
+) -> int:
+    """Resolve a batch via one Europe PMC OR search. Returns count stored."""
+    if not paper_ids:
+        return 0
+    doi_to_pids: Dict[str, List[str]] = {}
+    query_to_pids: Dict[str, List[str]] = {}
+    for pid in paper_ids:
+        sq = _epmc_search_query_for_paper_id(pid)
+        query_to_pids.setdefault(sq, []).append(pid)
+        doi = _extract_doi_from_identifier(pid)
+        if doi:
+            doi_to_pids.setdefault(doi.lower(), []).append(pid)
+
+    or_parts = list(query_to_pids.keys())
+    or_query = " OR ".join(or_parts)
+    _europepmc_note_search_query(paper_ids[0], or_query, cache_lock)
+    if throttle:
+        throttle.wait("europe_pmc")
+    else:
+        time.sleep(API_DELAY)
+    try:
+        resp = session.get(
+            EUROPEPMC_SEARCH_URL,
+            params={
+                "query": or_query,
+                "format": "json",
+                "resultType": "core",
+                "pageSize": min(1000, max(25, len(paper_ids) * 3)),
+            },
+            timeout=60,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+    except Exception as e:
+        logger.debug("Europe PMC OR batch failed (n={}): {}", len(paper_ids), e)
+        return 0
+
+    stored = 0
+    assigned: Set[str] = set()
+    for rec in (data.get("resultList") or {}).get("result") or []:
+        if not isinstance(rec, dict):
+            continue
+        picked = _pmcid_from_epmc_record(rec)
+        if not picked:
+            continue
+        pmcid, pmid = picked
+        targets: List[str] = []
+        rec_doi = str(rec.get("doi") or "").strip().lower()
+        if rec_doi and rec_doi in doi_to_pids:
+            targets.extend(doi_to_pids[rec_doi])
+        rec_pmcid = _normalize_pmcid_value(str(rec.get("pmcid") or ""))
+        sq = rec_pmcid if rec_pmcid else ""
+        if sq and sq in query_to_pids:
+            targets.extend(query_to_pids[sq])
+        for pid in dict.fromkeys(targets):
+            if pid in assigned:
+                continue
+            _store_pmcid_resolution(
+                pid, pmcid, pmid, or_query, cache, cache_lock
+            )
+            assigned.add(pid)
+            stored += 1
+
+    for pid in paper_ids:
+        if pid in assigned:
+            continue
+        if pid not in cache:
+            _store_pmcid_resolution(pid, None, None, or_query, cache, cache_lock)
+    return stored
+
+
+def batch_resolve_pmcids(
+    paper_ids: List[str],
+    cache: Dict[str, Optional[str]],
+    session: requests.Session,
+    throttle: Optional[CollectThrottle],
+    cache_lock: Optional[threading.Lock],
+    *,
+    collector_email: str = "",
+    resolve_workers: int = 8,
+    epmc_batch_size: int = 40,
+    idconv_batch_size: int = 200,
+) -> int:
+    """
+    Resolve many paper identifiers to PMCIDs before per-paper download.
+
+    Uses PMC ID Converter (200 IDs/request) then Europe PMC OR batches.
+    """
+    pending: List[str] = []
+    for pid in paper_ids:
+        norm = _normalize_paper_id(pid)
+        if not norm:
+            continue
+        if norm in cache:
+            continue
+        u = norm.upper()
+        if u.startswith("PMC"):
+            pmcid = _normalize_pmcid_value(norm)
+            _store_pmcid_resolution(
+                norm, pmcid, None, "direct_pmcid", cache, cache_lock
+            )
+            continue
+        pending.append(norm)
+
+    if not pending:
+        return 0
+
+    pending = list(dict.fromkeys(pending))
+    newly = 0
+    idconv_batch_size = max(1, min(200, int(idconv_batch_size)))
+    epmc_batch_size = max(1, min(80, int(epmc_batch_size)))
+    resolve_workers = max(1, min(32, int(resolve_workers)))
+
+    idconv_chunks = [
+        pending[i : i + idconv_batch_size]
+        for i in range(0, len(pending), idconv_batch_size)
+    ]
+    for chunk in idconv_chunks:
+        still_need = [p for p in chunk if p not in cache]
+        if not still_need:
+            continue
+        resolved = _pmcid_idconv_batch(still_need, session, collector_email)
+        for pid in still_need:
+            hit = resolved.get(pid)
+            if hit is None:
+                doi = _extract_doi_from_identifier(pid)
+                if doi:
+                    hit = resolved.get(doi)
+            if not hit:
+                continue
+            pmcid, pmid = hit
+            if pmcid:
+                _store_pmcid_resolution(
+                    pid, pmcid, pmid, "pmc_idconv", cache, cache_lock
+                )
+                newly += 1
+
+    remaining = [p for p in pending if p not in cache]
+    epmc_chunks = [
+        remaining[i : i + epmc_batch_size]
+        for i in range(0, len(remaining), epmc_batch_size)
+    ]
+    if epmc_chunks:
+        workers = min(resolve_workers, len(epmc_chunks))
+        with ThreadPoolExecutor(max_workers=workers) as ex:
+            futs = [
+                ex.submit(
+                    _pmcid_epmc_or_batch,
+                    chunk,
+                    session,
+                    cache,
+                    throttle,
+                    cache_lock,
+                )
+                for chunk in epmc_chunks
+            ]
+            for fut in as_completed(futs):
+                newly += int(fut.result() or 0)
+
+    # Final pass: mark unresolved
+    for pid in pending:
+        if pid not in cache:
+            _store_pmcid_resolution(pid, None, None, "unresolved", cache, cache_lock)
+
+    return newly
 
 
 def _resolve_to_pmcid(
@@ -1161,6 +1563,417 @@ def _extract_text_from_xml_string(xml: str) -> str:
     return _extract_text_from_xml_root(root)
 
 
+def _attempt_pmc_oa_s3(
+    pmcid: str,
+    context: CollectionContext,
+    file_stem: str,
+) -> Dict[str, Any]:
+    """
+  Try PMC OA S3 bucket first (metadata + .txt/.xml, optional .pdf).
+
+  Returns dict with xml_text, xml_path, pdf_path, text_path, attempt, metadata_info.
+    """
+    from auto_lit_search.pmc_oa_s3 import (
+        download_pmc_oa_fulltext,
+        download_pmc_oa_pdf,
+        fetch_pmc_oa_metadata,
+        metadata_https_url,
+    )
+
+    attempt: Dict[str, Any] = {
+        "attempted": True,
+        "success": False,
+        "artifact": None,
+        "error": None,
+    }
+    metadata_info: Dict[str, Any] = {"metadata_urls_tried": []}
+    out: Dict[str, Any] = {
+        "xml_text": "",
+        "xml_path": None,
+        "pdf_path": None,
+        "text_path": None,
+        "attempt": attempt,
+        "selected_text_source": None,
+        "metadata_info": metadata_info,
+    }
+    if context.throttle:
+        context.throttle.wait("pmc_oa_s3")
+    try:
+        meta = fetch_pmc_oa_metadata(pmcid, session=context.session)
+    except Exception as e:
+        attempt["error"] = str(e)
+        return out
+    if meta is None:
+        for v in range(1, 4):
+            metadata_info["metadata_urls_tried"].append(
+                metadata_https_url(pmcid, v)
+            )
+        attempt["error"] = "not_in_oa_bucket"
+        return out
+
+    metadata_info["metadata_url"] = metadata_https_url(meta.pmcid, meta.version)
+    metadata_info["text_url"] = meta.text_https_url
+    metadata_info["xml_url"] = meta.xml_https_url
+    metadata_info["pdf_url"] = meta.pdf_https_url
+
+    body, artifact = download_pmc_oa_fulltext(meta, session=context.session)
+    if body and artifact:
+        if artifact == "txt":
+            plain = body
+            stats = _xml_quality_stats(plain)
+            if stats["quality_pass"]:
+                txt_path = os.path.join(context.text_dir, f"{file_stem}.txt")
+                with open(txt_path, "w", encoding="utf-8", errors="replace") as f:
+                    f.write(plain)
+                out["text_path"] = txt_path
+                out["xml_text"] = plain
+                out["selected_text_source"] = "pmc_oa_s3_txt"
+                attempt["success"] = True
+                attempt["artifact"] = "txt"
+            else:
+                out["xml_text"] = plain
+                attempt["error"] = "txt_below_quality_threshold"
+        elif artifact == "xml":
+            plain = _extract_text_from_xml_string(body)
+            stats = _xml_quality_stats(plain)
+            try:
+                os.makedirs(context.xml_dir, exist_ok=True)
+                xml_out = os.path.join(
+                    context.xml_dir, f"{file_stem}__pmc_oa_s3.xml"
+                )
+                with open(xml_out, "w", encoding="utf-8", errors="replace") as xf:
+                    xf.write(body)
+                out["xml_path"] = xml_out
+            except Exception as ex:
+                logger.debug(f"Could not save PMC OA S3 XML for {file_stem}: {ex}")
+            out["xml_text"] = plain
+            if stats["quality_pass"]:
+                attempt["success"] = True
+                attempt["artifact"] = "xml"
+                out["selected_text_source"] = "pmc_oa_s3_xml"
+            else:
+                attempt["error"] = "xml_below_quality_threshold"
+
+    if context.force_pdfs and not out["pdf_path"]:
+        pdf_bytes = download_pmc_oa_pdf(meta, session=context.session)
+        if pdf_bytes:
+            os.makedirs(context.pdf_dir, exist_ok=True)
+            pdf_out = os.path.join(context.pdf_dir, f"{file_stem}__pmc_oa_s3.pdf")
+            with open(pdf_out, "wb") as pf:
+                pf.write(pdf_bytes)
+            out["pdf_path"] = pdf_out
+            if not attempt["success"]:
+                attempt["success"] = True
+                attempt["artifact"] = "pdf"
+
+    return out
+
+
+def _record_has_usable_text(rec: Optional[DownloadRecord]) -> bool:
+    if rec is None or not rec.text_path:
+        return False
+    return os.path.isfile(rec.text_path) and os.path.getsize(rec.text_path) > 0
+
+
+def _collect_s3_record(
+    paper_id: str,
+    source: str,
+    context: CollectionContext,
+) -> Optional[DownloadRecord]:
+    """S3-only fetch using a pre-populated PMCID cache. Returns record if text/pdf obtained."""
+    doi = _extract_doi_from_identifier(paper_id)
+    safe = _doi_file_stem(paper_id, doi, source)
+    text_path: Optional[str] = None
+    pdf_path: Optional[str] = None
+    selected_text_source = "none"
+
+    if not context.no_cache:
+        candidate_text = os.path.join(context.text_dir, f"{safe}.txt")
+        if (
+            os.path.exists(candidate_text)
+            and os.path.getsize(candidate_text) > 0
+        ):
+            text_path = candidate_text
+            selected_text_source = "cached_text"
+        candidate_pdf = os.path.join(context.pdf_dir, f"{safe}.pdf")
+        if os.path.exists(candidate_pdf) and os.path.getsize(candidate_pdf) > 0:
+            pdf_path = candidate_pdf
+
+    pmcid = context.pmcid_cache.get(paper_id)
+    epmc_pmid = _europepmc_get_pmid(paper_id, context.cache_lock)
+    epmc_search_query = _EUROPEPMC_LAST_SEARCH_QUERY.get(
+        paper_id, "pmcid_cache_hit"
+    )
+    pmc_oa_s3_meta: Dict[str, Any] = {}
+    source_attempts: Dict[str, Dict[str, Any]] = {
+        "pmc_oa_s3": {
+            "attempted": False,
+            "success": False,
+            "artifact": None,
+            "error": None,
+        },
+        "europe_pmc": {
+            "attempted": False,
+            "success": False,
+            "artifact": None,
+            "error": None,
+        },
+    }
+
+    if text_path:
+        xml_stats = _xml_quality_stats("")
+        status = "ok"
+        return DownloadRecord(
+            paper_id=paper_id,
+            source=source,
+            pmcid=pmcid,
+            pdf_path=pdf_path,
+            text_path=text_path,
+            status=status,
+            message=None,
+            details={
+                "source_attempts": source_attempts,
+                "selected_text_source": selected_text_source,
+                "pdf_docling_required": False,
+                "doi": doi,
+                "file_stem": safe,
+                "xml_stats": xml_stats,
+            },
+        )
+
+    if not pmcid or context.disable_pmc_oa_s3:
+        return None
+
+    s3_out = _attempt_pmc_oa_s3(pmcid, context, safe)
+    source_attempts["pmc_oa_s3"] = s3_out["attempt"]
+    pmc_oa_s3_meta = s3_out.get("metadata_info") or {}
+    if s3_out.get("text_path"):
+        text_path = s3_out["text_path"]
+        selected_text_source = s3_out.get("selected_text_source") or "pmc_oa_s3_txt"
+    if s3_out.get("pdf_path"):
+        pdf_path = s3_out["pdf_path"]
+
+    if not text_path and not pdf_path:
+        return None
+
+    xml_text = s3_out.get("xml_text") or ""
+    if xml_text:
+        plain_for_stats = xml_text
+    elif text_path:
+        try:
+            with open(text_path, "r", encoding="utf-8", errors="replace") as tf:
+                plain_for_stats = tf.read()
+        except Exception:
+            plain_for_stats = ""
+    else:
+        plain_for_stats = ""
+    xml_stats = _xml_quality_stats(plain_for_stats)
+    pdf_docling_required = bool(not text_path and pdf_path)
+    status = "ok" if text_path else "partial"
+    message = None if text_path else "xml below quality threshold; docling conversion required"
+    successful_sources = sorted(
+        [k for k, v in source_attempts.items() if v.get("success")]
+    )
+    logger.info(
+        f"paper_text_retrieval paper_id={paper_id!r} doi={doi!r} "
+        f"europe_pmc_search_query={epmc_search_query!r} pmcid={pmcid!r} "
+        f"pmid={epmc_pmid!r} status={status!r} selected_text_source={selected_text_source!r} "
+        f"xml_quality_score={xml_stats.get('quality_score', 0.0)!r} "
+        f"pdf_docling_required={pdf_docling_required!r}"
+    )
+    _channels = ",".join(successful_sources) if successful_sources else "none"
+    logger.info(
+        f"paper_download_outcome paper_id={paper_id!r} source={source!r} "
+        f"outcome={status!r} primary_source={selected_text_source!r} channels={_channels!r}"
+    )
+    return DownloadRecord(
+        paper_id=paper_id,
+        source=source,
+        pmcid=pmcid,
+        pdf_path=pdf_path,
+        text_path=text_path,
+        status=status,
+        message=message,
+        details={
+            "source_attempts": source_attempts,
+            "successful_sources": successful_sources,
+            "n_successful_sources": len(successful_sources),
+            "xml_stats": xml_stats,
+            "selected_text_source": selected_text_source,
+            "pdf_docling_required": pdf_docling_required,
+            "doi": doi,
+            "file_stem": safe,
+            "retrieval_queries": {
+                "pmc_oa_s3": pmc_oa_s3_meta,
+                "europe_pmc": {
+                    "search_query": epmc_search_query,
+                    "pmcid_resolved": pmcid,
+                    "pmid_from_search": epmc_pmid,
+                },
+            },
+        },
+    )
+
+
+def _download_papers_phased(
+    paper_ids_with_source: List[Tuple[str, str]],
+    output_dir: str,
+    session: requests.Session,
+    pmcid_cache: Dict[str, Optional[str]],
+    provider: BaseCollectionProvider,
+    *,
+    no_cache: bool,
+    force_pdfs: bool,
+    prefer_pdf_text: bool,
+    delete_pdf_after_text: bool,
+    disable_semantic_scholar: bool,
+    collector_email: str,
+    max_workers: int,
+) -> List[DownloadRecord]:
+    pdf_dir = os.path.join(output_dir, "pdf")
+    xml_dir = os.path.join(output_dir, "text_xml")
+    text_dir = output_dir
+    cache_path = _pmcid_cache_path(output_dir)
+    _merge_pmcid_cache_from_disk(pmcid_cache, cache_path)
+
+    throttle_intervals = dict(_DEFAULT_THROTTLE_INTERVALS_S)
+    throttle_intervals["pmc_oa_s3"] = _env_float("PMC_OA_S3_THROTTLE_SECONDS", 0.0)
+    throttle = CollectThrottle(throttle_intervals)
+
+    s3_workers = _env_int("COLLECT_S3_WORKERS", 32, 1, 64)
+    fallback_workers = _env_int("COLLECT_FALLBACK_WORKERS", max_workers, 1, 16)
+    resolve_workers = _env_int("COLLECT_PMCID_RESOLVE_WORKERS", 8, 1, 32)
+    epmc_batch_size = _env_int("COLLECT_PMCID_EPMC_BATCH_SIZE", 40, 5, 80)
+    idconv_batch_size = _env_int("COLLECT_PMCID_IDCONV_BATCH_SIZE", 200, 10, 200)
+
+    unique_ids = list(
+        dict.fromkeys(
+            _normalize_paper_id(pid) or pid
+            for pid, _ in paper_ids_with_source
+        )
+    )
+    cache_lock = threading.Lock()
+    t0 = time.monotonic()
+    newly = batch_resolve_pmcids(
+        unique_ids,
+        pmcid_cache,
+        session,
+        throttle,
+        cache_lock,
+        collector_email=collector_email,
+        resolve_workers=resolve_workers,
+        epmc_batch_size=epmc_batch_size,
+        idconv_batch_size=idconv_batch_size,
+    )
+    save_pmcid_cache(cache_path, pmcid_cache)
+    resolved_n = sum(1 for pid in unique_ids if pmcid_cache.get(pid))
+    logger.info(
+        "Collect phased: PMCID batch {} new, {}/{} with PMCID ({:.1f}s)",
+        newly,
+        resolved_n,
+        len(unique_ids),
+        time.monotonic() - t0,
+    )
+
+    n = len(paper_ids_with_source)
+    records: List[Optional[DownloadRecord]] = [None] * n
+    need_fallback_set: Set[int] = set()
+
+    def _s3_context() -> CollectionContext:
+        s = requests.Session()
+        s.trust_env = False
+        s.headers.setdefault("User-Agent", "auto_lit_search/0.1 (collect-s3)")
+        return CollectionContext(
+            session=s,
+            pmcid_cache=pmcid_cache,
+            pdf_dir=pdf_dir,
+            text_dir=text_dir,
+            xml_dir=xml_dir,
+            no_cache=no_cache,
+            delete_pdf_after_text=delete_pdf_after_text,
+            force_pdfs=force_pdfs,
+            prefer_pdf_text=prefer_pdf_text,
+            throttle=throttle,
+            cache_lock=cache_lock,
+            disable_semantic_scholar=disable_semantic_scholar,
+            disable_pmc_oa_s3=False,
+        )
+
+    def _s3_job(i: int) -> Tuple[int, Optional[DownloadRecord]]:
+        pid, src = paper_ids_with_source[i]
+        return i, _collect_s3_record(pid, src, _s3_context())
+
+    t_s3 = time.monotonic()
+    s3_done = 0
+    with ThreadPoolExecutor(max_workers=s3_workers) as ex:
+        futs = {ex.submit(_s3_job, i): i for i in range(n)}
+        for fut in as_completed(futs):
+            i, rec = fut.result()
+            records[i] = rec
+            s3_done += 1
+            if not _record_has_usable_text(rec):
+                need_fallback_set.add(i)
+            if s3_done % 50 == 0:
+                logger.info(
+                    "Collect (S3 phase): finished {}/{} papers ({:.1f}%)",
+                    s3_done,
+                    n,
+                    100.0 * s3_done / n,
+                )
+    s3_hits = sum(1 for r in records if _record_has_usable_text(r))
+    logger.info(
+        "Collect phased: S3 phase {} text hits in {:.1f}s (workers={})",
+        s3_hits,
+        time.monotonic() - t_s3,
+        s3_workers,
+    )
+
+    need_fallback = sorted(need_fallback_set)
+    if need_fallback:
+        fallback_worker = partial(
+            _collect_single_record,
+            provider=provider,
+            pdf_dir=pdf_dir,
+            text_dir=text_dir,
+            xml_dir=xml_dir,
+            pmcid_cache=pmcid_cache,
+            no_cache=no_cache,
+            delete_pdf_after_text=delete_pdf_after_text,
+            force_pdfs=force_pdfs,
+            prefer_pdf_text=prefer_pdf_text,
+            throttle=throttle,
+            cache_lock=cache_lock,
+            disable_semantic_scholar=disable_semantic_scholar,
+            disable_pmc_oa_s3=True,
+        )
+        t_fb = time.monotonic()
+        fb_done = 0
+        with ThreadPoolExecutor(max_workers=fallback_workers) as ex:
+            futs = {
+                ex.submit(fallback_worker, paper_ids_with_source[i]): i
+                for i in need_fallback
+            }
+            for fut in as_completed(futs):
+                i = futs[fut]
+                records[i] = fut.result()
+                fb_done += 1
+                if fb_done % 50 == 0:
+                    logger.info(
+                        "Collect (fallback): finished {}/{} papers",
+                        fb_done,
+                        len(need_fallback),
+                    )
+        logger.info(
+            "Collect phased: fallback {} papers in {:.1f}s (workers={})",
+            len(need_fallback),
+            time.monotonic() - t_fb,
+            fallback_workers,
+        )
+
+    save_pmcid_cache(cache_path, pmcid_cache)
+    return [r for r in records if r is not None]
+
+
 def download_papers_to_dir(
     paper_ids_with_source: List[Tuple[str, str]],
     output_dir: str,
@@ -1175,6 +1988,7 @@ def download_papers_to_dir(
     delete_pdf_after_text: bool = False,
     max_workers: int = 2,
     disable_semantic_scholar: bool = False,
+    disable_pmc_oa_s3: bool = False,
 ) -> List[DownloadRecord]:
     """
     Download full-text for a list of (paper_id, source) into output_dir.
@@ -1182,6 +1996,8 @@ def download_papers_to_dir(
     Returns list of DownloadRecord. Use output_dir as papers_dir for GPU API.
     """
     session = session or requests.Session()
+    session.trust_env = False
+    session.headers.setdefault("User-Agent", "auto_lit_search/0.1 (collect)")
     pmcid_cache = pmcid_cache if pmcid_cache is not None else {}
     os.makedirs(output_dir, exist_ok=True)
     pdf_dir = os.path.join(output_dir, "pdf")
@@ -1200,8 +2016,27 @@ def download_papers_to_dir(
         auth_scope=selected_scope,
         collector_email=selected_email or None,
     )
+    workers = max(1, min(16, int(max_workers)))
+    if _env_disable_pmc_oa_s3():
+        disable_pmc_oa_s3 = True
+
+    if _phased_download_enabled() and not disable_pmc_oa_s3:
+        return _download_papers_phased(
+            paper_ids_with_source,
+            output_dir,
+            session,
+            pmcid_cache,
+            provider,
+            no_cache=no_cache,
+            force_pdfs=force_pdfs,
+            prefer_pdf_text=prefer_pdf_text,
+            delete_pdf_after_text=delete_pdf_after_text,
+            disable_semantic_scholar=disable_semantic_scholar,
+            collector_email=selected_email,
+            max_workers=workers,
+        )
+
     throttle = CollectThrottle()
-    workers = max(1, int(max_workers))
     cache_lock = threading.Lock() if workers > 1 else None
 
     if workers <= 1:
@@ -1218,6 +2053,7 @@ def download_papers_to_dir(
             throttle=throttle,
             cache_lock=cache_lock,
             disable_semantic_scholar=disable_semantic_scholar,
+            disable_pmc_oa_s3=disable_pmc_oa_s3,
         )
         return [
             provider.resolve_and_fetch(pid, src, context)
@@ -1238,6 +2074,7 @@ def download_papers_to_dir(
         throttle=throttle,
         cache_lock=cache_lock,
         disable_semantic_scholar=disable_semantic_scholar,
+        disable_pmc_oa_s3=disable_pmc_oa_s3,
     )
     n = len(paper_ids_with_source)
     records: List[Optional[DownloadRecord]] = [None] * n
@@ -1303,6 +2140,7 @@ def run(
     collector_email: Optional[str] = None,
     max_workers: int = 2,
     disable_semantic_scholar: bool = False,
+    disable_pmc_oa_s3: bool = False,
     retry_failed_from: Optional[str] = None,
 ) -> pd.DataFrame:
     """
@@ -1388,11 +2226,14 @@ def run(
     ess = os.environ.get("COLLECT_DISABLE_SEMANTIC_SCHOLAR", "").strip().lower()
     if ess in ("1", "true", "yes"):
         disable_semantic_scholar = True
+    if _env_disable_pmc_oa_s3():
+        disable_pmc_oa_s3 = True
     throttle = CollectThrottle()
     cache_lock = threading.Lock() if workers > 1 else None
     logger.info(
         f"Collect (download): max_workers={workers} "
-        f"semantic_scholar={'off' if disable_semantic_scholar else 'on'}"
+        f"semantic_scholar={'off' if disable_semantic_scholar else 'on'} "
+        f"pmc_oa_s3={'off' if disable_pmc_oa_s3 else 'on'}"
     )
 
     def _load_retry_ids(path: str) -> Set[str]:
@@ -1515,6 +2356,7 @@ def run(
             throttle=throttle,
             cache_lock=cache_lock,
             disable_semantic_scholar=disable_semantic_scholar,
+            disable_pmc_oa_s3=disable_pmc_oa_s3,
         )
         for idx, (paper_id, source) in enumerate(paper_items, start=1):
             rec = provider.resolve_and_fetch(paper_id, source, context)
@@ -1543,6 +2385,7 @@ def run(
             throttle=throttle,
             cache_lock=cache_lock,
             disable_semantic_scholar=disable_semantic_scholar,
+            disable_pmc_oa_s3=disable_pmc_oa_s3,
         )
         slot: List[Optional[DownloadRecord]] = [None] * n_items
         with ThreadPoolExecutor(max_workers=workers) as ex:
@@ -1592,6 +2435,7 @@ def run(
         f"({data_root})"
     )
     checked_sources = [
+        "pmc_oa_s3",
         "europe_pmc",
         "elsevier",
         "wiley",
