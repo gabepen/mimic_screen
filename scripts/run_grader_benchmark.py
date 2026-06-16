@@ -148,6 +148,11 @@ def _grade_one(
         "baseline_relevance_grade": paper.get("baseline_relevance_grade"),
         "baseline_rubric_dimension_scores": paper.get("baseline_rubric_dimension_scores"),
         "new_relevance_grade": (new_row or {}).get("relevance_grade"),
+        "new_relevance_sort": (new_row or {}).get("relevance_sort"),
+        "new_paper_grade": (new_row or {}).get("paper_grade"),
+        "new_primary_grade": (new_row or {}).get("primary_grade"),
+        "new_axis_totals": (new_row or {}).get("axis_totals"),
+        "new_grading_schema_version": (new_row or {}).get("grading_schema_version"),
         "new_rubric_dimension_scores": (new_row or {}).get("rubric_dimension_scores"),
         "new_rationale": (new_row or {}).get("rationale"),
         "baseline_rationale": paper.get("baseline_rationale"),
@@ -236,6 +241,7 @@ def main() -> int:
         "n_graded_ok": n_graded_ok,
         "n_llm_failed": sum(1 for r in rows if not r.get("graded_ok")),
         "results_jsonl": str(results_path),
+        "note": "Run summarize_grader_benchmark.py for summary.json, compare.csv, and timing CSVs.",
     }
     (run_dir / "run_summary.json").write_text(
         json.dumps(summary, indent=2) + "\n",
