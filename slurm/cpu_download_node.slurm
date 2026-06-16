@@ -11,7 +11,11 @@ set -euo pipefail
 : "${DATA_ROOT:?DATA_ROOT must be set}"
 : "${PAPER_IDS_PATH:?PAPER_IDS_PATH must be set}"
 : "${OUTPUT_ROOT:?OUTPUT_ROOT must be set}"
-: "${GPU_HOST:?GPU_HOST must be set (GPU node hostname)}"
+GPU_URLS="${GPU_URLS:-}"
+GPU_JOB_IDS="${GPU_JOB_IDS:-}"
+if [[ -z "${GPU_URLS}" && -z "${GPU_JOB_IDS}" ]]; then
+    : "${GPU_HOST:?GPU_HOST must be set when GPU_URLS and GPU_JOB_IDS are empty}"
+fi
 : "${DOCLING_HOST:?DOCLING_HOST must be set (Docling node hostname)}"
 GRADER_URLS="${GRADER_URLS:-}"
 GRADER_JOB_IDS="${GRADER_JOB_IDS:-}"
@@ -26,6 +30,7 @@ fi
 GPU_API_PORT="${GPU_API_PORT:-9000}"
 DOCLING_API_PORT="${DOCLING_API_PORT:-9100}"
 GRADER_API_PORT="${GRADER_API_PORT:-9200}"
+NUM_SYNTHESIS_NODES="${NUM_SYNTHESIS_NODES:-}"
 GRADER_MAX_TOKENS="${GRADER_MAX_TOKENS:-4096}"
 STAGE_WATCHDOG_SECONDS="${STAGE_WATCHDOG_SECONDS:-14400}"
 REPO_ROOT="${REPO_ROOT:-$PWD}"
@@ -45,7 +50,13 @@ export PYTHONUNBUFFERED=1
 echo "cpu_download_node: DATA_ROOT=${DATA_ROOT}"
 echo "cpu_download_node: PAPER_IDS_PATH=${PAPER_IDS_PATH}"
 echo "cpu_download_node: OUTPUT_ROOT=${OUTPUT_ROOT}"
-echo "cpu_download_node: GPU_HOST=${GPU_HOST} GPU_API_PORT=${GPU_API_PORT}"
+echo "cpu_download_node: GPU_HOST=${GPU_HOST:-} GPU_API_PORT=${GPU_API_PORT}"
+if [[ -n "${GPU_URLS}" ]]; then
+    echo "cpu_download_node: GPU_URLS=${GPU_URLS}"
+fi
+if [[ -n "${GPU_JOB_IDS}" ]]; then
+    echo "cpu_download_node: GPU_JOB_IDS=${GPU_JOB_IDS} NUM_SYNTHESIS_NODES=${NUM_SYNTHESIS_NODES:-}"
+fi
 echo "cpu_download_node: DOCLING_HOST=${DOCLING_HOST} DOCLING_API_PORT=${DOCLING_API_PORT}"
 echo "cpu_download_node: STAGE_WATCHDOG_SECONDS=${STAGE_WATCHDOG_SECONDS}"
 if [[ -n "${GRADER_URLS}" ]]; then
@@ -57,8 +68,24 @@ if [[ -n "${GRADER_JOB_IDS}" ]]; then
     echo "cpu_download_node: GRADER_JOB_IDS=${GRADER_JOB_IDS} NUM_GRADER_NODES=${NUM_GRADER_NODES:-}"
 fi
 GRADER_ENDPOINTS_FILE="${DATA_ROOT}/logs/grader_endpoints_discovered.txt"
+GPU_ENDPOINTS_FILE="${DATA_ROOT}/logs/gpu_endpoints_discovered.txt"
 GRADER_DISCOVER_INTERVAL="${GRADER_DISCOVER_INTERVAL:-15}"
+GPU_DISCOVER_INTERVAL="${GPU_DISCOVER_INTERVAL:-15}"
 _DISCOVER_PID=""
+_GPU_DISCOVER_PID=""
+
+if [[ -n "${GPU_JOB_IDS}" ]]; then
+    export GPU_JOB_IDS GPU_API_PORT GPU_ENDPOINTS_FILE
+    bash "${REPO_ROOT}/slurm/gpu_endpoints_discover.sh" || true
+    echo "cpu_download_node: host synthesis GPU discovery -> ${GPU_ENDPOINTS_FILE} ($(wc -l < "${GPU_ENDPOINTS_FILE}" 2>/dev/null || echo 0) URL(s))"
+    (
+        while true; do
+            bash "${REPO_ROOT}/slurm/gpu_endpoints_discover.sh" 2>/dev/null || true
+            sleep "${GPU_DISCOVER_INTERVAL}"
+        done
+    ) &
+    _GPU_DISCOVER_PID=$!
+fi
 
 if [[ -n "${GRADER_JOB_IDS}" ]]; then
     export GRADER_JOB_IDS GRADER_API_PORT GRADER_ENDPOINTS_FILE
@@ -71,8 +98,9 @@ if [[ -n "${GRADER_JOB_IDS}" ]]; then
         done
     ) &
     _DISCOVER_PID=$!
-    trap '[[ -n "${_DISCOVER_PID}" ]] && kill "${_DISCOVER_PID}" 2>/dev/null || true' EXIT
 fi
+
+trap '[[ -n "${_DISCOVER_PID}" ]] && kill "${_DISCOVER_PID}" 2>/dev/null || true; [[ -n "${_GPU_DISCOVER_PID}" ]] && kill "${_GPU_DISCOVER_PID}" 2>/dev/null || true' EXIT
 
 echo "cpu_download_node: starting container..."
 EXTRA_BINDS=()
@@ -87,12 +115,12 @@ singularity exec \
     -B "${OUTPUT_ROOT}:${OUTPUT_ROOT}" \
     -B "${REPO_ROOT}:${REPO_ROOT}" \
     "${EXTRA_BINDS[@]}" \
-    --env "PYTHONPATH=${REPO_ROOT}/src,COLLECTION_ORG=${COLLECTION_ORG},COLLECTION_AUTH_SCOPE=${COLLECTION_AUTH_SCOPE},COLLECTOR_EMAIL=${COLLECTOR_EMAIL},COLLECT_MAX_WORKERS=${COLLECT_MAX_WORKERS},COLLECT_DISABLE_SEMANTIC_SCHOLAR=${COLLECT_DISABLE_SEMANTIC_SCHOLAR},GRADER_URLS=${GRADER_URLS},GRADER_JOB_IDS=${GRADER_JOB_IDS},GRADER_HOST=${GRADER_HOST:-},GRADER_API_PORT=${GRADER_API_PORT},NUM_GRADER_NODES=${NUM_GRADER_NODES},GRADER_MAX_TOKENS=${GRADER_MAX_TOKENS},STAGE_WATCHDOG_SECONDS=${STAGE_WATCHDOG_SECONDS},GRADER_ENDPOINTS_FILE=${GRADER_ENDPOINTS_FILE},HOST_RUBRIC_PATH=${HOST_RUBRIC_PATH},MICROBE_RUBRIC_PATH=${MICROBE_RUBRIC_PATH}" \
+    --env "PYTHONPATH=${REPO_ROOT}/src,COLLECTION_ORG=${COLLECTION_ORG},COLLECTION_AUTH_SCOPE=${COLLECTION_AUTH_SCOPE},COLLECTOR_EMAIL=${COLLECTOR_EMAIL},COLLECT_MAX_WORKERS=${COLLECT_MAX_WORKERS},COLLECT_DISABLE_SEMANTIC_SCHOLAR=${COLLECT_DISABLE_SEMANTIC_SCHOLAR},GPU_URLS=${GPU_URLS},GPU_JOB_IDS=${GPU_JOB_IDS},GPU_HOST=${GPU_HOST:-},GPU_API_PORT=${GPU_API_PORT},NUM_SYNTHESIS_NODES=${NUM_SYNTHESIS_NODES},GPU_ENDPOINTS_FILE=${GPU_ENDPOINTS_FILE},GRADER_URLS=${GRADER_URLS},GRADER_JOB_IDS=${GRADER_JOB_IDS},GRADER_HOST=${GRADER_HOST:-},GRADER_API_PORT=${GRADER_API_PORT},NUM_GRADER_NODES=${NUM_GRADER_NODES},GRADER_MAX_TOKENS=${GRADER_MAX_TOKENS},STAGE_WATCHDOG_SECONDS=${STAGE_WATCHDOG_SECONDS},GRADER_ENDPOINTS_FILE=${GRADER_ENDPOINTS_FILE},HOST_RUBRIC_PATH=${HOST_RUBRIC_PATH},MICROBE_RUBRIC_PATH=${MICROBE_RUBRIC_PATH}" \
     "${CPU_IMAGE}" \
     python -u -m auto_lit_search.download_node \
         --paper-ids "${PAPER_IDS_PATH}" \
         --data-root "${DATA_ROOT}" \
-        --gpu-host "${GPU_HOST}" \
+        --gpu-host "${GPU_HOST:-}" \
         --gpu-port "${GPU_API_PORT}" \
         --docling-host "${DOCLING_HOST}" \
         --docling-port "${DOCLING_API_PORT}" \
