@@ -3,12 +3,10 @@ CPU node script: read search output, download papers per alignment, POST each ba
 Run inside the lit-download container with env: DATA_ROOT, PAPER_IDS_PATH, GPU_HOST, GPU_API_PORT, OUTPUT_ROOT.
 """
 
-import csv
 import json
 import os
 import re
 import sys
-import tempfile
 import threading
 import time
 from typing import Any, Dict, List, Tuple
@@ -17,7 +15,23 @@ from urllib.parse import urlparse
 import requests
 from loguru import logger
 
-from auto_lit_search.collect import _extract_doi_from_identifier, download_papers_to_dir
+from auto_lit_search.collect import download_papers_to_dir
+from auto_lit_search.download_manifest import (
+    DOWNLOAD_MANIFEST_FILENAME,
+    _alignment_paper_ids,
+    _emit_download_progress_summary,
+    _infer_docling_required_basenames_from_disk,
+    _load_download_manifest,
+    _load_idmap,
+    _load_search_json,
+    _merge_recs_into_manifest,
+    _write_download_manifest_atomic,
+    classify_alignment_papers,
+    is_alignment_download_complete,
+    load_global_outcome_cache,
+    record_global_outcomes_from_rows,
+    write_alignment_download_complete,
+)
 from auto_lit_search.graded_request import build_run_alignment_graded_request
 from auto_lit_search.scheduler_http import post_run_alignment_graded
 from auto_lit_search.slurm_utils import (
@@ -33,7 +47,6 @@ logger.add(
     format="<green>{time:HH:mm:ss}</green> | <level>{level:<7}</level> | {message}",
 )
 
-DOWNLOAD_MANIFEST_FILENAME = "download_manifest.jsonl"
 _DEFAULT_GRADER_MAX_TOKENS = 4096
 
 
@@ -130,239 +143,81 @@ def _resolve_grader_url_bases(grader_host: str, grader_port: int) -> List[str]:
     return out
 
 
+def _resolve_gpu_url_bases(gpu_host: str, gpu_port: int) -> List[str]:
+    """Synthesis LLM endpoints: GPU_URLS, GPU_HOSTS, single --gpu-host."""
+    seen: set[str] = set()
+    out: List[str] = []
+
+    def _add(entry: str) -> None:
+        url = _normalize_grader_url(entry, gpu_port)
+        if url and url not in seen:
+            seen.add(url)
+            out.append(url)
+
+    raw_urls = os.environ.get("GPU_URLS", "").strip()
+    if raw_urls:
+        for part in re.split(r"[;,]", raw_urls):
+            _add(part)
+        if out:
+            return out
+
+    raw_hosts = os.environ.get("GPU_HOSTS", "").strip()
+    if raw_hosts:
+        for part in raw_hosts.split(","):
+            _add(part)
+        if out:
+            return out
+
+    if gpu_host and str(gpu_host).strip():
+        _add(str(gpu_host).strip())
+    return out
+
+
+def _parse_gpu_job_specs(gpu_port: int) -> List[Tuple[str, int]]:
+    """Return (slurm_job_id, api_port) pairs from GPU_JOB_IDS."""
+    raw = os.environ.get("GPU_JOB_IDS", "").strip()
+    if not raw:
+        return []
+    specs: List[Tuple[str, int]] = []
+    for i, part in enumerate(re.split(r"[:,]", raw)):
+        job_id = part.strip()
+        if job_id:
+            specs.append((job_id, gpu_port + i))
+    return specs
+
+
+def _registered_gpu_ports(urls: List[str]) -> set[int]:
+    ports: set[int] = set()
+    for u in urls:
+        p = urlparse(u)
+        if p.port is not None:
+            ports.add(int(p.port))
+    return ports
+
+
+def _prune_gpu_pending_specs(
+    pending: List[Dict[str, Any]],
+    registered_urls: List[str],
+) -> int:
+    reg_ports = _registered_gpu_ports(registered_urls)
+    if not reg_ports:
+        return 0
+    before = len(pending)
+    kept = [s for s in pending if int(s["port"]) not in reg_ports]
+    pending[:] = kept
+    return before - len(kept)
+
+
 def _only_download_progress_log(record: Dict[str, Any]) -> bool:
     return record["extra"].get("download_progress") is True
 
 
-def _paper_pair_key(paper_id: str, source: str) -> Tuple[str, str]:
-    return (str(paper_id).strip(), str(source).strip())
-
-
-def _load_download_manifest(manifest_path: str) -> Dict[Tuple[str, str], Dict[str, Any]]:
-    out: Dict[Tuple[str, str], Dict[str, Any]] = {}
-    if not manifest_path or not os.path.isfile(manifest_path):
-        return out
-    try:
-        with open(manifest_path, "r", encoding="utf-8") as f:
-            for line in f:
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    rec = json.loads(line)
-                except Exception:
-                    continue
-                pid = str(rec.get("paper_id") or "").strip()
-                src = str(rec.get("source") or "").strip()
-                if not pid:
-                    continue
-                out[_paper_pair_key(pid, src)] = rec
-    except Exception:
-        return out
-    return out
-
-
-def _manifest_file_stem(row: Dict[str, Any]) -> str:
-    stem = str(row.get("file_stem") or "").strip()
-    if stem:
-        return stem
-    tp = str(row.get("text_path") or "").strip()
-    if tp:
-        return os.path.splitext(os.path.basename(tp))[0]
-    pp = str(row.get("pdf_path") or "").strip()
-    if pp:
-        return os.path.splitext(os.path.basename(pp))[0]
-    return ""
-
-
-def _manifest_row_satisfied(row: Dict[str, Any], papers_dir: str) -> bool:
-    st = str(row.get("status") or "").strip().lower()
-    if st == "failed":
-        return False
-    if st == "skipped":
-        return True
-    stem = _manifest_file_stem(row)
-    if not stem:
-        return False
-    txt_path = os.path.join(papers_dir, f"{stem}.txt")
-    if os.path.isfile(txt_path) and os.path.getsize(txt_path) > 0:
-        return True
-    if st == "partial":
-        pdf_path = os.path.join(papers_dir, "pdf", f"{stem}.pdf")
-        return os.path.isfile(pdf_path) and os.path.getsize(pdf_path) > 0
-    return False
-
-
-def _download_record_to_manifest_row(rec: Any, updated_at: float) -> Dict[str, Any]:
-    d = getattr(rec, "details", None) or {}
-    doi = d.get("doi") or _extract_doi_from_identifier(getattr(rec, "paper_id", "") or "")
-    stem = str(d.get("file_stem") or "").strip()
-    if not stem:
-        tp = getattr(rec, "text_path", None) or ""
-        if tp:
-            stem = os.path.splitext(os.path.basename(str(tp)))[0]
-    if not stem:
-        pp = getattr(rec, "pdf_path", None) or ""
-        if pp:
-            stem = os.path.splitext(os.path.basename(str(pp)))[0]
-    return {
-        "paper_id": getattr(rec, "paper_id", "") or "",
-        "source": getattr(rec, "source", "") or "",
-        "doi": doi or "",
-        "file_stem": stem,
-        "status": getattr(rec, "status", "") or "",
-        "selected_text_source": str(d.get("selected_text_source") or ""),
-        "pdf_docling_required": bool(d.get("pdf_docling_required")),
-        "text_path": getattr(rec, "text_path", None) or "",
-        "pdf_path": getattr(rec, "pdf_path", None) or "",
-        "message": getattr(rec, "message", None) or "",
-        "updated_at": updated_at,
-    }
-
-
-def _merge_recs_into_manifest(
-    existing: Dict[Tuple[str, str], Dict[str, Any]], recs: List[Any]
-) -> Dict[Tuple[str, str], Dict[str, Any]]:
-    merged = dict(existing)
-    ts = time.time()
-    for rec in recs:
-        key = _paper_pair_key(getattr(rec, "paper_id", ""), getattr(rec, "source", ""))
-        merged[key] = _download_record_to_manifest_row(rec, ts)
-    return merged
-
-
-def _write_download_manifest_atomic(
-    manifest_path: str, rows_by_key: Dict[Tuple[str, str], Dict[str, Any]]
-) -> None:
-    d = os.path.dirname(manifest_path) or "."
-    os.makedirs(d, exist_ok=True)
-    keys = sorted(rows_by_key.keys(), key=lambda k: (k[0], k[1]))
-    fd, tmp = tempfile.mkstemp(
-        prefix=".download_manifest_", suffix=".tmp", dir=d, text=True
+def _retry_failed_enabled() -> bool:
+    return os.environ.get("DOWNLOAD_RETRY_FAILED", "").strip().lower() in (
+        "1",
+        "true",
+        "yes",
     )
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8") as wf:
-            for k in keys:
-                wf.write(json.dumps(rows_by_key[k], ensure_ascii=False) + "\n")
-        os.replace(tmp, manifest_path)
-    except Exception:
-        try:
-            os.unlink(tmp)
-        except Exception:
-            pass
-        raise
-
-
-def _emit_download_progress_summary(
-    alignment_id: str,
-    expected: List[Tuple[str, str]],
-    manifest_map: Dict[Tuple[str, str], Dict[str, Any]],
-    papers_dir: str,
-    phase: str,
-) -> List[Tuple[str, str]]:
-    total = len(expected)
-    satisfied = 0
-    missing: List[Tuple[str, str]] = []
-    for pid, src in expected:
-        key = _paper_pair_key(pid, src)
-        row = manifest_map.get(key)
-        if row and _manifest_row_satisfied(row, papers_dir):
-            satisfied += 1
-        else:
-            missing.append((pid, src))
-    cap = 20
-    parts: List[str] = []
-    for pid, src in missing[:cap]:
-        doi = _extract_doi_from_identifier(pid) or pid
-        parts.append(f"{doi}:{src}")
-    tail = ""
-    if len(missing) > cap:
-        tail = f" …(+{len(missing) - cap} more)"
-    preview = ",".join(parts) + tail
-    logger.bind(download_progress=True).info(
-        "alignment_download_summary alignment_id={} phase={} total_expected={} "
-        "satisfied={} missing_count={} missing_preview=[{}]",
-        alignment_id,
-        phase,
-        total,
-        satisfied,
-        len(missing),
-        preview,
-    )
-    return missing
-
-
-def _load_search_json(path: str) -> Dict[str, List[Dict[str, Any]]]:
-    with open(path, "r", encoding="utf-8") as f:
-        return json.load(f)
-
-
-def _alignment_paper_ids(alignment: Dict[str, Any]) -> List[Tuple[str, str]]:
-    """
-    Return a flat list of (paper_id, source) for this alignment.
-
-    Source is either "query" or "target"; for lp-human controls we also
-    carry richer gene metadata alongside the alignment, but this helper
-    stays focused on IDs + coarse role.
-    """
-    out: List[Tuple[str, str]] = []
-    for pid in alignment.get("query_paper_dois") or []:
-        if pid and str(pid).strip():
-            out.append((str(pid).strip(), "query"))
-    for pid in alignment.get("target_paper_dois") or []:
-        if pid and str(pid).strip():
-            out.append((str(pid).strip(), "target"))
-    return out
-
-
-def _load_idmap(csv_path: str) -> Dict[str, Dict[str, Any]]:
-    """
-    Load mapping CSV with columns like:
-        query,target,
-        query_entrez_id,target_entrez_id,
-        query_gene_name,target_gene_name,
-        query_locus_tag,target_locus_tag,
-        query_genbank_acc,target_genbank_acc,
-        query_common_name,target_common_name
-    and return a dict keyed by "query|target" with query/target metadata
-    shaped for the GPU gene_context helper.
-    """
-    out: Dict[str, Dict[str, Any]] = {}
-    if not csv_path or not os.path.isfile(csv_path):
-        return out
-
-    with open(csv_path, newline="", encoding="utf-8") as f:
-        reader = csv.DictReader(f)
-        for row in reader:
-            query = (row.get("query") or "").strip()
-            target = (row.get("target") or "").strip()
-            if not query or not target:
-                continue
-
-            def _meta(prefix: str) -> Dict[str, Any]:
-                syn_raw = (
-                    row.get(f"{prefix}_synonyms")
-                    or row.get(f"{prefix}_gene_synonyms")
-                    or row.get(f"{prefix}_aliases")
-                    or ""
-                )
-                syns = [s.strip() for s in str(syn_raw).split(",") if s.strip()]
-                return {
-                    "uniprot_id": (row.get(prefix) or "").strip(),
-                    "entrez_id": (row.get(f"{prefix}_entrez_id") or "").strip(),
-                    "gene_name": (row.get(f"{prefix}_gene_name") or "").strip(),
-                    "locus_tag": (row.get(f"{prefix}_locus_tag") or "").strip(),
-                    "genbank_acc": (row.get(f"{prefix}_genbank_acc") or "").strip(),
-                    "common_name": (row.get(f"{prefix}_common_name") or "").strip(),
-                    "synonyms": syns,
-                }
-
-            key = f"{query}|{target}"
-            out[key] = {
-                "query_meta": _meta("query"),
-                "target_meta": _meta("target"),
-            }
-    return out
 
 
 def _parse_grader_job_specs(grader_port: int) -> List[Tuple[str, int]]:
@@ -609,16 +464,163 @@ def run(
         "download_node: SERVICE_HEALTH_WAIT_SECONDS={} (LLM / Docling / Grader /healthz)",
         service_health_wait_seconds,
     )
-    gpu_url_base = f"http://{gpu_host}:{gpu_port}"
+    gpu_url_bases = _resolve_gpu_url_bases(gpu_host, gpu_port)
+    if not gpu_url_bases and not os.environ.get("GPU_JOB_IDS", "").strip():
+        raise RuntimeError(
+            "At least one synthesis GPU endpoint is required (GPU_URLS, GPU_HOSTS, "
+            "GPU_JOB_IDS, or --gpu-host)"
+        )
+
+    gpu_job_specs = _parse_gpu_job_specs(gpu_port)
+    gpu_discovery_enabled = bool(gpu_job_specs)
+    gpu_pending_specs: List[Dict[str, Any]] = [
+        {"job_id": jid, "port": port, "failed": False, "failed_logged": False}
+        for jid, port in gpu_job_specs
+    ]
+    _gpu_pruned = _prune_gpu_pending_specs(gpu_pending_specs, gpu_url_bases)
+    if _gpu_pruned:
+        logger.info(
+            "download_node: {} synthesis GPU Slurm job(s) skipped for discovery "
+            "(ports already in GPU_URLS: {})",
+            _gpu_pruned,
+            sorted(_registered_gpu_ports(gpu_url_bases)),
+        )
+    _num_synth_nodes_raw = os.environ.get("NUM_SYNTHESIS_NODES", "").strip()
+    _num_synth_nodes_want = 0
+    if _num_synth_nodes_raw:
+        try:
+            _num_synth_nodes_want = max(0, int(_num_synth_nodes_raw))
+        except ValueError:
+            _num_synth_nodes_want = 0
+    if gpu_job_specs:
+        gpu_target = len(gpu_job_specs)
+        if _num_synth_nodes_want and gpu_target < _num_synth_nodes_want:
+            logger.warning(
+                "download_node: GPU_JOB_IDS lists {} job(s) but NUM_SYNTHESIS_NODES={}",
+                gpu_target,
+                _num_synth_nodes_want,
+            )
+            gpu_target = _num_synth_nodes_want
+    elif _num_synth_nodes_want:
+        gpu_target = _num_synth_nodes_want
+    else:
+        gpu_target = max(1, len(gpu_url_bases) or 1)
+
+    scheduler_lock = threading.Lock()
+
+    def _register_gpu_url(url: str, job_id: str = "") -> bool:
+        base = url.rstrip("/")
+        with scheduler_lock:
+            if base in gpu_url_bases:
+                return False
+            gpu_url_bases.append(base)
+        p = urlparse(base)
+        if p.port is not None:
+            gpu_pending_specs[:] = [
+                s for s in gpu_pending_specs if int(s["port"]) != int(p.port)
+            ]
+        logger.info(
+            "download_node: synthesis GPU endpoint registered (job_id={}, url={})",
+            job_id or "n/a",
+            base,
+        )
+        return True
+
+    def _refresh_gpu_endpoints_from_host_file() -> None:
+        path = os.environ.get("GPU_ENDPOINTS_FILE", "").strip()
+        if not path or not os.path.isfile(path):
+            return
+        with open(path, encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith("#"):
+                    continue
+                url = line.split()[0]
+                if url.startswith("http://") or url.startswith("https://"):
+                    _register_gpu_url(url, "host_discovery")
+
+    def _refresh_gpu_endpoints() -> None:
+        _refresh_gpu_endpoints_from_host_file()
+        if not gpu_pending_specs:
+            return
+        still_pending: List[Dict[str, Any]] = []
+        for spec in gpu_pending_specs:
+            if spec.get("failed"):
+                continue
+            jid = str(spec["job_id"])
+            port = int(spec["port"])
+            node = get_job_node(jid)
+            if not node:
+                st = get_job_state(jid)
+                if is_terminal_job_state(st):
+                    if not spec.get("failed_logged"):
+                        logger.warning(
+                            "Synthesis GPU Slurm job {} entered terminal state {}",
+                            jid,
+                            st,
+                        )
+                        spec["failed_logged"] = True
+                    spec["failed"] = True
+                else:
+                    still_pending.append(spec)
+                continue
+            url = f"http://{node}:{port}".rstrip("/")
+            with scheduler_lock:
+                already_registered = url in gpu_url_bases
+            if already_registered:
+                continue
+            if not _grader_health_ok(url):
+                still_pending.append(spec)
+                continue
+            if not _register_gpu_url(url, jid):
+                still_pending.append(spec)
+        gpu_pending_specs[:] = still_pending
+
+    if gpu_discovery_enabled:
+        logger.info(
+            "download_node: dynamic synthesis GPU discovery enabled ({} Slurm job(s), "
+            "{} URL(s) at startup)",
+            len(gpu_job_specs),
+            len(gpu_url_bases),
+        )
+        deadline = time.monotonic() + service_health_wait_seconds
+        while time.monotonic() < deadline:
+            _refresh_gpu_endpoints()
+            if any(_grader_health_ok(u) for u in gpu_url_bases):
+                break
+            time.sleep(5)
+        else:
+            raise RuntimeError(
+                "No synthesis GPU endpoint became healthy within "
+                f"{service_health_wait_seconds}s (GPU_JOB_IDS discovery)"
+            )
+    for synth_url in list(gpu_url_bases):
+        logger.info(
+            "download_node: probing synthesis LLM GPU health at {}/healthz",
+            synth_url.rstrip("/"),
+        )
+        sys.stdout.flush()
+        if not _wait_health(
+            "LLM GPU",
+            synth_url,
+            timeout=service_health_wait_seconds if not gpu_discovery_enabled else min(
+                120, service_health_wait_seconds
+            ),
+        ):
+            if gpu_discovery_enabled:
+                logger.warning(
+                    "Synthesis GPU at {} not healthy yet; will retry via discovery",
+                    synth_url,
+                )
+            else:
+                raise RuntimeError(f"GPU node not healthy at {synth_url}")
+    if gpu_discovery_enabled:
+        _refresh_gpu_endpoints()
     logger.info(
-        "download_node: probing LLM GPU health at {}/healthz",
-        gpu_url_base.rstrip("/"),
+        "download_node: {} synthesis GPU endpoint(s) active: {}",
+        len(gpu_url_bases),
+        ", ".join(gpu_url_bases),
     )
-    sys.stdout.flush()
-    if not _wait_health(
-        "LLM GPU", gpu_url_base, timeout=service_health_wait_seconds
-    ):
-        raise RuntimeError(f"GPU node not healthy at {gpu_url_base}")
 
     docling_url_base = ""
     if docling_host:
@@ -688,7 +690,6 @@ def run(
                 "download_node: invalid GRADER_INFLIGHT_CAP={!r}; ignoring",
                 _grader_limit_raw,
             )
-    scheduler_lock = threading.Lock()
 
     def _drop_pending_specs_for_registered_port(port: int) -> None:
         grader_pending_specs[:] = [
@@ -915,6 +916,8 @@ def run(
     # ConnectionResetError on status polls when the lock previously wrapped HTTP).
     scheduler_session.headers["Connection"] = "close"
     pmcid_cache: Dict[str, str | None] = {}
+    retry_failed = _retry_failed_enabled()
+    global_cache = load_global_outcome_cache(logs_base)
     total_done = 0
     failed_count = 0
     docling_inflight_cap = max(1, int(os.environ.get("DOCLING_INFLIGHT_CAP", "1")))
@@ -1274,56 +1277,92 @@ def run(
                 _write_state(aid)
 
     def _dispatch_synthesis() -> None:
-        with scheduler_lock:
-            if synthesis_inflight:
-                return
-            pending_aid: str | None = None
-            for aid, st in alignment_states.items():
-                if st.get("state") != STATE_SYNTHESIS_READY:
-                    continue
-                pending_aid = aid
-                st["state"] = STATE_SYNTHESIS_INFLIGHT
-                st["synthesis_submitted_at"] = time.time()
-                break
-        if not pending_aid:
-            return
+        def _synthesis_inflight_count_for_url(url: str) -> int:
+            return sum(
+                1
+                for meta in synthesis_inflight.values()
+                if str(meta.get("gpu_url_base") or "") == url
+            )
 
-        def _synthesis_worker(alignment_id: str) -> None:
-            err: str | None = None
-            try:
-                req = build_run_alignment_graded_request(
-                    alignment_id,
-                    output_root,
-                    instructions=instructions_text,
-                )
-                post_run_alignment_graded(gpu_url_base, req.dict())
-            except Exception as e:
-                err = f"synthesis failed: {e}"
-                logger.error("Alignment {}: {}", alignment_id, err)
+        def _pick_gpu_url_for_synthesis() -> str | None:
             with scheduler_lock:
-                meta = synthesis_inflight.get(alignment_id)
-                if meta is not None:
-                    meta["error"] = err
+                candidates = [
+                    u
+                    for u in gpu_url_bases
+                    if _synthesis_inflight_count_for_url(u) < 1
+                ]
+            if not candidates:
+                return None
+            candidates.sort(key=lambda u: (_synthesis_inflight_count_for_url(u), u))
+            return candidates[0]
 
-        worker = threading.Thread(
-            target=_synthesis_worker,
-            args=(pending_aid,),
-            name=f"lit-synthesis-{pending_aid}",
-            daemon=True,
-        )
-        with scheduler_lock:
-            synthesis_inflight[pending_aid] = {
-                "thread": worker,
-                "started_monotonic": time.monotonic(),
-            }
-        logger.info(
-            "Alignment {}: synthesis worker started (host={})",
-            pending_aid,
-            gpu_url_base,
-        )
-        worker.start()
-        with scheduler_lock:
-            _write_state(pending_aid)
+        max_rounds = max(1, len(gpu_url_bases))
+        for _ in range(max_rounds):
+            with scheduler_lock:
+                if not gpu_url_bases:
+                    return
+                busy = all(
+                    _synthesis_inflight_count_for_url(u) >= 1 for u in gpu_url_bases
+                )
+                if busy:
+                    return
+            pending_aid: str | None = None
+            with scheduler_lock:
+                for aid, st in alignment_states.items():
+                    if st.get("state") != STATE_SYNTHESIS_READY:
+                        continue
+                    pending_aid = aid
+                    st["state"] = STATE_SYNTHESIS_INFLIGHT
+                    st["synthesis_submitted_at"] = time.time()
+                    break
+            if not pending_aid:
+                return
+            synth_url = _pick_gpu_url_for_synthesis()
+            if not synth_url:
+                with scheduler_lock:
+                    st = alignment_states.get(pending_aid)
+                    if st and st.get("state") == STATE_SYNTHESIS_INFLIGHT:
+                        st["state"] = STATE_SYNTHESIS_READY
+                        st.pop("synthesis_submitted_at", None)
+                return
+
+            def _synthesis_worker(alignment_id: str, gpu_base: str) -> None:
+                err: str | None = None
+                try:
+                    req = build_run_alignment_graded_request(
+                        alignment_id,
+                        output_root,
+                        instructions=instructions_text,
+                    )
+                    post_run_alignment_graded(gpu_base, req.dict())
+                except Exception as e:
+                    err = f"synthesis failed: {e}"
+                    logger.error("Alignment {}: {}", alignment_id, err)
+                with scheduler_lock:
+                    meta = synthesis_inflight.get(alignment_id)
+                    if meta is not None:
+                        meta["error"] = err
+
+            worker = threading.Thread(
+                target=_synthesis_worker,
+                args=(pending_aid, synth_url),
+                name=f"lit-synthesis-{pending_aid}",
+                daemon=True,
+            )
+            with scheduler_lock:
+                synthesis_inflight[pending_aid] = {
+                    "thread": worker,
+                    "started_monotonic": time.monotonic(),
+                    "gpu_url_base": synth_url,
+                }
+            logger.info(
+                "Alignment {}: synthesis worker started (host={})",
+                pending_aid,
+                synth_url,
+            )
+            worker.start()
+            with scheduler_lock:
+                _write_state(pending_aid)
 
     def _dispatch_docling() -> None:
         if not docling_url_base:
@@ -1523,6 +1562,8 @@ def run(
         _reconcile_outputs_into_state()
         n_registered_before = len(grader_url_bases)
         _refresh_grader_endpoints()
+        if gpu_discovery_enabled and gpu_pending_specs:
+            _refresh_gpu_endpoints()
         if grader_discovery_enabled and grader_pending_specs:
             _discovery_status_tick += 1
             if (
@@ -1604,103 +1645,131 @@ def run(
                     and os.path.getsize(os.path.join(existing_pdf_dir, fname)) > 0
                     for fname in os.listdir(existing_pdf_dir)
                 )
-                can_resume_from_disk = bool(existing_txt or existing_pdf) and not no_cache
                 manifest_path = os.path.join(papers_dir, DOWNLOAD_MANIFEST_FILENAME)
                 manifest_map = _load_download_manifest(manifest_path)
+
+                collect_skip = (
+                    not no_cache
+                    and not retry_failed
+                    and is_alignment_download_complete(papers_dir)
+                )
+                recs: List[Any] = []
+                plan_stats: Dict[str, int] = {}
+
+                if collect_skip:
+                    logger.info(
+                        "Alignment {}: download-complete; skipping collect",
+                        alignment_id,
+                    )
+                    _emit_download_progress_summary(
+                        alignment_id,
+                        paper_ids_src,
+                        manifest_map,
+                        papers_dir,
+                        "before_collect",
+                    )
+                else:
+                    plan = classify_alignment_papers(
+                        paper_ids_src,
+                        manifest_map,
+                        papers_dir,
+                        global_cache,
+                        retry_failed=retry_failed,
+                        no_cache=no_cache,
+                    )
+                    plan_stats = plan.stats
+                    if plan.global_inject:
+                        manifest_map = {**manifest_map, **plan.global_inject}
+                        _write_download_manifest_atomic(manifest_path, manifest_map)
+                    logger.info(
+                        "Alignment {}: collect plan satisfied={} terminal_failed={} "
+                        "global_skipped={} to_fetch={}",
+                        alignment_id,
+                        plan.stats.get("satisfied", 0),
+                        plan.stats.get("terminal_failed", 0),
+                        plan.stats.get("global_skipped", 0),
+                        plan.stats.get("to_fetch", 0),
+                    )
+                    _emit_download_progress_summary(
+                        alignment_id,
+                        paper_ids_src,
+                        manifest_map,
+                        papers_dir,
+                        "before_collect",
+                        classification_stats=plan.stats,
+                    )
+
+                    if no_cache:
+                        logger.info(
+                            "Alignment {}: no_cache re-downloading all {} papers",
+                            alignment_id,
+                            len(paper_ids_src),
+                        )
+                        recs = download_papers_to_dir(
+                            paper_ids_src,
+                            papers_dir,
+                            session=session,
+                            pmcid_cache=pmcid_cache,
+                            no_cache=True,
+                            force_pdfs=True,
+                            prefer_pdf_text=True,
+                            collection_org=collection_org,
+                            auth_scope=collection_auth_scope,
+                            collector_email=collector_email or None,
+                            max_workers=collect_max_workers,
+                            disable_semantic_scholar=collect_disable_s2,
+                        )
+                        manifest_map = _merge_recs_into_manifest({}, recs)
+                        _write_download_manifest_atomic(manifest_path, manifest_map)
+                    elif plan.to_fetch:
+                        recs = download_papers_to_dir(
+                            plan.to_fetch,
+                            papers_dir,
+                            session=session,
+                            pmcid_cache=pmcid_cache,
+                            no_cache=no_cache,
+                            force_pdfs=True,
+                            prefer_pdf_text=True,
+                            collection_org=collection_org,
+                            auth_scope=collection_auth_scope,
+                            collector_email=collector_email or None,
+                            max_workers=collect_max_workers,
+                            disable_semantic_scholar=collect_disable_s2,
+                        )
+                        manifest_map = _merge_recs_into_manifest(manifest_map, recs)
+                        _write_download_manifest_atomic(manifest_path, manifest_map)
+                        record_global_outcomes_from_rows(
+                            logs_base, manifest_map.values(), global_cache
+                        )
+                    else:
+                        logger.info(
+                            "Alignment {}: nothing to fetch (satisfied={} terminal_failed={} global_skipped={})",
+                            alignment_id,
+                            plan.stats.get("satisfied", 0),
+                            plan.stats.get("terminal_failed", 0),
+                            plan.stats.get("global_skipped", 0),
+                        )
+
+                    if not no_cache:
+                        write_alignment_download_complete(
+                            papers_dir,
+                            {
+                                "alignment_id": alignment_id,
+                                "total_expected": len(paper_ids_src),
+                                **plan.stats,
+                                "fetched": len(recs),
+                                "retry_failed_mode": retry_failed,
+                            },
+                        )
+
                 _emit_download_progress_summary(
                     alignment_id,
                     paper_ids_src,
                     manifest_map,
                     papers_dir,
-                    "before_collect",
+                    "after_collect",
+                    classification_stats=plan_stats or None,
                 )
-                missing_pre: List[Tuple[str, str]] = []
-                for pid, src in paper_ids_src:
-                    key = _paper_pair_key(pid, src)
-                    row = manifest_map.get(key)
-                    if row is None or not _manifest_row_satisfied(row, papers_dir):
-                        missing_pre.append((pid, src))
-
-                if no_cache:
-                    logger.info(
-                        "Alignment {}: no_cache re-downloading all {} papers",
-                        alignment_id,
-                        len(paper_ids_src),
-                    )
-                    recs = download_papers_to_dir(
-                        paper_ids_src,
-                        papers_dir,
-                        session=session,
-                        pmcid_cache=pmcid_cache,
-                        no_cache=True,
-                        force_pdfs=True,
-                        prefer_pdf_text=True,
-                        collection_org=collection_org,
-                        auth_scope=collection_auth_scope,
-                        collector_email=collector_email or None,
-                        max_workers=collect_max_workers,
-                        disable_semantic_scholar=collect_disable_s2,
-                    )
-                    manifest_map = _merge_recs_into_manifest({}, recs)
-                    _write_download_manifest_atomic(manifest_path, manifest_map)
-                elif missing_pre:
-                    logger.info(
-                        "Alignment {}: collecting {} missing papers ({} already satisfied)",
-                        alignment_id,
-                        len(missing_pre),
-                        len(paper_ids_src) - len(missing_pre),
-                    )
-                    recs = download_papers_to_dir(
-                        missing_pre,
-                        papers_dir,
-                        session=session,
-                        pmcid_cache=pmcid_cache,
-                        no_cache=no_cache,
-                        force_pdfs=True,
-                        prefer_pdf_text=True,
-                        collection_org=collection_org,
-                        auth_scope=collection_auth_scope,
-                        collector_email=collector_email or None,
-                        max_workers=collect_max_workers,
-                        disable_semantic_scholar=collect_disable_s2,
-                    )
-                    manifest_map = _merge_recs_into_manifest(manifest_map, recs)
-                    _write_download_manifest_atomic(manifest_path, manifest_map)
-                elif can_resume_from_disk:
-                    docling_required_basenames = _infer_docling_required_basenames_from_disk(
-                        papers_dir
-                    )
-                    n_docling_required = len(docling_required_basenames)
-                    has_pdf = existing_pdf
-                    recs = []
-                    logger.info(
-                        "Alignment {} reusing existing artifacts (txt={} pending_docling={}): download manifest complete",
-                        alignment_id,
-                        len(existing_txt),
-                        n_docling_required,
-                    )
-                else:
-                    logger.info(
-                        "Downloading {} papers for {}",
-                        len(paper_ids_src),
-                        alignment_id,
-                    )
-                    recs = download_papers_to_dir(
-                        paper_ids_src,
-                        papers_dir,
-                        session=session,
-                        pmcid_cache=pmcid_cache,
-                        no_cache=no_cache,
-                        force_pdfs=True,
-                        prefer_pdf_text=True,
-                        collection_org=collection_org,
-                        auth_scope=collection_auth_scope,
-                        collector_email=collector_email or None,
-                        max_workers=collect_max_workers,
-                        disable_semantic_scholar=collect_disable_s2,
-                    )
-                    manifest_map = _merge_recs_into_manifest(manifest_map, recs)
-                    _write_download_manifest_atomic(manifest_path, manifest_map)
 
                 if recs:
                     has_pdf = any(r.pdf_path for r in recs) or existing_pdf
@@ -1721,13 +1790,6 @@ def run(
                     n_docling_required = len(docling_required_basenames)
                     has_pdf = existing_pdf
 
-                _emit_download_progress_summary(
-                    alignment_id,
-                    paper_ids_src,
-                    manifest_map,
-                    papers_dir,
-                    "after_collect",
-                )
             query_meta = al.get("query_meta")
             target_meta = al.get("target_meta")
             gene_context: Dict[str, Any] | None = None
@@ -1924,7 +1986,7 @@ def main() -> int:
     )
     p.add_argument("--paper-ids", required=True, help="Search output JSON path")
     p.add_argument("--data-root", required=True, help="Shared data root")
-    p.add_argument("--gpu-host", required=True, help="GPU node hostname")
+    p.add_argument("--gpu-host", default=os.environ.get("GPU_HOST", ""), help="GPU node hostname")
     p.add_argument("--gpu-port", type=int, default=9000)
     p.add_argument("--docling-host", default="", help="Docling node hostname")
     p.add_argument("--docling-port", type=int, default=9100)

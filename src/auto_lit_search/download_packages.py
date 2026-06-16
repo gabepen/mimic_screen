@@ -18,12 +18,15 @@ from auto_lit_search.download_manifest import (
     _infer_docling_required_basenames_from_disk,
     _load_download_manifest,
     _load_search_json,
-    _manifest_row_satisfied,
     _merge_recs_into_manifest,
-    _paper_pair_key,
     _write_docling_eval_manifest,
     _write_download_manifest_atomic,
     build_paper_identifier_index,
+    classify_alignment_papers,
+    is_alignment_download_complete,
+    load_global_outcome_cache,
+    record_global_outcomes_from_rows,
+    write_alignment_download_complete,
     write_paper_identifier_index,
 )
 
@@ -43,6 +46,16 @@ def _results_path(output_root: str, alignment_id: str) -> str:
     return os.path.join(output_root, f"{alignment_id}_results.json")
 
 
+def _retry_failed_enabled(retry_failed: bool) -> bool:
+    if retry_failed:
+        return True
+    return os.environ.get("DOWNLOAD_RETRY_FAILED", "").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+    )
+
+
 def run_download_packages_only(
     paper_ids_path: str,
     data_root: str,
@@ -53,6 +66,7 @@ def run_download_packages_only(
     max_alignments: int | None = None,
     alignment_id: str = "",
     skip_if_results: bool = False,
+    retry_failed: bool = False,
 ) -> None:
     """Download per-alignment packages without GPU / Docling / Grader."""
     collection_org = os.environ.get("COLLECTION_ORG", "ucsc").strip() or "ucsc"
@@ -77,6 +91,7 @@ def run_download_packages_only(
     collect_disable_s2 = os.environ.get(
         "COLLECT_DISABLE_SEMANTIC_SCHOLAR", ""
     ).strip().lower() in ("1", "true", "yes")
+    retry_failed = _retry_failed_enabled(retry_failed)
 
     if not output_root:
         output_root = os.path.join(data_root, "llm_results")
@@ -110,6 +125,7 @@ def run_download_packages_only(
     data = _load_search_json(paper_ids_path)
     session = requests.Session()
     pmcid_cache: Dict[str, str | None] = {}
+    global_cache = load_global_outcome_cache(logs_base)
     processed = 0
 
     for query_id, alignments in data.items():
@@ -132,34 +148,53 @@ def run_download_packages_only(
             os.makedirs(papers_dir, exist_ok=True)
             manifest_path = os.path.join(papers_dir, DOWNLOAD_MANIFEST_FILENAME)
             manifest_map = _load_download_manifest(manifest_path)
+
+            if (
+                not no_cache
+                and not retry_failed
+                and is_alignment_download_complete(papers_dir)
+            ):
+                logger.info("Alignment {}: download-complete marker present; skipping", aid)
+                write_paper_identifier_index(
+                    papers_dir, build_paper_identifier_index(manifest_map)
+                )
+                processed += 1
+                if max_alignments is not None and processed >= max_alignments:
+                    logger.info("Reached max_alignments={}", max_alignments)
+                    return
+                continue
+
+            plan = classify_alignment_papers(
+                paper_ids_src,
+                manifest_map,
+                papers_dir,
+                global_cache,
+                retry_failed=retry_failed,
+                no_cache=no_cache,
+            )
+            if plan.global_inject:
+                manifest_map = {**manifest_map, **plan.global_inject}
+                _write_download_manifest_atomic(manifest_path, manifest_map)
+
+            logger.info(
+                "Alignment {}: collect plan satisfied={} terminal_failed={} "
+                "global_skipped={} to_fetch={}",
+                aid,
+                plan.stats.get("satisfied", 0),
+                plan.stats.get("terminal_failed", 0),
+                plan.stats.get("global_skipped", 0),
+                plan.stats.get("to_fetch", 0),
+            )
             _emit_download_progress_summary(
-                aid, paper_ids_src, manifest_map, papers_dir, "before_collect"
+                aid,
+                paper_ids_src,
+                manifest_map,
+                papers_dir,
+                "before_collect",
+                classification_stats=plan.stats,
             )
 
-            existing_txt = [
-                fname
-                for fname in os.listdir(papers_dir)
-                if fname.endswith(".txt")
-                and os.path.isfile(os.path.join(papers_dir, fname))
-                and os.path.getsize(os.path.join(papers_dir, fname)) > 0
-            ]
-            existing_pdf_dir = os.path.join(papers_dir, "pdf")
-            existing_pdf = os.path.isdir(existing_pdf_dir) and any(
-                fname.endswith(".pdf")
-                and os.path.isfile(os.path.join(existing_pdf_dir, fname))
-                and os.path.getsize(os.path.join(existing_pdf_dir, fname)) > 0
-                for fname in os.listdir(existing_pdf_dir)
-            )
-            can_resume_from_disk = bool(existing_txt or existing_pdf) and not no_cache
-
-            missing_pre: List[Tuple[str, str]] = []
-            for pid, src in paper_ids_src:
-                key = _paper_pair_key(pid, src)
-                row = manifest_map.get(key)
-                if row is None or not _manifest_row_satisfied(row, papers_dir):
-                    missing_pre.append((pid, src))
-
-            recs = []
+            recs: List[Any] = []
             if no_cache:
                 logger.info(
                     "Alignment {}: no_cache re-downloading all {} papers",
@@ -182,15 +217,9 @@ def run_download_packages_only(
                 )
                 manifest_map = _merge_recs_into_manifest({}, recs)
                 _write_download_manifest_atomic(manifest_path, manifest_map)
-            elif missing_pre:
-                logger.info(
-                    "Alignment {}: downloading {} missing papers ({} already on disk)",
-                    aid,
-                    len(missing_pre),
-                    len(paper_ids_src) - len(missing_pre),
-                )
+            elif plan.to_fetch:
                 recs = download_papers_to_dir(
-                    missing_pre,
+                    plan.to_fetch,
                     papers_dir,
                     session=session,
                     pmcid_cache=pmcid_cache,
@@ -205,32 +234,27 @@ def run_download_packages_only(
                 )
                 manifest_map = _merge_recs_into_manifest(manifest_map, recs)
                 _write_download_manifest_atomic(manifest_path, manifest_map)
-            elif can_resume_from_disk:
-                n_docling = len(_infer_docling_required_basenames_from_disk(papers_dir))
-                logger.info(
-                    "Alignment {} reusing existing artifacts (txt={} pending_docling={})",
-                    aid,
-                    len(existing_txt),
-                    n_docling,
-                )
+                record_global_outcomes_from_rows(logs_base, manifest_map.values(), global_cache)
             else:
-                logger.info("Alignment {}: downloading {} papers", aid, len(paper_ids_src))
-                recs = download_papers_to_dir(
-                    paper_ids_src,
-                    papers_dir,
-                    session=session,
-                    pmcid_cache=pmcid_cache,
-                    no_cache=no_cache,
-                    force_pdfs=True,
-                    prefer_pdf_text=True,
-                    collection_org=collection_org,
-                    auth_scope=collection_auth_scope,
-                    collector_email=collector_email or None,
-                    max_workers=collect_max_workers,
-                    disable_semantic_scholar=collect_disable_s2,
+                logger.info(
+                    "Alignment {}: nothing to fetch (satisfied={} terminal_failed={} global_skipped={})",
+                    aid,
+                    plan.stats.get("satisfied", 0),
+                    plan.stats.get("terminal_failed", 0),
+                    plan.stats.get("global_skipped", 0),
                 )
-                manifest_map = _merge_recs_into_manifest(manifest_map, recs)
-                _write_download_manifest_atomic(manifest_path, manifest_map)
+
+            if not no_cache:
+                write_alignment_download_complete(
+                    papers_dir,
+                    {
+                        "alignment_id": aid,
+                        "total_expected": len(paper_ids_src),
+                        **plan.stats,
+                        "fetched": len(recs),
+                        "retry_failed_mode": retry_failed,
+                    },
+                )
 
             docling_required = _infer_docling_required_basenames_from_disk(papers_dir)
             if recs:
@@ -248,7 +272,12 @@ def run_download_packages_only(
                 papers_dir, build_paper_identifier_index(manifest_map)
             )
             _emit_download_progress_summary(
-                aid, paper_ids_src, manifest_map, papers_dir, "after_collect"
+                aid,
+                paper_ids_src,
+                manifest_map,
+                papers_dir,
+                "after_collect",
+                classification_stats=plan.stats,
             )
 
             processed += 1
@@ -271,6 +300,11 @@ def main() -> int:
     p.add_argument("--max-alignments", type=int, default=None, help="Stop after N alignments")
     p.add_argument("--skip-if-results", action="store_true")
     p.add_argument("--no-cache", action="store_true")
+    p.add_argument(
+        "--retry-failed",
+        action="store_true",
+        help="Re-run collect on manifest failed/partial-without-pdf rows",
+    )
     args = p.parse_args()
 
     run_download_packages_only(
@@ -282,6 +316,7 @@ def main() -> int:
         max_alignments=args.max_alignments,
         alignment_id=args.alignment_id,
         skip_if_results=args.skip_if_results,
+        retry_failed=args.retry_failed,
     )
     return 0
 

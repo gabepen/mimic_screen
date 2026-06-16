@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -11,6 +12,31 @@ from auto_lit_search.analysis_packet import (
     GradedPaper,
     RunAlignmentGradedRequest,
 )
+from auto_lit_search.rubric_scoring import (
+    resolve_axis_rationales,
+    rubric_role_for_paper_role,
+)
+
+
+def _load_rubric_json(path: str | Path) -> Dict[str, Any] | None:
+    p = Path(path)
+    if not p.is_file():
+        return None
+    try:
+        with p.open("r", encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else None
+    except (OSError, json.JSONDecodeError):
+        return None
+
+
+def _rubric_for_paper_role(
+    paper_role: str | None,
+    host_rubric: Dict[str, Any] | None,
+    microbe_rubric: Dict[str, Any] | None,
+) -> Dict[str, Any] | None:
+    role = rubric_role_for_paper_role(paper_role or "")
+    return microbe_rubric if role == "microbe" else host_rubric
 
 
 def load_graded_json(graded_path: Path) -> Dict[str, Any]:
@@ -80,6 +106,9 @@ def build_run_alignment_graded_request(
     papers_root_p = Path(papers_root) if papers_root else None
     meta = _meta_from_sidecar(alignment_id, out_root, papers_root_p)
 
+    host_rubric = _load_rubric_json(os.environ.get("HOST_RUBRIC_PATH", ""))
+    microbe_rubric = _load_rubric_json(os.environ.get("MICROBE_RUBRIC_PATH", ""))
+
     instr = (instructions or "").strip()
     if instructions_file:
         ip = Path(instructions_file)
@@ -105,20 +134,36 @@ def build_run_alignment_graded_request(
         tags = row.get("rubric_tags")
         if not isinstance(tags, dict):
             tags = {}
+        criterion_scores = row.get("criterion_scores") or {}
+        rubric = _rubric_for_paper_role(row.get("paper_role"), host_rubric, microbe_rubric)
+        axis_rationales = resolve_axis_rationales(
+            rubric,
+            criterion_scores if isinstance(criterion_scores, dict) else {},
+            row.get("rubric_axis_rationales") if isinstance(row.get("rubric_axis_rationales"), dict) else {},
+        )
         graded_papers.append(
             GradedPaper(
                 paper_id=str(row.get("paper_id") or ""),
                 file_name=str(row.get("file_name") or ""),
                 paper_role=row.get("paper_role"),
+                grading_schema_version=int(row.get("grading_schema_version") or 1),
                 relevance_grade=float(row.get("relevance_grade") or 0.0),
+                relevance_sort=int(row.get("relevance_sort") or 0),
+                paper_grade=str(row.get("paper_grade") or ""),
+                primary_grade=str(row.get("primary_grade") or ""),
+                criterion_scores=criterion_scores,
+                axis_totals=row.get("axis_totals") or {},
                 rubric_dimension_scores={
                     str(k): float(v)
                     for k, v in (row.get("rubric_dimension_scores") or {}).items()
                 },
                 rubric_axis_rationales={
-                    str(k): str(v)
-                    for k, v in (row.get("rubric_axis_rationales") or {}).items()
+                    str(k): str(v) for k, v in axis_rationales.items()
                 },
+                mention_type=row.get("mention_type"),
+                infection_naive=row.get("infection_naive"),
+                no_meaningful_mention=bool(row.get("no_meaningful_mention")),
+                claim_summary=str(row.get("claim_summary") or ""),
                 rationale=str(row.get("rationale") or ""),
                 rubric_tags={str(k): str(v) for k, v in tags.items()},
                 model_output=row.get("model_output"),
