@@ -38,6 +38,37 @@ def _canonical_alignment_text_key(fname: str) -> str:
     return low
 
 
+def _canonical_paper_stem(name_stem: str) -> str:
+    """Collapse channel-tagged artifact stems to query/target paper stem."""
+    low = name_stem.lower()
+    m = re.match(r"^(.*__(?:query|target))(?:__.*)?$", low)
+    if m:
+        return m.group(1)
+    return low
+
+
+def _paper_has_usable_text(papers_dir: str, pdf_basename: str) -> bool:
+    """True when a non-empty .txt exists for this PDF (exact or canonical query/target stem)."""
+    stem = pdf_basename
+    if stem.lower().endswith(".pdf"):
+        stem = os.path.splitext(stem)[0]
+    exact = os.path.join(papers_dir, f"{stem}.txt")
+    if os.path.isfile(exact) and os.path.getsize(exact) > 0:
+        return True
+    canon = _canonical_paper_stem(stem)
+    if not os.path.isdir(papers_dir):
+        return False
+    for fname in os.listdir(papers_dir):
+        if not fname.endswith(".txt"):
+            continue
+        path = os.path.join(papers_dir, fname)
+        if not os.path.isfile(path) or os.path.getsize(path) <= 0:
+            continue
+        if _canonical_paper_stem(os.path.splitext(fname)[0]) == canon:
+            return True
+    return False
+
+
 def _paper_pair_key(paper_id: str, source: str) -> Tuple[str, str]:
     return (str(paper_id).strip(), str(source).strip())
 
@@ -442,17 +473,84 @@ def _emit_download_progress_summary(
     return missing
 
 
+def _manifest_pdf_basename(row: Dict[str, Any]) -> str:
+    pp = str(row.get("pdf_path") or "").strip()
+    if pp:
+        return os.path.splitext(os.path.basename(pp))[0]
+    stem = str(row.get("file_stem") or "").strip()
+    if stem:
+        return stem
+    return ""
+
+
+def _manifest_row_needs_docling(row: Dict[str, Any], papers_dir: str) -> bool:
+    """True when manifest says this paper still needs PDF→text conversion."""
+    if not row.get("pdf_docling_required"):
+        st = str(row.get("status") or "").strip().lower()
+        if st != "partial":
+            return False
+    base = _manifest_pdf_basename(row)
+    if not base:
+        return False
+    if _paper_has_usable_text(papers_dir, base):
+        return False
+    pdf_path = os.path.join(papers_dir, "pdf", f"{base}.pdf")
+    return os.path.isfile(pdf_path) and os.path.getsize(pdf_path) > 0
+
+
+def _infer_docling_required_from_manifest(
+    manifest_map: Dict[Tuple[str, str], Dict[str, Any]],
+    papers_dir: str,
+) -> List[str]:
+    required: List[str] = []
+    seen: set[str] = set()
+    for row in manifest_map.values():
+        if not _manifest_row_needs_docling(row, papers_dir):
+            continue
+        base = _manifest_pdf_basename(row)
+        if not base or base in seen:
+            continue
+        seen.add(base)
+        required.append(base)
+    return sorted(required)
+
+
+def _infer_docling_required_basenames(
+    papers_dir: str,
+    manifest_map: Optional[Dict[Tuple[str, str], Dict[str, Any]]] = None,
+) -> List[str]:
+    """
+    Papers needing Docling: manifest rows flagged pdf_docling_required (or partial
+    with PDF, no text). When a manifest exists, do not treat orphan S3 PDFs on disk
+    as docling work — only API-fallback PDFs recorded in the manifest.
+    """
+    if manifest_map is None:
+        manifest_path = os.path.join(papers_dir, DOWNLOAD_MANIFEST_FILENAME)
+        manifest_map = (
+            _load_download_manifest(manifest_path)
+            if os.path.isfile(manifest_path)
+            else {}
+        )
+    if manifest_map:
+        return _infer_docling_required_from_manifest(manifest_map, papers_dir)
+    return _infer_docling_required_basenames_from_disk(papers_dir)
+
+
 def _infer_docling_required_basenames_from_disk(papers_dir: str) -> List[str]:
     pdf_dir = os.path.join(papers_dir, "pdf")
     if not os.path.isdir(pdf_dir):
         return []
-    txt_basenames = {
-        os.path.splitext(_canonical_alignment_text_key(fname))[0]
-        for fname in os.listdir(papers_dir)
-        if fname.endswith(".txt")
-        and os.path.isfile(os.path.join(papers_dir, fname))
-        and os.path.getsize(os.path.join(papers_dir, fname)) > 0
-    }
+    txt_canonical_stems: set[str] = set()
+    if os.path.isdir(papers_dir):
+        for fname in os.listdir(papers_dir):
+            if not fname.endswith(".txt"):
+                continue
+            path = os.path.join(papers_dir, fname)
+            if not os.path.isfile(path) or os.path.getsize(path) <= 0:
+                continue
+            txt_canonical_stems.add(
+                _canonical_paper_stem(os.path.splitext(fname)[0])
+            )
     required: List[str] = []
     for fname in os.listdir(pdf_dir):
         if not fname.endswith(".pdf"):
@@ -461,8 +559,9 @@ def _infer_docling_required_basenames_from_disk(papers_dir: str) -> List[str]:
         if not os.path.isfile(pdf_path) or os.path.getsize(pdf_path) <= 0:
             continue
         base = os.path.splitext(fname)[0]
-        if base not in txt_basenames:
-            required.append(base)
+        if _canonical_paper_stem(base) in txt_canonical_stems:
+            continue
+        required.append(base)
     return sorted(required)
 
 

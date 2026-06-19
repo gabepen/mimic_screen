@@ -21,9 +21,12 @@ from auto_lit_search.analysis_packet import (
     RunAlignmentResponse,
 )
 from auto_lit_search.env_config import env_flag
+from auto_lit_search.paper_excerpt import (
+    build_grader_excerpt_with_meta,
+    excerpt_meta_dict,
+)
 from auto_lit_search.paper_io import (
     DOWNLOAD_MANIFEST_FILENAME,
-    MAX_PAPER_CHARS,
     ensure_dir as _ensure_dir,
     extract_paper_role as _extract_paper_role,
     identification_terms_block,
@@ -291,6 +294,44 @@ def _append_grader_llm_jsonl(output_root: str, alignment_id: str, record: Dict[s
             f.write(line)
 
 
+def _build_grader_system_prompt(
+    req: GradeAlignmentRequest,
+    rubric: Dict[str, Any],
+    rubric_role: str,
+    *,
+    role: Optional[str],
+) -> str:
+    criterion_block = criteria_prompt_block(rubric)
+    term_block = identification_terms_block(req.query, req.target_id, req.gene_context)
+    gene_focus = (
+        "the QUERY gene (pathogen / microbe-side rubric context)"
+        if role == "query"
+        else (
+            "the TARGET gene (host-side rubric context)"
+            if role == "target"
+            else "the gene implied by this paper's role in the pair below (query vs target)"
+        )
+    )
+    return (
+        "Grade using the RUBRIC JSON object below. If `grader_instructions` exists, read it first; "
+        "then `system_context`, `evaluation_unit`, `scoring_scale`, and each `axis` with criteria.\n\n"
+        "Alignment context (pair-level; the rubric file is per side):\n"
+        f"- alignment_id={req.alignment_id}\n"
+        f"- query_gene_id={req.query}\n"
+        f"- target_gene_id={req.target_id}\n"
+        f"- paper_role={role or 'unknown'} (query → microbe rubric; target → host rubric)\n"
+        f"- gene_focus_for_this_paper: {gene_focus}\n"
+        f"{term_block}\n"
+        f"{_grader_json_output_instructions(rubric, rubric_role)}\n"
+        f"Scored criteria by axis:\n{criterion_block}\n\n"
+        f"RUBRIC:\n{json.dumps(rubric, ensure_ascii=False)}"
+    )
+
+
+def _build_grader_user_prompt(excerpt: str) -> str:
+    return f"Paper excerpt:\n{excerpt}"
+
+
 def _call_llm(
     user_content: str,
     base_url: str,
@@ -298,10 +339,11 @@ def _call_llm(
     temperature: float,
     log_context: str = "",
     *,
+    system_content: Optional[str] = None,
     emit_event: Optional[Callable[[Dict[str, Any]], None]] = None,
     log_static: Optional[Dict[str, Any]] = None,
 ) -> GraderLLMCallResult:
-    prompt_char_len = len(user_content)
+    prompt_char_len = len(user_content) + (len(system_content) if system_content else 0)
     configured = (os.environ.get("VLLM_MODEL_NAME") or "").strip()
     root_url = base_url.rstrip("/")
     api_base = root_url
@@ -309,9 +351,13 @@ def _call_llm(
         api_base = f"{api_base}/v1"
     url = f"{api_base}/chat/completions"
     model_id = configured or _resolve_model_id(root_url)
+    messages: List[Dict[str, str]] = []
+    if system_content:
+        messages.append({"role": "system", "content": system_content})
+    messages.append({"role": "user", "content": user_content})
     payload: Dict[str, Any] = {
         "model": model_id,
-        "messages": [{"role": "user", "content": user_content}],
+        "messages": messages,
         "max_tokens": max_tokens,
         "temperature": temperature,
         "response_format": {"type": "json_object"},
@@ -684,6 +730,8 @@ def _grade_single_paper(
     rubric: Dict[str, Any],
     llm_base_url: Optional[str],
     paper_id_by_file: Optional[Dict[str, str]] = None,
+    *,
+    system_prompt: Optional[str] = None,
 ) -> Tuple[GradedPaper, Dict[str, int]]:
     fname = os.path.basename(file_path)
     lookup = paper_id_by_file or {}
@@ -691,32 +739,13 @@ def _grade_single_paper(
     role = _extract_paper_role(fname)
     rubric_role = rubric_role_for_paper_role(role or "")
     text = _read_text(file_path)
-    criterion_block = criteria_prompt_block(rubric)
-    term_block = identification_terms_block(req.query, req.target_id, req.gene_context)
-    gene_focus = (
-        "the QUERY gene (pathogen / microbe-side rubric context)"
-        if role == "query"
-        else (
-            "the TARGET gene (host-side rubric context)"
-            if role == "target"
-            else "the gene implied by this paper's role in the pair below (query vs target)"
-        )
+    excerpt_meta = build_grader_excerpt_with_meta(text)
+    excerpt = excerpt_meta.excerpt
+    excerpt_log = excerpt_meta_dict(excerpt_meta)
+    system_content = system_prompt or _build_grader_system_prompt(
+        req, rubric, rubric_role, role=role
     )
-    prompt = (
-        "Grade using the RUBRIC JSON object below. If `grader_instructions` exists, read it first; "
-        "then `system_context`, `evaluation_unit`, `scoring_scale`, and each `axis` with criteria.\n\n"
-        "Alignment context (pair-level; the rubric file is per side):\n"
-        f"- alignment_id={req.alignment_id}\n"
-        f"- query_gene_id={req.query}\n"
-        f"- target_gene_id={req.target_id}\n"
-        f"- paper_role={role or 'unknown'} (query → microbe rubric; target → host rubric)\n"
-        f"- gene_focus_for_this_paper: {gene_focus}\n"
-        f"{term_block}\n"
-        f"{_grader_json_output_instructions(rubric, rubric_role)}\n"
-        f"Scored criteria by axis:\n{criterion_block}\n\n"
-        f"RUBRIC:\n{json.dumps(rubric, ensure_ascii=False)}\n\n"
-        f"Paper excerpt:\n{text[:100000]}"
-    )
+    user_prompt = _build_grader_user_prompt(excerpt)
     criterion_ids = ", ".join(required_scored_criterion_ids(rubric))
     notes = ""
     raw = ""
@@ -742,14 +771,14 @@ def _grade_single_paper(
         row.setdefault("file_name", fname)
         _append_grader_llm_jsonl(req.output_root, req.alignment_id, row)
 
-    excerpt_char_len = len(text)
-    excerpt_in_prompt_chars = min(100000, excerpt_char_len)
+    excerpt_char_len = excerpt_meta.raw_char_len
+    excerpt_in_prompt_chars = excerpt_meta.excerpt_char_len
 
     if not llm_base_url or not str(llm_base_url).strip():
         _emit_llm_row(
             {
                 "call_kind": "skipped_no_vllm_url",
-                "excerpt_char_len": excerpt_char_len,
+                **excerpt_log,
                 "excerpt_in_prompt_chars": excerpt_in_prompt_chars,
             }
         )
@@ -757,7 +786,7 @@ def _grade_single_paper(
         _emit_llm_row(
             {
                 "call_kind": "skipped_no_excerpt",
-                "excerpt_char_len": excerpt_char_len,
+                **excerpt_log,
                 "excerpt_in_prompt_chars": excerpt_in_prompt_chars,
             }
         )
@@ -788,16 +817,17 @@ def _grade_single_paper(
                     retry_extra += f"Invalid earlier reply (excerpt):\n{bad}\n"
             try:
                 llm_res = _call_llm(
-                    prompt + retry_extra,
+                    user_prompt + retry_extra,
                     llm_base_url,
                     max_tokens=max_tokens,
                     temperature=temperature,
                     log_context=fname,
+                    system_content=system_content,
                     emit_event=_emit_llm_row,
                     log_static={
                         "call_kind": "grade",
                         "grade_attempt": attempt,
-                        "excerpt_char_len": excerpt_char_len,
+                        **excerpt_log,
                         "excerpt_in_prompt_chars": excerpt_in_prompt_chars,
                     },
                 )
@@ -813,8 +843,9 @@ def _grade_single_paper(
                             "phase": "client_exception",
                             "error": str(e),
                             "error_type": type(e).__name__,
-                            "prompt_char_len": len(prompt + retry_extra),
-                            "excerpt_char_len": excerpt_char_len,
+                            "prompt_char_len": len(system_content)
+                            + len(user_prompt + retry_extra),
+                            **excerpt_log,
                             "excerpt_in_prompt_chars": excerpt_in_prompt_chars,
                         }
                     )
@@ -850,7 +881,7 @@ def _grade_single_paper(
                         log_static={
                             "call_kind": "repair",
                             "grade_attempt": attempt,
-                            "excerpt_char_len": excerpt_char_len,
+                            **excerpt_log,
                             "excerpt_in_prompt_chars": excerpt_in_prompt_chars,
                         },
                     )
@@ -866,7 +897,7 @@ def _grade_single_paper(
                                 "error": str(e),
                                 "error_type": type(e).__name__,
                                 "prompt_char_len": len(repair_prompt),
-                                "excerpt_char_len": excerpt_char_len,
+                                **excerpt_log,
                                 "excerpt_in_prompt_chars": excerpt_in_prompt_chars,
                             }
                         )
@@ -993,6 +1024,12 @@ def _grade_alignment_sync(req: GradeAlignmentRequest) -> RunAlignmentResponse:
     microbe_rubric = _load_json_file(req.microbe_rubric_path)
     llm_base_url = os.environ.get("VLLM_BASE_URL")
     paper_id_by_file = _paper_id_by_artifact_basename(req.papers_dir)
+    system_by_role = {
+        "host": _build_grader_system_prompt(req, host_rubric, "host", role="target"),
+        "microbe": _build_grader_system_prompt(
+            req, microbe_rubric, "microbe", role="query"
+        ),
+    }
     paper_workers = _grader_paper_workers()
     logger.info(
         "Grader {}: grading {} papers with {} parallel workers",
@@ -1004,12 +1041,14 @@ def _grade_alignment_sync(req: GradeAlignmentRequest) -> RunAlignmentResponse:
     def _grade_one(fname: str) -> Tuple[str, GradedPaper, Dict[str, int]]:
         role = _extract_paper_role(fname)
         rubric = microbe_rubric if role == "query" else host_rubric
+        rubric_role = rubric_role_for_paper_role(role or "")
         gp, retry_meta = _grade_single_paper(
             file_path=os.path.join(req.papers_dir, fname),
             req=req,
             rubric=rubric,
             llm_base_url=llm_base_url,
             paper_id_by_file=paper_id_by_file,
+            system_prompt=system_by_role[rubric_role],
         )
         return fname, gp, retry_meta
 

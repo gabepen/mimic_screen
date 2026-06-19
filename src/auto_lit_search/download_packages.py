@@ -15,7 +15,7 @@ from auto_lit_search.download_manifest import (
     _alignment_id_for_pair,
     _alignment_paper_ids,
     _emit_download_progress_summary,
-    _infer_docling_required_basenames_from_disk,
+    _infer_docling_required_basenames,
     _load_download_manifest,
     _load_search_json,
     _merge_recs_into_manifest,
@@ -207,7 +207,7 @@ def run_download_packages_only(
                     session=session,
                     pmcid_cache=pmcid_cache,
                     no_cache=True,
-                    force_pdfs=True,
+                    force_pdfs=False,
                     prefer_pdf_text=True,
                     collection_org=collection_org,
                     auth_scope=collection_auth_scope,
@@ -224,7 +224,7 @@ def run_download_packages_only(
                     session=session,
                     pmcid_cache=pmcid_cache,
                     no_cache=no_cache,
-                    force_pdfs=True,
+                    force_pdfs=False,
                     prefer_pdf_text=True,
                     collection_org=collection_org,
                     auth_scope=collection_auth_scope,
@@ -256,7 +256,9 @@ def run_download_packages_only(
                     },
                 )
 
-            docling_required = _infer_docling_required_basenames_from_disk(papers_dir)
+            docling_required = _infer_docling_required_basenames(
+                papers_dir, manifest_map
+            )
             if recs:
                 try:
                     _write_docling_eval_manifest(papers_dir, recs, docling_required)

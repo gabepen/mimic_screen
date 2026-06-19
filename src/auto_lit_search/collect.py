@@ -490,7 +490,7 @@ class UCSCEmailOnlyProvider(BaseCollectionProvider):
                 "xml" if xml_path else None
             )
 
-        if pmcid and (context.force_pdfs or not text_path) and not pdf_path:
+        if pmcid and not text_path and not pdf_path:
             epmc_pdf = _fetch_fulltext_pdf(
                 pmcid,
                 context.session,
@@ -536,7 +536,7 @@ class UCSCEmailOnlyProvider(BaseCollectionProvider):
                     source_attempts["elsevier"]["artifact"] = "xml"
 
         # MDPI before Unpaywall: OA PDFs are on mdpi.com; Unpaywall often omits them.
-        if doi and is_mdpi_primary_doi(doi) and not pdf_path:
+        if doi and is_mdpi_primary_doi(doi) and not text_path and not pdf_path:
             source_attempts["mdpi"]["attempted"] = True
             if context.throttle:
                 context.throttle.wait("mdpi")
@@ -552,7 +552,7 @@ class UCSCEmailOnlyProvider(BaseCollectionProvider):
                 pdf_path = pdf_path or mdpi_pdf
 
         # ASM before Unpaywall: ASM PDFs are often reachable via doi-derived URL patterns.
-        if doi and is_asm_primary_doi(doi) and not pdf_path:
+        if doi and is_asm_primary_doi(doi) and not text_path and not pdf_path:
             if context.throttle:
                 context.throttle.wait("asm")
             asm_pdf = download_asm_article_pdf(
@@ -567,7 +567,7 @@ class UCSCEmailOnlyProvider(BaseCollectionProvider):
                 pdf_path = pdf_path or asm_pdf
 
         unpaywall_url = None
-        if doi and not pdf_path:
+        if doi and not text_path and not pdf_path:
             source_attempts["unpaywall"]["attempted"] = True
             if context.throttle:
                 context.throttle.wait("unpaywall")
@@ -588,7 +588,7 @@ class UCSCEmailOnlyProvider(BaseCollectionProvider):
                 source_attempts["unpaywall"]["artifact"] = "pdf"
                 pdf_path = pdf_path or up_pdf
 
-        if doi and is_wiley_primary_doi(doi) and not pdf_path:
+        if doi and is_wiley_primary_doi(doi) and not text_path and not pdf_path:
             source_attempts["wiley"]["attempted"] = True
             if context.throttle:
                 context.throttle.wait("wiley")
@@ -603,7 +603,7 @@ class UCSCEmailOnlyProvider(BaseCollectionProvider):
                 source_attempts["wiley"]["artifact"] = "pdf"
                 pdf_path = pdf_path or wiley_pdf
 
-        if doi and is_elsevier_primary_doi(doi) and not pdf_path:
+        if doi and is_elsevier_primary_doi(doi) and not text_path and not pdf_path:
             if context.throttle:
                 context.throttle.wait("elsevier")
             el_pdf = download_elsevier_article_pdf(
@@ -618,7 +618,7 @@ class UCSCEmailOnlyProvider(BaseCollectionProvider):
                 pdf_path = pdf_path or el_pdf
 
         arxiv_url = None
-        if doi or title:
+        if not text_path and (doi or title):
             if context.throttle:
                 context.throttle.wait("arxiv")
             arxiv_url = get_arxiv_pdf_url(doi, title, context.session)
@@ -639,7 +639,7 @@ class UCSCEmailOnlyProvider(BaseCollectionProvider):
         s2_url = None
         if context.disable_semantic_scholar:
             source_attempts["semantic_scholar"]["attempted"] = False
-        elif doi or title:
+        elif not text_path and (doi or title):
             if context.throttle:
                 context.throttle.wait("semantic_scholar")
             s2_url = get_semantic_scholar_pdf_url(doi, title, context.session)
@@ -663,6 +663,7 @@ class UCSCEmailOnlyProvider(BaseCollectionProvider):
         pdf_docling_required = False
         if text_path:
             selected_text_source = selected_text_source_hint or "cached_text"
+            pdf_docling_required = False
         else:
             if pdf_path:
                 selected_text_source = "docling_pdf"
@@ -687,12 +688,12 @@ class UCSCEmailOnlyProvider(BaseCollectionProvider):
         if pdf_docling_required:
             message = "xml below quality threshold; docling conversion required"
 
-        if context.delete_pdf_after_text and pdf_path and text_path:
-            try:
-                os.remove(pdf_path)
-                pdf_path = None
-            except Exception as e:
-                logger.warning(f"Could not delete PDF {pdf_path}: {e}")
+        pdf_path = _finalize_pdf_text_paths(
+            pdf_path,
+            text_path,
+            pdf_docling_required,
+            delete_pdf_after_text=context.delete_pdf_after_text,
+        )
 
         retrieval_queries: Dict[str, Any] = {
             "paper_id": paper_id,
@@ -1648,13 +1649,17 @@ def _attempt_pmc_oa_s3(
                 logger.debug(f"Could not save PMC OA S3 XML for {file_stem}: {ex}")
             out["xml_text"] = plain
             if stats["quality_pass"]:
+                txt_path = os.path.join(context.text_dir, f"{file_stem}.txt")
+                with open(txt_path, "w", encoding="utf-8", errors="replace") as tf:
+                    tf.write(plain)
+                out["text_path"] = txt_path
                 attempt["success"] = True
                 attempt["artifact"] = "xml"
                 out["selected_text_source"] = "pmc_oa_s3_xml"
             else:
                 attempt["error"] = "xml_below_quality_threshold"
 
-    if context.force_pdfs and not out["pdf_path"]:
+    if context.force_pdfs and not out["pdf_path"] and not out["text_path"]:
         pdf_bytes = download_pmc_oa_pdf(meta, session=context.session)
         if pdf_bytes:
             os.makedirs(context.pdf_dir, exist_ok=True)
@@ -1673,6 +1678,33 @@ def _record_has_usable_text(rec: Optional[DownloadRecord]) -> bool:
     if rec is None or not rec.text_path:
         return False
     return os.path.isfile(rec.text_path) and os.path.getsize(rec.text_path) > 0
+
+
+def _finalize_pdf_text_paths(
+    pdf_path: Optional[str],
+    text_path: Optional[str],
+    pdf_docling_required: bool,
+    *,
+    delete_pdf_after_text: bool = False,
+) -> Optional[str]:
+    """Drop PDF from record when usable text exists; optionally delete file from disk."""
+    if not text_path or pdf_docling_required or not pdf_path:
+        return pdf_path
+    if delete_pdf_after_text:
+        try:
+            os.remove(pdf_path)
+        except Exception as e:
+            logger.warning(f"Could not delete PDF {pdf_path}: {e}")
+    return None
+
+
+def _record_needs_publisher_fallback(rec: Optional[DownloadRecord]) -> bool:
+    """Skip publisher APIs when S3/cache already produced text or a PDF for Docling."""
+    if _record_has_usable_text(rec):
+        return False
+    if rec is not None and rec.pdf_path and os.path.isfile(rec.pdf_path):
+        return False
+    return True
 
 
 def _collect_s3_record(
@@ -1699,7 +1731,10 @@ def _collect_s3_record(
         if os.path.exists(candidate_pdf) and os.path.getsize(candidate_pdf) > 0:
             pdf_path = candidate_pdf
 
-    pmcid = context.pmcid_cache.get(paper_id)
+    norm_pid = _normalize_paper_id(paper_id) or paper_id
+    pmcid = context.pmcid_cache.get(norm_pid)
+    if pmcid is None and norm_pid != paper_id:
+        pmcid = context.pmcid_cache.get(paper_id)
     epmc_pmid = _europepmc_get_pmid(paper_id, context.cache_lock)
     epmc_search_query = _EUROPEPMC_LAST_SEARCH_QUERY.get(
         paper_id, "pmcid_cache_hit"
@@ -1727,7 +1762,7 @@ def _collect_s3_record(
             paper_id=paper_id,
             source=source,
             pmcid=pmcid,
-            pdf_path=pdf_path,
+            pdf_path=None,
             text_path=text_path,
             status=status,
             message=None,
@@ -1771,6 +1806,13 @@ def _collect_s3_record(
     pdf_docling_required = bool(not text_path and pdf_path)
     status = "ok" if text_path else "partial"
     message = None if text_path else "xml below quality threshold; docling conversion required"
+    if text_path and pdf_path and not pdf_docling_required:
+        pdf_path = _finalize_pdf_text_paths(
+            pdf_path,
+            text_path,
+            pdf_docling_required,
+            delete_pdf_after_text=context.delete_pdf_after_text,
+        )
     successful_sources = sorted(
         [k for k, v in source_attempts.items() if v.get("success")]
     )
@@ -1911,7 +1953,7 @@ def _download_papers_phased(
             i, rec = fut.result()
             records[i] = rec
             s3_done += 1
-            if not _record_has_usable_text(rec):
+            if _record_needs_publisher_fallback(rec):
                 need_fallback_set.add(i)
             if s3_done % 50 == 0:
                 logger.info(
@@ -1944,7 +1986,7 @@ def _download_papers_phased(
             throttle=throttle,
             cache_lock=cache_lock,
             disable_semantic_scholar=disable_semantic_scholar,
-            disable_pmc_oa_s3=True,
+            disable_pmc_oa_s3=False,
         )
         t_fb = time.monotonic()
         fb_done = 0

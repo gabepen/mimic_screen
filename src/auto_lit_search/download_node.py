@@ -20,11 +20,12 @@ from auto_lit_search.download_manifest import (
     DOWNLOAD_MANIFEST_FILENAME,
     _alignment_paper_ids,
     _emit_download_progress_summary,
-    _infer_docling_required_basenames_from_disk,
+    _infer_docling_required_basenames,
     _load_download_manifest,
     _load_idmap,
     _load_search_json,
     _merge_recs_into_manifest,
+    _paper_has_usable_text,
     _write_download_manifest_atomic,
     classify_alignment_papers,
     is_alignment_download_complete,
@@ -32,7 +33,7 @@ from auto_lit_search.download_manifest import (
     record_global_outcomes_from_rows,
     write_alignment_download_complete,
 )
-from auto_lit_search.graded_request import build_run_alignment_graded_request
+from auto_lit_search.graded_request_payload import build_run_alignment_graded_payload
 from auto_lit_search.scheduler_http import post_run_alignment_graded
 from auto_lit_search.slurm_utils import (
     get_job_node,
@@ -237,7 +238,7 @@ def _parse_grader_job_specs(grader_port: int) -> List[Tuple[str, int]]:
 def _grader_health_ok(grader_url_base: str, timeout: int = 5) -> bool:
     url = f"{grader_url_base.rstrip('/')}/healthz"
     try:
-        r = requests.get(url, timeout=timeout)
+        r = requests.get(url, timeout=(3, timeout))
         return r.status_code == 200
     except Exception:
         return False
@@ -347,7 +348,7 @@ def _wait_service_capacity(
             service_name,
             timeout_seconds,
         )
-    return False
+    return True
 
 
 def _grader_status_once(
@@ -506,7 +507,7 @@ def run(
     else:
         gpu_target = max(1, len(gpu_url_bases) or 1)
 
-    scheduler_lock = threading.Lock()
+    scheduler_lock = threading.RLock()
 
     def _register_gpu_url(url: str, job_id: str = "") -> bool:
         base = url.rstrip("/")
@@ -691,13 +692,56 @@ def run(
                 _grader_limit_raw,
             )
 
+    grader_url_penalty_until: Dict[str, float] = {}
+    grader_url_penalty_seconds = max(
+        30, int(os.environ.get("GRADER_URL_PENALTY_SECONDS", "300"))
+    )
+
     def _drop_pending_specs_for_registered_port(port: int) -> None:
         grader_pending_specs[:] = [
             s for s in grader_pending_specs if int(s["port"]) != port
         ]
 
+    def _penalize_grader_url(url: str, *, reason: str = "") -> None:
+        base = url.rstrip("/")
+        until = time.monotonic() + float(grader_url_penalty_seconds)
+        with scheduler_lock:
+            prev = grader_url_penalty_until.get(base, 0.0)
+            grader_url_penalty_until[base] = max(prev, until)
+        if reason:
+            logger.warning("Grader endpoint penalized for {}s: {} ({})", grader_url_penalty_seconds, base, reason)
+
+    def _grader_url_is_penalized(url: str) -> bool:
+        base = url.rstrip("/")
+        with scheduler_lock:
+            until = grader_url_penalty_until.get(base, 0.0)
+        return until > time.monotonic()
+
+    def _prune_unhealthy_grader_urls(*, log_removals: bool = False) -> int:
+        removed = 0
+        with scheduler_lock:
+            urls = list(grader_url_bases)
+        kept: List[str] = []
+        for url in urls:
+            if _grader_url_is_penalized(url):
+                continue
+            if _grader_health_ok(url):
+                kept.append(url)
+            else:
+                removed += 1
+                if log_removals:
+                    logger.warning(
+                        "download_node: dropping unhealthy grader endpoint {}",
+                        url,
+                    )
+        with scheduler_lock:
+            grader_url_bases[:] = kept
+        return removed
+
     def _register_grader_url(url: str, job_id: str = "") -> bool:
         base = url.rstrip("/")
+        if not _grader_health_ok(base):
+            return False
         with scheduler_lock:
             if base in grader_url_bases:
                 return False
@@ -781,33 +825,57 @@ def run(
             len(grader_job_specs),
             len(grader_url_bases),
         )
-        deadline = time.monotonic() + service_health_wait_seconds
-        while time.monotonic() < deadline:
-            _refresh_grader_endpoints()
-            if any(_grader_health_ok(u) for u in grader_url_bases):
-                break
-            time.sleep(5)
-        else:
-            raise RuntimeError(
-                "No grader endpoint became healthy within "
-                f"{service_health_wait_seconds}s (GRADER_JOB_IDS discovery)"
-            )
-        for grader_url_base in grader_url_bases:
-            if not _grader_health_ok(grader_url_base):
-                logger.info(
-                    "download_node: waiting for Grader health at {}",
-                    grader_url_base.rstrip("/"),
-                )
-                if not _wait_health(
-                    "Grader",
-                    grader_url_base,
-                    timeout=min(120, service_health_wait_seconds),
-                    interval=5,
+        sys.stdout.flush()
+        _refresh_grader_endpoints_from_host_file()
+        preconfigured = bool(os.environ.get("GRADER_URLS", "").strip())
+        if not grader_url_bases:
+            deadline = time.monotonic() + min(120, service_health_wait_seconds)
+            while time.monotonic() < deadline:
+                _refresh_grader_endpoints()
+                if grader_url_bases and any(
+                    _grader_health_ok(u) for u in grader_url_bases
                 ):
-                    logger.warning(
-                        "Grader at {} not healthy yet; will retry via discovery",
-                        grader_url_base,
+                    break
+                time.sleep(5)
+            else:
+                raise RuntimeError(
+                    "No grader endpoint discovered within "
+                    f"{min(120, service_health_wait_seconds)}s"
+                )
+        else:
+            healthy_n = sum(1 for u in grader_url_bases if _grader_health_ok(u))
+            logger.info(
+                "download_node: {} grader URL(s) configured, {} healthy at startup",
+                len(grader_url_bases),
+                healthy_n,
+            )
+            sys.stdout.flush()
+            if healthy_n == 0:
+                deadline = time.monotonic() + service_health_wait_seconds
+                logger.info(
+                    "download_node: preconfigured grader URL(s) not healthy yet; "
+                    "waiting up to {}s with Slurm discovery",
+                    service_health_wait_seconds,
+                )
+                sys.stdout.flush()
+                while time.monotonic() < deadline:
+                    _refresh_grader_endpoints()
+                    healthy_n = sum(1 for u in grader_url_bases if _grader_health_ok(u))
+                    if healthy_n > 0:
+                        break
+                    time.sleep(5)
+                else:
+                    raise RuntimeError(
+                        f"No healthy grader in configured URLs ({len(grader_url_bases)} total) "
+                        f"after {service_health_wait_seconds}s"
                     )
+            if preconfigured and healthy_n < len(grader_url_bases):
+                logger.info(
+                    "download_node: skipping serial health wait for {} unhealthy "
+                    "preconfigured grader URL(s); background discovery will prune them",
+                    len(grader_url_bases) - healthy_n,
+                )
+        sys.stdout.flush()
     else:
         for grader_url_base in grader_url_bases:
             logger.info(
@@ -819,13 +887,15 @@ def run(
             ):
                 raise RuntimeError(f"Grader node not healthy at {grader_url_base}")
 
-    if grader_discovery_enabled:
+    if grader_discovery_enabled and grader_pending_specs:
         _refresh_grader_endpoints()
+    _prune_unhealthy_grader_urls(log_removals=True)
     logger.info(
         "download_node: {} grader endpoint(s) active: {}",
         len(grader_url_bases),
         ", ".join(grader_url_bases),
     )
+    sys.stdout.flush()
     if grader_discovery_enabled and len(grader_url_bases) < grader_target:
         logger.info(
             "download_node: waiting for up to {} more grader endpoint(s) via "
@@ -839,6 +909,11 @@ def run(
             instructions_text = f.read().strip()
 
     data = _load_search_json(paper_ids_path)
+    logger.info(
+        "download_node: loaded search JSON ({} query keys)",
+        len(data) if isinstance(data, dict) else 0,
+    )
+    sys.stdout.flush()
     collection_org = os.environ.get("COLLECTION_ORG", "ucsc").strip() or "ucsc"
     collection_auth_scope = (
         os.environ.get("COLLECTION_AUTH_SCOPE", "email_only").strip() or "email_only"
@@ -948,6 +1023,10 @@ def run(
     docling_inflight: Dict[str, Dict[str, Any]] = {}
     grader_inflight: Dict[str, Dict[str, Any]] = {}
     synthesis_inflight: Dict[str, Dict[str, Any]] = {}
+    grader_dispatch_rr = 0
+    grader_submit_max_attempts = max(
+        1, int(os.environ.get("GRADER_SUBMIT_MAX_ATTEMPTS", "12"))
+    )
 
     def _graded_path(alignment_id: str) -> str:
         return os.path.join(output_root, f"{alignment_id}_graded.json")
@@ -980,20 +1059,80 @@ def run(
             for aid, st in alignment_states.items():
                 if st.get("state") == STATE_DONE:
                     continue
-                if not _outputs_done(aid):
-                    continue
                 prev = str(st.get("state") or "")
-                st["state"] = STATE_DONE
-                st.pop("last_error", None)
-                st["updated_at"] = time.time()
-                docling_inflight.pop(aid, None)
-                grader_inflight.pop(aid, None)
-                logger.info(
-                    "Alignment {}: outputs present on disk; reconciled state {} -> DONE",
-                    aid,
-                    prev or "UNKNOWN",
-                )
-                _write_state(aid)
+                if _outputs_done(aid):
+                    st["state"] = STATE_DONE
+                    st.pop("last_error", None)
+                    st["updated_at"] = time.time()
+                    docling_inflight.pop(aid, None)
+                    grader_inflight.pop(aid, None)
+                    logger.info(
+                        "Alignment {}: outputs present on disk; reconciled state {} -> DONE",
+                        aid,
+                        prev or "UNKNOWN",
+                    )
+                    _write_state(aid)
+                    continue
+                if _graded_exists(aid) and not os.path.isfile(_results_path(aid)):
+                    if st.get("state") in {
+                        STATE_FAILED,
+                        STATE_GRADER_INFLIGHT,
+                        STATE_GRADER_READY,
+                    }:
+                        st["state"] = STATE_SYNTHESIS_READY
+                        st.pop("last_error", None)
+                        st["updated_at"] = time.time()
+                        docling_inflight.pop(aid, None)
+                        grader_inflight.pop(aid, None)
+                        logger.info(
+                            "Alignment {}: graded.json present; reconciled state {} -> SYNTHESIS_READY",
+                            aid,
+                            prev or "UNKNOWN",
+                        )
+                        _write_state(aid)
+                    continue
+                if st.get("state") == STATE_FAILED:
+                    pd = str(st.get("papers_dir") or "")
+                    if (
+                        _papers_dir_has_nonempty_txt(pd)
+                        and not _graded_exists(aid)
+                        and not os.path.isfile(_results_path(aid))
+                    ):
+                        st["state"] = STATE_GRADER_READY
+                        st["updated_at"] = time.time()
+                        docling_inflight.pop(aid, None)
+                        logger.info(
+                            "Alignment {}: FAILED with text on disk; reconciled -> GRADER_READY",
+                            aid,
+                        )
+                        _write_state(aid)
+
+    def _sync_scheduler_states_from_disk() -> None:
+        """Pick up state transitions written by offline requeue scripts (no CPU restart)."""
+        if not os.path.isdir(scheduler_state_dir):
+            return
+        with scheduler_lock:
+            for aid, st in list(alignment_states.items()):
+                if str(st.get("state") or "") != STATE_FAILED:
+                    continue
+                path = _state_path(aid)
+                if not os.path.isfile(path):
+                    continue
+                try:
+                    with open(path, "r", encoding="utf-8") as f:
+                        on_disk = json.load(f)
+                except (OSError, json.JSONDecodeError):
+                    continue
+                if not isinstance(on_disk, dict):
+                    continue
+                disk_state = str(on_disk.get("state") or "")
+                if disk_state and disk_state != STATE_FAILED:
+                    alignment_states[aid] = on_disk
+                    logger.info(
+                        "Alignment {}: picked up disk state {} from offline requeue",
+                        aid,
+                        disk_state,
+                    )
 
     def _required_docling_txt_done(st: Dict[str, Any]) -> bool:
         req = st.get("docling_required_basenames") or []
@@ -1001,10 +1140,18 @@ def run(
             return True
         papers_dir = str(st.get("papers_dir") or "")
         for base in req:
+            if _paper_has_usable_text(papers_dir, base):
+                continue
             txt_path = os.path.join(papers_dir, f"{base}.txt")
             if not (os.path.isfile(txt_path) and os.path.getsize(txt_path) > 0):
                 return False
         return True
+
+    def _recompute_docling_required(
+        papers_dir: str,
+        manifest_map: Dict[Tuple[str, str], Dict[str, Any]] | None = None,
+    ) -> List[str]:
+        return _infer_docling_required_basenames(papers_dir, manifest_map)
 
     def _papers_dir_has_nonempty_txt(papers_dir: str) -> bool:
         if not papers_dir or not os.path.isdir(papers_dir):
@@ -1028,30 +1175,6 @@ def run(
             return False
         return _required_docling_txt_done(st)
 
-    def _infer_docling_required_basenames_from_disk(papers_dir: str) -> List[str]:
-        """Best-effort resume helper when a prior run already downloaded artifacts."""
-        pdf_dir = os.path.join(papers_dir, "pdf")
-        if not os.path.isdir(pdf_dir):
-            return []
-        txt_basenames = {
-            os.path.splitext(_canonical_alignment_text_key(fname))[0]
-            for fname in os.listdir(papers_dir)
-            if fname.endswith(".txt")
-            and os.path.isfile(os.path.join(papers_dir, fname))
-            and os.path.getsize(os.path.join(papers_dir, fname)) > 0
-        }
-        required: List[str] = []
-        for fname in os.listdir(pdf_dir):
-            if not fname.endswith(".pdf"):
-                continue
-            pdf_path = os.path.join(pdf_dir, fname)
-            if not os.path.isfile(pdf_path) or os.path.getsize(pdf_path) <= 0:
-                continue
-            base = os.path.splitext(fname)[0]
-            if base not in txt_basenames:
-                required.append(base)
-        return sorted(required)
-
     def _bootstrap_state(alignment_id: str, defaults: Dict[str, Any]) -> Dict[str, Any]:
         state = dict(defaults)
         path = _state_path(alignment_id)
@@ -1064,6 +1187,17 @@ def run(
             except Exception:
                 pass
         _refresh_grader_payload_constraints(state.get("grader_payload"))
+        papers_dir = str(state.get("papers_dir") or "")
+        if papers_dir and os.path.isdir(papers_dir):
+            manifest_path = os.path.join(papers_dir, DOWNLOAD_MANIFEST_FILENAME)
+            manifest_map = (
+                _load_download_manifest(manifest_path)
+                if os.path.isfile(manifest_path)
+                else None
+            )
+            state["docling_required_basenames"] = _recompute_docling_required(
+                papers_dir, manifest_map
+            )
         if _outputs_done(alignment_id):
             state["state"] = STATE_DONE
         elif _graded_exists(alignment_id) and not os.path.isfile(
@@ -1132,9 +1266,21 @@ def run(
                     continue
                 docling_inflight.pop(aid, None)
                 if s == "failed":
-                    st["state"] = STATE_FAILED
-                    st["last_error"] = str(status.get("error") or "docling failed")
-                    failed_count += 1
+                    err = str(status.get("error") or "docling failed")
+                    pd = str(st.get("papers_dir") or "")
+                    if _papers_dir_has_nonempty_txt(pd) and not _graded_exists(aid):
+                        st["state"] = STATE_GRADER_READY
+                        st["last_error"] = err
+                        logger.warning(
+                            "Alignment {}: docling failed ({}) but papers_dir has "
+                            "usable text; proceeding to GRADER_READY",
+                            aid,
+                            err[:120],
+                        )
+                    else:
+                        st["state"] = STATE_FAILED
+                        st["last_error"] = err
+                        failed_count += 1
                 elif _outputs_done(aid):
                     st["state"] = STATE_DONE
                     total_done += 1
@@ -1180,10 +1326,19 @@ def run(
                     grader_inflight.pop(aid, None)
                     continue
                 if time.monotonic() - float(meta.get("started_monotonic", 0)) > stage_watchdog_seconds:
-                    st["state"] = STATE_FAILED
-                    st["last_error"] = "grader watchdog timeout"
-                    failed_count += 1
                     grader_inflight.pop(aid, None)
+                    if _graded_exists(aid):
+                        st["state"] = STATE_SYNTHESIS_READY
+                        st.pop("last_error", None)
+                        logger.info(
+                            "Alignment {}: grader watchdog elapsed but graded.json present; "
+                            "queued for CPU synthesis",
+                            aid,
+                        )
+                    else:
+                        st["state"] = STATE_FAILED
+                        st["last_error"] = "grader watchdog timeout"
+                        failed_count += 1
                     _write_state(aid)
                     continue
                 gj = str(meta.get("job_id") or "").strip()
@@ -1329,12 +1484,13 @@ def run(
             def _synthesis_worker(alignment_id: str, gpu_base: str) -> None:
                 err: str | None = None
                 try:
-                    req = build_run_alignment_graded_request(
+                    payload = build_run_alignment_graded_payload(
                         alignment_id,
                         output_root,
+                        papers_root=papers_base,
                         instructions=instructions_text,
                     )
-                    post_run_alignment_graded(gpu_base, req.dict())
+                    post_run_alignment_graded(gpu_base, payload)
                 except Exception as e:
                     err = f"synthesis failed: {e}"
                     logger.error("Alignment {}: {}", alignment_id, err)
@@ -1458,28 +1614,26 @@ def run(
         )
 
     def _pick_grader_url_for_dispatch() -> str | None:
-        """Pick a grader endpoint with no inflight alignment and remote queue capacity."""
+        """Round-robin across grader endpoints with a free inflight slot."""
+        nonlocal grader_dispatch_rr
         with scheduler_lock:
             candidates = [
                 u
                 for u in grader_url_bases
                 if _grader_inflight_count_for_url(u) < 1
+                and not _grader_url_is_penalized(u)
             ]
         if not candidates:
             return None
         candidates.sort(key=lambda u: (_grader_inflight_count_for_url(u), u))
-        for url in candidates:
-            if _wait_service_capacity(
-                session=scheduler_session,
-                base_url=url,
-                endpoint="grader_capacity",
-                service_name="Grader",
-                timeout_seconds=1,
-                poll_interval_seconds=1,
-                warn_on_timeout=False,
-            ):
-                return url
-        return None
+        with scheduler_lock:
+            idx = grader_dispatch_rr % len(candidates)
+            grader_dispatch_rr += 1
+        url = candidates[idx]
+        if not _grader_health_ok(url):
+            _penalize_grader_url(url, reason="healthz failed before dispatch")
+            return None
+        return url
 
     def _next_grader_ready_alignment() -> Tuple[str | None, Dict[str, Any] | None]:
         with scheduler_lock:
@@ -1526,13 +1680,31 @@ def run(
                     submit_timeout=30,
                 )
             except Exception as e:
+                _penalize_grader_url(grader_url_base, reason=f"submit failed: {e}")
                 with scheduler_lock:
                     st = alignment_states.get(pending_aid)
                     if st and st.get("state") == STATE_GRADER_READY:
-                        st["state"] = STATE_FAILED
+                        attempts = int(st.get("grader_submit_attempts") or 0) + 1
+                        st["grader_submit_attempts"] = attempts
                         st["last_error"] = f"grader submit failed: {e}"
+                        if attempts >= grader_submit_max_attempts:
+                            st["state"] = STATE_FAILED
+                            logger.error(
+                                "Alignment {}: grader submit exhausted after {} attempts",
+                                pending_aid,
+                                attempts,
+                            )
+                        else:
+                            logger.warning(
+                                "Alignment {}: grader submit failed (attempt {}/{}), "
+                                "will retry on another endpoint: {}",
+                                pending_aid,
+                                attempts,
+                                grader_submit_max_attempts,
+                                e,
+                            )
                         _write_state(pending_aid)
-                return
+                continue
 
             with scheduler_lock:
                 st = alignment_states.get(pending_aid)
@@ -1559,9 +1731,11 @@ def run(
 
     def _tick_scheduler() -> None:
         nonlocal _discovery_status_tick
+        _sync_scheduler_states_from_disk()
         _reconcile_outputs_into_state()
         n_registered_before = len(grader_url_bases)
         _refresh_grader_endpoints()
+        _prune_unhealthy_grader_urls()
         if gpu_discovery_enabled and gpu_pending_specs:
             _refresh_gpu_endpoints()
         if grader_discovery_enabled and grader_pending_specs:
@@ -1583,6 +1757,54 @@ def run(
         _dispatch_docling()
         _dispatch_grader()
         _dispatch_synthesis()
+
+    def _preload_scheduler_states() -> int:
+        """Load saved scheduler JSON so the background tick can dispatch immediately."""
+        if not os.path.isdir(scheduler_state_dir):
+            return 0
+        loaded = 0
+        for fname in os.listdir(scheduler_state_dir):
+            if not fname.endswith(".json"):
+                continue
+            aid = fname[: -len(".json")]
+            path = _state_path(aid)
+            try:
+                with open(path, "r", encoding="utf-8") as f:
+                    st = json.load(f)
+            except (OSError, json.JSONDecodeError):
+                continue
+            if not isinstance(st, dict):
+                continue
+            state = str(st.get("state") or "")
+            if state == STATE_GRADER_INFLIGHT and _graded_exists(aid):
+                st["state"] = STATE_SYNTHESIS_READY
+                for k in ("grader_job_id", "grader_url_base", "grader_submitted_at"):
+                    st.pop(k, None)
+            elif state == STATE_DOCLING_INFLIGHT and _required_docling_txt_done(st):
+                st["state"] = STATE_GRADER_READY
+                for k in ("docling_job_id", "docling_submitted_at"):
+                    st.pop(k, None)
+            with scheduler_lock:
+                alignment_states[aid] = st
+                if st.get("state") == STATE_GRADER_INFLIGHT:
+                    gj = str(st.get("grader_job_id") or "").strip()
+                    gu = str(st.get("grader_url_base") or "").strip()
+                    if gj and gu:
+                        grader_inflight[aid] = {
+                            "job_id": gj,
+                            "grader_url_base": gu,
+                            "started_monotonic": time.monotonic(),
+                        }
+                elif st.get("state") == STATE_DOCLING_INFLIGHT:
+                    dj = str(st.get("docling_job_id") or "").strip()
+                    if dj:
+                        docling_inflight[aid] = {
+                            "job_id": dj,
+                            "started_monotonic": time.monotonic(),
+                            "status_errors": 0,
+                        }
+            loaded += 1
+        return loaded
 
     scheduler_stop = threading.Event()
 
@@ -1606,6 +1828,13 @@ def run(
         name="lit-docling-grader-scheduler",
         daemon=True,
     )
+    preloaded = _preload_scheduler_states()
+    logger.info(
+        "download_node: preloaded {} scheduler state(s) from {}",
+        preloaded,
+        scheduler_state_dir,
+    )
+    sys.stdout.flush()
     bg_scheduler_thread.start()
 
     for query_id, alignments in data.items():
@@ -1711,8 +1940,9 @@ def run(
                             session=session,
                             pmcid_cache=pmcid_cache,
                             no_cache=True,
-                            force_pdfs=True,
+                            force_pdfs=False,
                             prefer_pdf_text=True,
+                            delete_pdf_after_text=True,
                             collection_org=collection_org,
                             auth_scope=collection_auth_scope,
                             collector_email=collector_email or None,
@@ -1728,8 +1958,9 @@ def run(
                             session=session,
                             pmcid_cache=pmcid_cache,
                             no_cache=no_cache,
-                            force_pdfs=True,
+                            force_pdfs=False,
                             prefer_pdf_text=True,
+                            delete_pdf_after_text=True,
                             collection_org=collection_org,
                             auth_scope=collection_auth_scope,
                             collector_email=collector_email or None,
@@ -1771,24 +2002,15 @@ def run(
                     classification_stats=plan_stats or None,
                 )
 
-                if recs:
-                    has_pdf = any(r.pdf_path for r in recs) or existing_pdf
-                    from_recs = {
-                        os.path.splitext(os.path.basename(str(r.pdf_path)))[0]
-                        for r in recs
-                        if ((r.details or {}).get("pdf_docling_required")) and r.pdf_path
-                    }
-                    from_disk = set(
-                        _infer_docling_required_basenames_from_disk(papers_dir)
-                    )
-                    docling_required_basenames = sorted(from_recs | from_disk)
-                    n_docling_required = len(docling_required_basenames)
-                elif not already_done:
-                    docling_required_basenames = _infer_docling_required_basenames_from_disk(
-                        papers_dir
+                if recs or not already_done:
+                    docling_required_basenames = _infer_docling_required_basenames(
+                        papers_dir, manifest_map
                     )
                     n_docling_required = len(docling_required_basenames)
-                    has_pdf = existing_pdf
+                    if not recs:
+                        has_pdf = existing_pdf or bool(docling_required_basenames)
+                    else:
+                        has_pdf = any(r.pdf_path for r in recs) or existing_pdf
 
             query_meta = al.get("query_meta")
             target_meta = al.get("target_meta")
