@@ -47,6 +47,7 @@ vllm serve \"${MODEL_DIR}\" \
     --max-model-len \"${VLLM_MAX_MODEL_LEN}\" \
     --max-num-seqs \"${VLLM_MAX_NUM_SEQS}\" \
     --gpu-memory-utilization \"${VLLM_GPU_MEMORY_UTILIZATION}\" \
+    --enable-prefix-caching \
     --trust-remote-code &
 
 VLLM_PID=\$!
