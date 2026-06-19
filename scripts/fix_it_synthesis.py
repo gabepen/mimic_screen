@@ -11,7 +11,7 @@ import time
 from pathlib import Path
 from typing import List
 
-from auto_lit_search.graded_request import build_run_alignment_graded_request
+from auto_lit_search.graded_request_payload import build_run_alignment_graded_payload
 from auto_lit_search.scheduler_http import post_run_alignment_graded, synthesis_http_timeout_sec
 
 
@@ -127,7 +127,7 @@ def main() -> int:
                 rows.append(f"{alignment_id}\tskipped\tresults look ok")
                 continue
         try:
-            req = build_run_alignment_graded_request(
+            payload = build_run_alignment_graded_payload(
                 alignment_id,
                 args.output_root,
                 papers_root=args.papers_root,
@@ -137,7 +137,9 @@ def main() -> int:
             rows.append(f"{alignment_id}\terror\tbuild request: {e}")
             continue
         if args.dry_run:
-            rows.append(f"{alignment_id}\tdry_run\tn_papers={len(req.graded_papers)}")
+            rows.append(
+                f"{alignment_id}\tdry_run\tn_papers={len(payload.get('graded_papers') or [])}"
+            )
             continue
         if args.backup:
             for suffix in ("_results.json", "_analysis.json"):
@@ -148,7 +150,7 @@ def main() -> int:
         try:
             out = post_run_alignment_graded(
                 args.synthesis_url,
-                req.dict(),
+                payload,
                 timeout=synthesis_http_timeout_sec(),
             )
             rows.append(
