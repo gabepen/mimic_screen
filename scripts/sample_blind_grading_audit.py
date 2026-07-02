@@ -16,6 +16,13 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
+_REPO_SRC = Path(__file__).resolve().parents[1] / "src"
+if str(_REPO_SRC) not in sys.path:
+    sys.path.insert(0, str(_REPO_SRC))
+
+from auto_lit_search.download_manifest import _load_idmap  # noqa: E402
+from auto_lit_search.paper_io import gene_terms  # noqa: E402
+
 BLIND_CSV_FIELDS = [
     "sample_id",
     "doi",
@@ -28,6 +35,34 @@ BLIND_CSV_FIELDS = [
     "human_relevant_yes_no",
     "human_relevance_0_1",
     "human_notes",
+]
+
+BLIND_CSV_BASE_FIELDS = [
+    "sample_id",
+    "doi",
+    "gene_focus_id",
+    "paper_role",
+    "alignment_id",
+    "query_gene_id",
+    "target_gene_id",
+    "file_name",
+    "text_path",
+    "papers_dir",
+    "gene_focus_symbol",
+    "gene_focus_common_name",
+    "gene_focus_search_terms",
+    "query_search_terms",
+    "target_search_terms",
+    "applicable_axes",
+]
+
+IDENTIFIER_FIELDS = [
+    "text_path",
+    "gene_focus_symbol",
+    "gene_focus_common_name",
+    "gene_focus_search_terms",
+    "query_search_terms",
+    "target_search_terms",
 ]
 
 GRADE_BINS: List[Tuple[str, float, float, float]] = [
@@ -53,6 +88,163 @@ class PaperRecord:
     rubric_tags: Dict[str, str]
     rationale: str
     grading_meta: Dict[str, Any] = field(default_factory=dict)
+    text_path: str = ""
+    gene_focus_symbol: str = ""
+    gene_focus_common_name: str = ""
+    gene_focus_search_terms: str = ""
+    query_search_terms: str = ""
+    target_search_terms: str = ""
+    gene_context: Dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass
+class RubricAxis:
+    axis_id: str
+    label: str
+    paper_roles: Tuple[str, ...]
+
+
+@dataclass
+class RubricSpec:
+    host_path: Path
+    microbe_path: Path
+    host_version: str
+    microbe_version: str
+    axes: Tuple[RubricAxis, ...]
+
+    def axes_for_role(self, paper_role: str) -> Tuple[str, ...]:
+        role = (paper_role or "").strip().lower()
+        if role in ("query", "microbe"):
+            return tuple(
+                a.axis_id
+                for a in self.axes
+                if "query" in a.paper_roles or "microbe" in a.paper_roles
+            )
+        return tuple(
+            a.axis_id
+            for a in self.axes
+            if "target" in a.paper_roles or "host" in a.paper_roles
+        )
+
+
+def _load_rubric_axes(path: Path, paper_roles: Tuple[str, ...]) -> Tuple[str, Tuple[RubricAxis, ...]]:
+    data = json.loads(path.read_text(encoding="utf-8"))
+    version = str(data.get("rubric_version") or "")
+    axes = tuple(
+        RubricAxis(
+            axis_id=str(axis.get("id") or ""),
+            label=str(axis.get("label") or axis.get("id") or ""),
+            paper_roles=paper_roles,
+        )
+        for axis in (data.get("axes") or [])
+        if isinstance(axis, dict) and axis.get("id")
+    )
+    return version, axes
+
+
+def load_rubric_spec(host_rubric: Path, microbe_rubric: Path) -> RubricSpec:
+    host_version, host_axes = _load_rubric_axes(host_rubric, ("target", "host"))
+    microbe_version, microbe_axes = _load_rubric_axes(microbe_rubric, ("query", "microbe"))
+    seen: set[str] = set()
+    merged: List[RubricAxis] = []
+    for axis in host_axes + microbe_axes:
+        if axis.axis_id in seen:
+            continue
+        seen.add(axis.axis_id)
+        merged.append(axis)
+    return RubricSpec(
+        host_path=host_rubric,
+        microbe_path=microbe_rubric,
+        host_version=host_version,
+        microbe_version=microbe_version,
+        axes=tuple(merged),
+    )
+
+
+def blind_csv_fieldnames(
+    per_axis: bool,
+    rubric_spec: Optional[RubricSpec],
+    *,
+    include_identifiers: bool,
+) -> List[str]:
+    if per_axis and rubric_spec is not None:
+        fields = list(BLIND_CSV_BASE_FIELDS)
+        for axis in rubric_spec.axes:
+            fields.append(f"human_{axis.axis_id}")
+        fields.append("human_notes")
+        return fields
+    fields = list(BLIND_CSV_FIELDS)
+    if include_identifiers:
+        insert_at = fields.index("file_name") + 1
+        for name in reversed(IDENTIFIER_FIELDS):
+            if name not in fields:
+                fields.insert(insert_at, name)
+        if "papers_dir" not in fields:
+            fields.insert(insert_at, "papers_dir")
+    return fields
+
+
+def _format_search_terms(meta: Dict[str, Any], fallback_id: str) -> str:
+    gt = gene_terms(meta, fallback_id)
+    parts: List[str] = []
+    for val in (
+        fallback_id,
+        gt["symbol"],
+        gt["common_name"] if gt["common_name"] != "none" else "",
+        str(meta.get("entrez_id") or "").strip(),
+        str(meta.get("locus_tag") or "").strip(),
+        str(meta.get("genbank_acc") or "").strip(),
+    ):
+        if val and val.lower() not in {p.lower() for p in parts}:
+            parts.append(val)
+    for syn in gt["synonyms"]:
+        if syn.lower() not in {p.lower() for p in parts}:
+            parts.append(syn)
+    return "; ".join(parts)
+
+
+def _gene_context_for_alignment(
+    alignment_id: str,
+    query_gene_id: str,
+    target_gene_id: str,
+    idmap: Dict[str, Dict[str, Any]],
+) -> Dict[str, Any]:
+    key = f"{query_gene_id}|{target_gene_id}"
+    if key in idmap:
+        row = idmap[key]
+        return {
+            "query": dict(row.get("query_meta") or {}),
+            "target": dict(row.get("target_meta") or {}),
+        }
+    return {"query": {}, "target": {}}
+
+
+def _attach_identifiers(
+    rec: PaperRecord,
+    *,
+    idmap: Dict[str, Dict[str, Any]],
+) -> None:
+    ctx = _gene_context_for_alignment(
+        rec.alignment_id, rec.query_gene_id, rec.target_gene_id, idmap
+    )
+    rec.gene_context = ctx
+    rec.query_search_terms = _format_search_terms(ctx.get("query") or {}, rec.query_gene_id)
+    rec.target_search_terms = _format_search_terms(
+        ctx.get("target") or {}, rec.target_gene_id
+    )
+    role = (rec.paper_role or "").strip().lower()
+    if role in ("query", "microbe"):
+        focus_meta = ctx.get("query") or {}
+        focus_id = rec.query_gene_id
+    else:
+        focus_meta = ctx.get("target") or {}
+        focus_id = rec.target_gene_id
+    gt = gene_terms(focus_meta, focus_id)
+    rec.gene_focus_symbol = gt["symbol"]
+    rec.gene_focus_common_name = gt["common_name"]
+    rec.gene_focus_search_terms = _format_search_terms(focus_meta, focus_id)
+    if rec.papers_dir and rec.file_name:
+        rec.text_path = str(Path(rec.papers_dir) / rec.file_name)
 
 
 def _parse_alignment_id(alignment_id: str) -> Tuple[str, str]:
@@ -103,6 +295,7 @@ def _resolve_papers_dir(
 def load_candidate_pool(
     output_root: Path,
     papers_root: Optional[Path],
+    idmap: Optional[Dict[str, Dict[str, Any]]] = None,
 ) -> List[PaperRecord]:
     seen: set[Tuple[str, str]] = set()
     pool: List[PaperRecord] = []
@@ -176,6 +369,13 @@ def load_candidate_pool(
                     grading_meta=dict(meta),
                 )
             )
+    if idmap:
+        for rec in pool:
+            _attach_identifiers(rec, idmap=idmap)
+    else:
+        for rec in pool:
+            if rec.papers_dir and rec.file_name:
+                rec.text_path = str(Path(rec.papers_dir) / rec.file_name)
     return pool
 
 
@@ -348,11 +548,27 @@ def sample_records(
     return selected, stats
 
 
+def _identifier_row_fields(rec: PaperRecord) -> Dict[str, str]:
+    return {
+        "text_path": rec.text_path,
+        "papers_dir": rec.papers_dir,
+        "gene_focus_symbol": rec.gene_focus_symbol,
+        "gene_focus_common_name": rec.gene_focus_common_name,
+        "gene_focus_search_terms": rec.gene_focus_search_terms,
+        "query_search_terms": rec.query_search_terms,
+        "target_search_terms": rec.target_search_terms,
+    }
+
+
 def write_outputs(
     selected: Sequence[PaperRecord],
     out_dir: Path,
     seed: int,
     stats: Dict[str, Any],
+    *,
+    per_axis: bool = False,
+    rubric_spec: Optional[RubricSpec] = None,
+    include_identifiers: bool = False,
 ) -> None:
     out_dir.mkdir(parents=True, exist_ok=True)
     ordered = list(selected)
@@ -361,11 +577,34 @@ def write_outputs(
 
     answer_key: Dict[str, Any] = {}
     blind_rows: List[Dict[str, str]] = []
+    fieldnames = blind_csv_fieldnames(
+        per_axis,
+        rubric_spec,
+        include_identifiers=include_identifiers,
+    )
 
     for i, rec in enumerate(ordered, start=1):
         sample_id = f"audit_{i:03d}"
-        blind_rows.append(
-            {
+        if per_axis and rubric_spec is not None:
+            applicable = rubric_spec.axes_for_role(rec.paper_role)
+            row: Dict[str, str] = {
+                "sample_id": sample_id,
+                "doi": rec.doi,
+                "gene_focus_id": rec.gene_focus_id,
+                "paper_role": rec.paper_role,
+                "alignment_id": rec.alignment_id,
+                "query_gene_id": rec.query_gene_id,
+                "target_gene_id": rec.target_gene_id,
+                "file_name": rec.file_name,
+                **_identifier_row_fields(rec),
+                "applicable_axes": ";".join(applicable),
+                "human_notes": "",
+            }
+            for axis in rubric_spec.axes:
+                row[f"human_{axis.axis_id}"] = ""
+            blind_rows.append(row)
+        else:
+            row = {
                 "sample_id": sample_id,
                 "doi": rec.doi,
                 "gene_focus_id": rec.gene_focus_id,
@@ -378,7 +617,9 @@ def write_outputs(
                 "human_relevance_0_1": "",
                 "human_notes": "",
             }
-        )
+            if include_identifiers:
+                row.update(_identifier_row_fields(rec))
+            blind_rows.append(row)
         answer_key[sample_id] = {
             "doi": rec.doi,
             "gene_focus_id": rec.gene_focus_id,
@@ -388,6 +629,13 @@ def write_outputs(
             "paper_role": rec.paper_role,
             "file_name": rec.file_name,
             "papers_dir": rec.papers_dir,
+            "text_path": rec.text_path,
+            "gene_focus_symbol": rec.gene_focus_symbol,
+            "gene_focus_common_name": rec.gene_focus_common_name,
+            "gene_focus_search_terms": rec.gene_focus_search_terms,
+            "query_search_terms": rec.query_search_terms,
+            "target_search_terms": rec.target_search_terms,
+            "gene_context": rec.gene_context,
             "relevance_grade": rec.relevance_grade,
             "rubric_dimension_scores": rec.rubric_dimension_scores,
             "rubric_axis_rationales": rec.rubric_axis_rationales,
@@ -395,11 +643,24 @@ def write_outputs(
             "rationale": rec.rationale,
             "graded_at": rec.grading_meta.get("graded_at"),
             "grader_model": rec.grading_meta.get("grader_model"),
+            "grading_schema_version": rec.grading_meta.get("grading_schema_version"),
+            "host_rubric_path": rec.grading_meta.get("host_rubric_path"),
+            "microbe_rubric_path": rec.grading_meta.get("microbe_rubric_path"),
         }
+        if per_axis and rubric_spec is not None:
+            answer_key[sample_id]["applicable_axes"] = list(
+                rubric_spec.axes_for_role(rec.paper_role)
+            )
+            answer_key[sample_id]["rubric_spec"] = {
+                "host_rubric_path": str(rubric_spec.host_path),
+                "host_rubric_version": rubric_spec.host_version,
+                "microbe_rubric_path": str(rubric_spec.microbe_path),
+                "microbe_rubric_version": rubric_spec.microbe_version,
+            }
 
     blind_path = out_dir / "blind_grading_sheet.csv"
     with blind_path.open("w", encoding="utf-8", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=BLIND_CSV_FIELDS)
+        writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
         writer.writeheader()
         writer.writerows(blind_rows)
 
@@ -408,6 +669,26 @@ def write_outputs(
         json.dumps(answer_key, indent=2, ensure_ascii=False) + "\n",
         encoding="utf-8",
     )
+
+    if per_axis and rubric_spec is not None:
+        guide_lines = [
+            "Per-axis human scoring sheet",
+            "Fill human_<axis_id> with a score from 0.0 to 1.0 for each applicable axis.",
+            "Leave blank for axes not listed in applicable_axes for that row.",
+            "Open text_path and search for gene_focus_search_terms while grading.",
+            "See rubric_axis_guide.txt and rubric validation markdown guides.",
+            "",
+            f"host_rubric={rubric_spec.host_path} (v{rubric_spec.host_version})",
+            f"microbe_rubric={rubric_spec.microbe_path} (v{rubric_spec.microbe_version})",
+            "",
+        ]
+        for axis in rubric_spec.axes:
+            roles = ", ".join(axis.paper_roles)
+            guide_lines.append(f"{axis.axis_id}\troles={roles}\t{axis.label}")
+        (out_dir / "rubric_axis_guide.txt").write_text(
+            "\n".join(guide_lines) + "\n",
+            encoding="utf-8",
+        )
 
     report_lines = [
         f"timestamp={time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())}",
@@ -441,6 +722,8 @@ def write_outputs(
     print(f"Wrote {blind_path}")
     print(f"Wrote {key_path}")
     print(f"Wrote {out_dir / 'sampling_report.txt'}")
+    if per_axis and rubric_spec is not None:
+        print(f"Wrote {out_dir / 'rubric_axis_guide.txt'}")
 
 
 def main() -> int:
@@ -467,6 +750,29 @@ def main() -> int:
     )
     p.add_argument("--irrelevant-min", type=float, default=0.10)
     p.add_argument("--irrelevant-max", type=float, default=0.30)
+    p.add_argument(
+        "--per-axis",
+        action="store_true",
+        help="Blind CSV with one human_<axis_id> column per rubric axis (requires rubric paths)",
+    )
+    p.add_argument(
+        "--host-rubric",
+        type=Path,
+        default=None,
+        help="Host/target-side rubric JSON (e.g. host_rubric_v1.json)",
+    )
+    p.add_argument(
+        "--microbe-rubric",
+        type=Path,
+        default=None,
+        help="Query/microbe-side rubric JSON (e.g. legionella_rubric.json)",
+    )
+    p.add_argument(
+        "--idmap-csv",
+        type=Path,
+        default=None,
+        help="Stage-1 idmap CSV with query/target gene identifiers (recommended)",
+    )
     args = p.parse_args()
 
     if args.n < 1:
@@ -479,12 +785,31 @@ def main() -> int:
         print(f"Not a directory: {args.output_root}", file=sys.stderr)
         return 2
 
+    rubric_spec: Optional[RubricSpec] = None
+    if args.per_axis:
+        if args.host_rubric is None or args.microbe_rubric is None:
+            print("--per-axis requires --host-rubric and --microbe-rubric", file=sys.stderr)
+            return 2
+        if not args.host_rubric.is_file() or not args.microbe_rubric.is_file():
+            print("Rubric JSON path not found", file=sys.stderr)
+            return 2
+        rubric_spec = load_rubric_spec(args.host_rubric, args.microbe_rubric)
+
+    idmap: Dict[str, Dict[str, Any]] = {}
+    if args.idmap_csv:
+        if not args.idmap_csv.is_file():
+            print(f"Not found: {args.idmap_csv}", file=sys.stderr)
+            return 2
+        idmap = _load_idmap(str(args.idmap_csv))
+        if not idmap:
+            print(f"Warning: no rows loaded from {args.idmap_csv}", file=sys.stderr)
+
     out_dir = args.out_dir
     if out_dir is None:
         ts = time.strftime("%Y%m%d_%H%M%S")
         out_dir = args.output_root / f"blind_grading_audit_{ts}"
 
-    pool = load_candidate_pool(args.output_root, args.papers_root)
+    pool = load_candidate_pool(args.output_root, args.papers_root, idmap=idmap or None)
     if not pool:
         print("No graded papers found.", file=sys.stderr)
         return 1
@@ -501,7 +826,15 @@ def main() -> int:
         print("No samples selected.", file=sys.stderr)
         return 1
 
-    write_outputs(selected, out_dir, args.seed, stats)
+    write_outputs(
+        selected,
+        out_dir,
+        args.seed,
+        stats,
+        per_axis=args.per_axis,
+        rubric_spec=rubric_spec,
+        include_identifiers=bool(idmap),
+    )
     if stats.get("warning"):
         print(f"Warning: {stats['warning']}", file=sys.stderr)
     return 0

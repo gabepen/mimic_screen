@@ -744,12 +744,19 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
 def resolve_paths(args: argparse.Namespace) -> Dict[str, Path]:
     data_root = args.data_root
     logs_dir = args.logs_dir or (data_root / "logs")
+    output_root = args.output_root or (data_root / "llm_results")
+    if args.scheduler_state_dir:
+        scheduler_dir = args.scheduler_state_dir
+    elif (output_root / "scheduler_state").is_dir():
+        scheduler_dir = output_root / "scheduler_state"
+    else:
+        scheduler_dir = logs_dir / "scheduler_state"
     return {
         "data_root": data_root,
-        "output_root": args.output_root or (data_root / "llm_results"),
+        "output_root": output_root,
         "paper_ids": args.paper_ids
         or (data_root / "search_results" / "lp-human-all_search.json"),
-        "scheduler_dir": args.scheduler_state_dir or (logs_dir / "scheduler_state"),
+        "scheduler_dir": scheduler_dir,
         "papers_root": args.papers_root or (data_root / "papers"),
         "logs_dir": logs_dir,
         "cpu_log": args.cpu_log or find_latest_cpu_log(logs_dir),

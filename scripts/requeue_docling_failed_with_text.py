@@ -64,12 +64,16 @@ def requeue_docling_failed_with_text(
         papers_dir = papers_root / aid
         if not papers_dir.is_dir():
             papers_dir = Path(str(state.get("papers_dir") or ""))
-        n_txt = sum(
-            1
-            for f in papers_dir.glob("*.txt")
-            if f.is_file() and f.stat().st_size > 0
-        )
-        if n_txt < min_txt_files and not _papers_dir_has_nonempty_txt(papers_dir):
+        if min_txt_files <= 1:
+            has_text = _papers_dir_has_nonempty_txt(papers_dir)
+        else:
+            n_txt = sum(
+                1
+                for f in papers_dir.glob("*.txt")
+                if f.is_file() and f.stat().st_size > 0
+            )
+            has_text = n_txt >= min_txt_files
+        if not has_text:
             no_text += 1
             skipped += 1
             continue
