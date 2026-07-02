@@ -27,6 +27,9 @@ MAX_PAPER_CHARS = 120000
 _MODEL_ID_CACHE: Dict[str, str] = {}
 
 
+from auto_lit_search.llm_response import message_text_from_chat_response
+
+
 def _call_llm(
     user_content: str,
     base_url: str,
@@ -63,11 +66,12 @@ def _call_llm(
     if not model:
         model = configured or _fetch_served_model_id(root_url)
     timeout = env_positive_float("SYNTHESIS_LLM_TIMEOUT", 300.0)
-    payload = {
+    payload: Dict[str, Any] = {
         "model": model,
         "messages": [{"role": "user", "content": user_content}],
         "max_tokens": max_tokens,
         "temperature": temperature,
+        "chat_template_kwargs": {"enable_thinking": False},
     }
     r = requests.post(url, json=payload, timeout=timeout)
     if r.status_code == 404 and configured:
@@ -77,12 +81,21 @@ def _call_llm(
             r = requests.post(url, json=payload, timeout=timeout)
     r.raise_for_status()
     data = r.json()
-    choices = data.get("choices") or []
-    if choices:
-        msg = choices[0].get("message") if isinstance(choices[0], dict) else None
-        if isinstance(msg, dict):
-            return (msg.get("content") or "").strip()
-    return ""
+    if not isinstance(data, dict):
+        return ""
+    text = message_text_from_chat_response(data)
+    if not text:
+        choices = data.get("choices") or []
+        finish = ""
+        if choices and isinstance(choices[0], dict):
+            finish = str(choices[0].get("finish_reason") or "").strip()
+        logger.warning(
+            "LLM returned empty content and reasoning_content (finish_reason={})",
+            finish or "unknown",
+        )
+    elif text and not str((data.get("choices") or [{}])[0].get("message", {}).get("content") or "").strip():
+        logger.warning("LLM returned empty content; using reasoning_content (len={})", len(text))
+    return text
 
 
 def _write_alignment_results(
@@ -196,7 +209,26 @@ def _run_alignment_graded_impl(req: RunAlignmentGradedRequest) -> RunAlignmentRe
 
 @app.get("/healthz")
 def healthz() -> Dict[str, str]:
-    return {"status": "ok", "detail": "ready"}
+    """Ready only when the local vLLM server responds on /v1/models."""
+    import requests as req_lib
+
+    base = (os.environ.get("VLLM_BASE_URL") or "").strip().rstrip("/")
+    if not base:
+        return {"status": "ok", "vllm": "disabled", "detail": "VLLM_BASE_URL unset"}
+    try:
+        resp = req_lib.get(f"{base}/v1/models", timeout=10)
+        if resp.ok:
+            data = resp.json()
+            if isinstance(data, dict) and data.get("data"):
+                return {"status": "ok", "vllm": "ready", "detail": "vllm models available"}
+        raise HTTPException(
+            status_code=503,
+            detail=f"vllm not ready: HTTP {resp.status_code} {(resp.text or '')[:200]}",
+        )
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=503, detail=f"vllm not ready: {e}") from e
 
 
 @app.post("/run_alignment", response_model=RunAlignmentResponse)
