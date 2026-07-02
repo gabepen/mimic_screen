@@ -47,31 +47,31 @@ vllm serve \"${MODEL_DIR}\" \
 
 VLLM_PID=\$!
 
-for i in \$(seq 1 60); do
-    if \"\$PY\" - << 'PY' 2>/dev/null; then break; fi
-import os
-import socket
-import sys
-
-host = '127.0.0.1'
-port = int(os.environ.get('VLLM_PORT', '8000'))
-s = socket.socket()
-s.settimeout(1)
-try:
-    s.connect((host, port))
-    s.close()
-    sys.exit(0)
-except Exception:
-    sys.exit(1)
-PY
-    if [ \$? -eq 0 ]; then
+echo \"Waiting for vLLM /v1/models on 127.0.0.1:${VLLM_PORT} ...\"
+VLLM_READY=0
+for i in \$(seq 1 120); do
+    if \"\$PY\" -c \"import json,urllib.request; url='http://127.0.0.1:${VLLM_PORT}/v1/models'; data=json.loads(urllib.request.urlopen(url,timeout=10).read()); raise SystemExit(0 if isinstance(data,dict) and data.get('data') else 1)\" 2>/dev/null; then
+        VLLM_READY=1
+        echo \"vLLM ready after \${i} attempt(s)\"
         break
     fi
-    sleep 2
+    sleep 5
 done
+if [[ \"\${VLLM_READY}\" -ne 1 ]]; then
+    echo \"ERROR: vLLM did not become ready on port ${VLLM_PORT}\" >&2
+    exit 1
+fi
 
 export VLLM_BASE_URL=\"http://127.0.0.1:${VLLM_PORT}\"
 export GPU_API_PORT=\"${GPU_API_PORT}\"
+export HOST_RUBRIC_PATH=\"${HOST_RUBRIC_PATH:-}\"
+export MICROBE_RUBRIC_PATH=\"${MICROBE_RUBRIC_PATH:-}\"
+export SYNTHESIS_FINAL_EXCERPT_TOP_K_HOST=\"\${SYNTHESIS_FINAL_EXCERPT_TOP_K_HOST:-8}\"
+export SYNTHESIS_FINAL_EXCERPT_TOP_K_QUERY=\"\${SYNTHESIS_FINAL_EXCERPT_TOP_K_QUERY:-8}\"
+export SYNTHESIS_FINAL_EXCERPT_CHARS=\"\${SYNTHESIS_FINAL_EXCERPT_CHARS:-4000}\"
+export SYNTHESIS_FINAL_MAX_TOKENS=\"\${SYNTHESIS_FINAL_MAX_TOKENS:-8192}\"
+export SYNTHESIS_CONTEXT_MARGIN=\"\${SYNTHESIS_CONTEXT_MARGIN:-4096}\"
+export SYNTHESIS_ENABLE_REPAIR_PASS=\"\${SYNTHESIS_ENABLE_REPAIR_PASS:-0}\"
 
 \"\$PY\" -m uvicorn auto_lit_search.gpu_server:app --host 0.0.0.0 --port \"${GPU_API_PORT}\"
 
