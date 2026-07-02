@@ -84,6 +84,25 @@ def primary_axis_for_role(rubric_role: str) -> str:
     return HOST_PRIMARY_AXIS if rubric_role == "host" else MICROBE_PRIMARY_AXIS
 
 
+def _grading_config(rubric: Dict[str, Any]) -> Dict[str, Any]:
+    cfg = rubric.get("grading_config")
+    return cfg if isinstance(cfg, dict) else {}
+
+
+def primary_axis_for_rubric(rubric: Dict[str, Any], rubric_role: str) -> str:
+    configured = str(_grading_config(rubric).get("primary_axis") or "").strip()
+    if configured:
+        return configured
+    return primary_axis_for_role(rubric_role)
+
+
+def bonus_axis_for_rubric(rubric: Dict[str, Any], rubric_role: str) -> str | None:
+    configured = str(_grading_config(rubric).get("bonus_axis") or "").strip()
+    if configured:
+        return configured
+    return HOST_BONUS_AXIS if rubric_role == "host" else None
+
+
 def criterion_id_to_axis_map(rubric: Dict[str, Any]) -> Dict[str, str]:
     scored, _ = rubric_criteria(rubric)
     return {c.id: c.axis_id for c in scored}
@@ -178,18 +197,22 @@ def compute_axis_totals(
     return totals
 
 
-def compute_relevance_grade(dim_scores: Dict[str, float], rubric_role: str) -> float:
+def compute_relevance_grade(
+    dim_scores: Dict[str, float],
+    rubric_role: str,
+    *,
+    bonus_axis: str | None = None,
+) -> float:
     if not dim_scores:
         return 0.0
-    if (
-        rubric_role == "host"
-        and HOST_BONUS_AXIS in dim_scores
-        and len(dim_scores) > 1
-    ):
-        base_keys = [k for k in dim_scores if k != HOST_BONUS_AXIS]
+    bonus = bonus_axis
+    if bonus is None and rubric_role == "host":
+        bonus = HOST_BONUS_AXIS
+    if rubric_role == "host" and bonus and bonus in dim_scores and len(dim_scores) > 1:
+        base_keys = [k for k in dim_scores if k != bonus]
         base = sum(float(dim_scores[k]) for k in base_keys) / len(base_keys)
-        bonus = float(dim_scores[HOST_BONUS_AXIS]) / len(dim_scores)
-        return max(0.0, min(1.0, base + bonus))
+        bonus_val = float(dim_scores[bonus]) / len(dim_scores)
+        return max(0.0, min(1.0, base + bonus_val))
     return max(0.0, min(1.0, sum(float(v) for v in dim_scores.values()) / len(dim_scores)))
 
 
@@ -203,7 +226,8 @@ def aggregate_paper_scores(
     total_score = sum(t.score for t in axis_totals.values())
     total_max = sum(t.max_score for t in axis_totals.values())
 
-    primary_axis = primary_axis_for_role(rubric_role)
+    primary_axis = primary_axis_for_rubric(rubric, rubric_role)
+    bonus_axis = bonus_axis_for_rubric(rubric, rubric_role)
     primary = axis_totals.get(primary_axis, AxisTotal(score=0, max_score=0))
     dim_scores = {axis_id: total.norm for axis_id, total in axis_totals.items()}
 
@@ -221,7 +245,9 @@ def aggregate_paper_scores(
         "primary_grade_max": primary.max_score,
         "relevance_sort": primary.score,
         "rubric_dimension_scores": dim_scores,
-        "relevance_grade": compute_relevance_grade(dim_scores, rubric_role),
+        "relevance_grade": compute_relevance_grade(
+            dim_scores, rubric_role, bonus_axis=bonus_axis
+        ),
         "rubric_axis_rationales": derive_axis_rationales_from_criterion_scores(
             rubric, criterion_scores
         ),
