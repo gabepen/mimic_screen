@@ -249,13 +249,23 @@ def _wait_health(
     gpu_url_base: str,
     timeout: int = 300,
     interval: int = 5,
+    *,
+    host_resolver=None,
 ) -> bool:
-    url = f"{gpu_url_base.rstrip('/')}/healthz"
     deadline = time.monotonic() + timeout
     started = time.monotonic()
     attempt = 0
     while time.monotonic() < deadline:
         attempt += 1
+        base = gpu_url_base
+        if host_resolver is not None:
+            try:
+                resolved = host_resolver()
+                if resolved:
+                    base = resolved
+            except Exception:
+                pass
+        url = f"{base.rstrip('/')}/healthz"
         try:
             r = requests.get(url, timeout=10)
             if r.status_code == 200:
@@ -281,7 +291,7 @@ def _wait_health(
     logger.error(
         "Timed out waiting for {} at {} after {}s",
         service,
-        url,
+        gpu_url_base,
         timeout,
     )
     return False
@@ -624,17 +634,36 @@ def run(
     )
 
     docling_url_base = ""
-    if docling_host:
-        docling_url_base = f"http://{docling_host}:{docling_port}"
+    if docling_host or os.environ.get("DOCLING_JOB_ID", "").strip():
+        docling_job_id = os.environ.get("DOCLING_JOB_ID", "").strip()
+
+        def _docling_url_base() -> str:
+            host = (docling_host or "").strip()
+            if docling_job_id:
+                node = get_job_node(docling_job_id)
+                if node:
+                    host = node
+            if not host:
+                return ""
+            return f"http://{host}:{docling_port}"
+
+        docling_url_base = _docling_url_base()
         logger.info(
-            "download_node: probing Docling health at {}/healthz",
+            "download_node: probing Docling health at {}/healthz{}",
             docling_url_base.rstrip("/"),
+            f" (DOCLING_JOB_ID={docling_job_id})" if docling_job_id else "",
         )
         sys.stdout.flush()
         if not _wait_health(
-            "Docling", docling_url_base, timeout=service_health_wait_seconds
+            "Docling",
+            docling_url_base or f"http://{docling_host}:{docling_port}",
+            timeout=service_health_wait_seconds,
+            host_resolver=_docling_url_base,
         ):
-            raise RuntimeError(f"Docling node not healthy at {docling_url_base}")
+            raise RuntimeError(
+                f"Docling node not healthy at {docling_url_base or docling_host}:{docling_port}"
+            )
+        docling_url_base = _docling_url_base()
     grader_url_bases = _resolve_grader_url_bases(grader_host, grader_port)
     if not grader_url_bases and not os.environ.get("GRADER_JOB_IDS", "").strip():
         raise RuntimeError(
@@ -956,10 +985,16 @@ def run(
         idmap = _load_idmap(idmap_path)
     papers_base = os.path.join(data_root, "papers")
     logs_base = os.path.join(data_root, "logs")
+    run_logs_dir = os.environ.get("RUN_LOGS_DIR", "").strip() or os.path.join(
+        output_root, "logs"
+    )
     os.makedirs(papers_base, exist_ok=True)
     os.makedirs(logs_base, exist_ok=True)
     os.makedirs(output_root, exist_ok=True)
-    scheduler_state_dir = os.path.join(logs_base, "scheduler_state")
+    os.makedirs(run_logs_dir, exist_ok=True)
+    scheduler_state_dir = os.environ.get("SCHEDULER_STATE_DIR", "").strip() or os.path.join(
+        output_root, "scheduler_state"
+    )
     os.makedirs(scheduler_state_dir, exist_ok=True)
 
     if os.environ.get("DOWNLOAD_PROGRESS_LOG", "1").strip().lower() not in (
@@ -969,7 +1004,7 @@ def run(
     ):
         _p_path = (
             os.environ.get("DOWNLOAD_PROGRESS_LOG_PATH", "").strip()
-            or os.path.join(logs_base, "download_progress.log")
+            or os.path.join(run_logs_dir, "download_progress.log")
         )
         try:
             os.makedirs(os.path.dirname(_p_path) or ".", exist_ok=True)
@@ -1833,6 +1868,11 @@ def run(
         "download_node: preloaded {} scheduler state(s) from {}",
         preloaded,
         scheduler_state_dir,
+    )
+    logger.info(
+        "download_node: run logs dir={} (shared data logs={})",
+        run_logs_dir,
+        logs_base,
     )
     sys.stdout.flush()
     bg_scheduler_thread.start()

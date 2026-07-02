@@ -97,9 +97,13 @@ def run_download_packages_only(
         output_root = os.path.join(data_root, "llm_results")
     papers_base = os.path.join(data_root, "papers")
     logs_base = os.path.join(data_root, "logs")
+    run_logs_dir = os.environ.get("RUN_LOGS_DIR", "").strip() or os.path.join(
+        output_root, "logs"
+    )
     os.makedirs(papers_base, exist_ok=True)
     os.makedirs(logs_base, exist_ok=True)
     os.makedirs(output_root, exist_ok=True)
+    os.makedirs(run_logs_dir, exist_ok=True)
 
     if os.environ.get("DOWNLOAD_PROGRESS_LOG", "1").strip().lower() not in (
         "0",
@@ -108,7 +112,7 @@ def run_download_packages_only(
     ):
         progress_path = (
             os.environ.get("DOWNLOAD_PROGRESS_LOG_PATH", "").strip()
-            or os.path.join(logs_base, "download_progress.log")
+            or os.path.join(run_logs_dir, "download_progress.log")
         )
         try:
             os.makedirs(os.path.dirname(progress_path) or ".", exist_ok=True)
