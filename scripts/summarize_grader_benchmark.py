@@ -7,10 +7,17 @@ import argparse
 import csv
 import json
 import statistics
+import sys
 from collections import defaultdict
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
+
+_REPO_SRC = Path(__file__).resolve().parents[1] / "src"
+if str(_REPO_SRC) not in sys.path:
+    sys.path.insert(0, str(_REPO_SRC))
+
+from auto_lit_search.env_config import resolve_rubric_paths  # noqa: E402
 
 # Axes applicable per paper role, with weighted max totals from rubric JSON.
 ROLE_AXES: Dict[str, List[Tuple[str, int, str]]] = {
@@ -27,13 +34,6 @@ ROLE_AXES: Dict[str, List[Tuple[str, int, str]]] = {
 
 # ~1 criterion point on a 12-point axis.
 SIMILAR_DELTA_THRESHOLD = 0.083
-
-_DEFAULT_HOST_RUBRIC = Path(
-    "/private/groups/corbettlab/gabe/auto_lit_eval_data/rubrics/host_rubric_v1.json"
-)
-_DEFAULT_MICROBE_RUBRIC = Path(
-    "/private/groups/corbettlab/gabe/auto_lit_eval_data/rubrics/legionella_rubric.json"
-)
 
 
 def _criterion_axis_map(rubric_path: Path) -> Dict[str, str]:
@@ -62,8 +62,8 @@ def _criterion_axis_map(rubric_path: Path) -> Dict[str, str]:
 
 
 def _resolve_rubric_paths(manifest: Dict[str, Any], run_dir: Path) -> Tuple[Path, Path]:
-    host_path = _DEFAULT_HOST_RUBRIC
-    microbe_path = _DEFAULT_MICROBE_RUBRIC
+    host_path: Path | None = None
+    microbe_path: Path | None = None
     for paper in manifest.get("papers") or []:
         if not isinstance(paper, dict):
             continue
@@ -87,7 +87,7 @@ def _resolve_rubric_paths(manifest: Dict[str, Any], run_dir: Path) -> Tuple[Path
         if meta.get("microbe_rubric_path"):
             microbe_path = Path(str(meta["microbe_rubric_path"]))
         break
-    return host_path, microbe_path
+    return resolve_rubric_paths(host=host_path, microbe=microbe_path)
 
 
 def _format_v2_axis_reasoning(

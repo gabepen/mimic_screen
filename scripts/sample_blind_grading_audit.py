@@ -21,15 +21,9 @@ if str(_REPO_SRC) not in sys.path:
     sys.path.insert(0, str(_REPO_SRC))
 
 from auto_lit_search.download_manifest import _load_idmap  # noqa: E402
-from auto_lit_search.env_config import (  # noqa: E402
-    default_host_rubric_path,
-    default_microbe_rubric_path,
-)
+from auto_lit_search.env_config import resolve_rubric_paths  # noqa: E402
 from auto_lit_search.paper_io import gene_terms  # noqa: E402
 from auto_lit_search.rubric_scoring import rubric_criteria  # noqa: E402
-
-_DEFAULT_HOST_RUBRIC = default_host_rubric_path()
-_DEFAULT_MICROBE_RUBRIC = default_microbe_rubric_path()
 
 BLIND_CSV_FIELDS = [
     "sample_id",
@@ -839,8 +833,14 @@ def main() -> int:
     per_criterion = args.per_criterion or args.per_axis
     rubric_spec: Optional[RubricSpec] = None
     if per_criterion:
-        host_rubric = args.host_rubric or _DEFAULT_HOST_RUBRIC
-        microbe_rubric = args.microbe_rubric or _DEFAULT_MICROBE_RUBRIC
+        try:
+            host_rubric, microbe_rubric = resolve_rubric_paths(
+                host=args.host_rubric,
+                microbe=args.microbe_rubric,
+            )
+        except RuntimeError as e:
+            print(str(e), file=sys.stderr)
+            return 2
         if not host_rubric.is_file() or not microbe_rubric.is_file():
             print("Rubric JSON path not found", file=sys.stderr)
             return 2

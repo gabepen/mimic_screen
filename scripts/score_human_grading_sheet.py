@@ -21,11 +21,8 @@ from auto_lit_search.rubric_scoring import (  # noqa: E402
     primary_axis_for_rubric,
     rubric_role_for_paper_role,
 )
-from sample_blind_grading_audit import (  # noqa: E402
-    _DEFAULT_HOST_RUBRIC,
-    _DEFAULT_MICROBE_RUBRIC,
-    load_rubric_spec,
-)
+from auto_lit_search.env_config import resolve_rubric_paths  # noqa: E402
+from sample_blind_grading_audit import load_rubric_spec  # noqa: E402
 
 _DEFAULT_OUT_NAME = "human_grading_scores.json"
 _HUMAN_COL_PREFIX = "human_"
@@ -458,8 +455,8 @@ def format_report_markdown(reports: List[Dict[str, Any]], summary: Dict[str, Any
 def main() -> int:
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--sheet", type=Path, required=True, help="Filled blind_grading_sheet.csv")
-    p.add_argument("--host-rubric", type=Path, default=_DEFAULT_HOST_RUBRIC)
-    p.add_argument("--microbe-rubric", type=Path, default=_DEFAULT_MICROBE_RUBRIC)
+    p.add_argument("--host-rubric", type=Path, default=None)
+    p.add_argument("--microbe-rubric", type=Path, default=None)
     p.add_argument(
         "--answer-key",
         type=Path,
@@ -483,11 +480,19 @@ def main() -> int:
     if not args.sheet.is_file():
         print(f"Not found: {args.sheet}", file=sys.stderr)
         return 2
-    if not args.host_rubric.is_file() or not args.microbe_rubric.is_file():
+    try:
+        host_rubric, microbe_rubric = resolve_rubric_paths(
+            host=args.host_rubric,
+            microbe=args.microbe_rubric,
+        )
+    except RuntimeError as e:
+        print(str(e), file=sys.stderr)
+        return 2
+    if not host_rubric.is_file() or not microbe_rubric.is_file():
         print("Rubric JSON path not found", file=sys.stderr)
         return 2
 
-    rubric_spec = load_rubric_spec(args.host_rubric, args.microbe_rubric)
+    rubric_spec = load_rubric_spec(host_rubric, microbe_rubric)
     answer_key: Dict[str, Any] = {}
     if args.answer_key:
         if not args.answer_key.is_file():
@@ -533,8 +538,8 @@ def main() -> int:
 
     payload = {
         "sheet": str(args.sheet),
-        "host_rubric": str(args.host_rubric),
-        "microbe_rubric": str(args.microbe_rubric),
+        "host_rubric": str(host_rubric),
+        "microbe_rubric": str(microbe_rubric),
         "criterion_columns": criterion_columns,
         "n_rows": n_rows,
         "n_scored": len(results),
