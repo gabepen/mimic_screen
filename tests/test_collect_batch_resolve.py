@@ -11,6 +11,7 @@ import pytest
 
 from auto_lit_search.collect import (
     CollectThrottle,
+    CollectionContext,
     _collect_s3_record,
     _download_papers_phased,
     _pmcid_epmc_or_batch,
@@ -117,7 +118,10 @@ def test_phased_download_s3_then_fallback(
 ) -> None:
     from auto_lit_search.collect import DownloadRecord, UCSCEmailOnlyProvider
 
-    good_text = "Abstract\n" + ("x" * 3000)
+    good_text = (
+        "Abstract\nIntroduction\nMethods\nResults\nDiscussion\nConclusion\n"
+        + ("paragraph text. " * 400)
+    )
     meta = MagicMock()
     meta.pmcid = "PMC123"
     meta.version = 1
@@ -175,5 +179,89 @@ def test_phased_download_s3_then_fallback(
             )
         assert len(recs) == 2
         mock_fallback.assert_called_once()
+        assert mock_fallback.call_args.kwargs.get("disable_pmc_oa_s3") is False
         hit = next(r for r in recs if r.paper_id == "10.1/hit")
         assert hit.text_path is not None
+
+
+@patch("auto_lit_search.collect._collect_single_record")
+@patch("auto_lit_search.collect.batch_resolve_pmcids", return_value=0)
+def test_phased_download_s3_pdf_skips_publisher_fallback(
+    mock_batch: MagicMock,
+    mock_fallback: MagicMock,
+) -> None:
+    from auto_lit_search.collect import DownloadRecord, UCSCEmailOnlyProvider
+
+    meta = MagicMock()
+    meta.pmcid = "PMC123"
+    meta.version = 1
+    meta.text_https_url = None
+    meta.xml_https_url = None
+    meta.pdf_https_url = "https://example.com/paper.pdf"
+
+    with tempfile.TemporaryDirectory() as tmp:
+        os.environ["DATA_ROOT"] = tmp
+        os.environ["COLLECT_S3_WORKERS"] = "1"
+        os.environ["COLLECT_FALLBACK_WORKERS"] = "1"
+        provider = UCSCEmailOnlyProvider(collector_email="test@ucsc.edu")
+        pdf_bytes = b"%PDF-1.4 minimal"
+        with (
+            patch(
+                "auto_lit_search.pmc_oa_s3.fetch_pmc_oa_metadata",
+                return_value=meta,
+            ),
+            patch(
+                "auto_lit_search.pmc_oa_s3.download_pmc_oa_fulltext",
+                return_value=("short", "txt"),
+            ),
+            patch(
+                "auto_lit_search.pmc_oa_s3.download_pmc_oa_pdf",
+                return_value=pdf_bytes,
+            ),
+        ):
+            recs = _download_papers_phased(
+                [("10.1/low", "query")],
+                tmp,
+                MagicMock(),
+                {"10.1/low": "PMC123"},
+                provider,
+                no_cache=False,
+                force_pdfs=True,
+                prefer_pdf_text=True,
+                delete_pdf_after_text=False,
+                disable_semantic_scholar=True,
+                collector_email="test@ucsc.edu",
+                max_workers=1,
+            )
+        assert len(recs) == 1
+        mock_fallback.assert_not_called()
+        assert recs[0].pdf_path is not None
+        assert recs[0].text_path is None
+        assert (recs[0].details or {}).get("pdf_docling_required") is True
+
+
+def test_collect_s3_record_cached_text_clears_pdf_path() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        pdf_dir = os.path.join(tmp, "pdf")
+        os.makedirs(pdf_dir)
+        stem = "10.1_hit__target"
+        text_path = os.path.join(tmp, f"{stem}.txt")
+        with open(text_path, "w", encoding="utf-8") as tf:
+            tf.write("cached text from prior run")
+        pdf_path = os.path.join(pdf_dir, f"{stem}__unpaywall.pdf")
+        with open(pdf_path, "wb") as pf:
+            pf.write(b"%PDF-1.4 minimal")
+
+        ctx = CollectionContext(
+            session=MagicMock(),
+            pmcid_cache={"10.1/hit": "PMC123"},
+            pdf_dir=pdf_dir,
+            text_dir=tmp,
+            xml_dir=os.path.join(tmp, "text_xml"),
+            throttle=CollectThrottle(),
+        )
+        rec = _collect_s3_record("10.1/hit", "target", ctx)
+        assert rec is not None
+        assert rec.text_path == text_path
+        assert rec.pdf_path is None
+        assert (rec.details or {}).get("pdf_docling_required") is False
