@@ -21,7 +21,15 @@ if str(_REPO_SRC) not in sys.path:
     sys.path.insert(0, str(_REPO_SRC))
 
 from auto_lit_search.download_manifest import _load_idmap  # noqa: E402
+from auto_lit_search.env_config import (  # noqa: E402
+    default_host_rubric_path,
+    default_microbe_rubric_path,
+)
 from auto_lit_search.paper_io import gene_terms  # noqa: E402
+from auto_lit_search.rubric_scoring import rubric_criteria  # noqa: E402
+
+_DEFAULT_HOST_RUBRIC = default_host_rubric_path()
+_DEFAULT_MICROBE_RUBRIC = default_microbe_rubric_path()
 
 BLIND_CSV_FIELDS = [
     "sample_id",
@@ -53,7 +61,7 @@ BLIND_CSV_BASE_FIELDS = [
     "gene_focus_search_terms",
     "query_search_terms",
     "target_search_terms",
-    "applicable_axes",
+    "applicable_criteria",
 ]
 
 IDENTIFIER_FIELDS = [
@@ -86,6 +94,10 @@ class PaperRecord:
     rubric_dimension_scores: Dict[str, float]
     rubric_axis_rationales: Dict[str, str]
     rubric_tags: Dict[str, str]
+    criterion_scores: Dict[str, Dict[str, Any]]
+    axis_totals: Dict[str, Any]
+    paper_grade: str
+    primary_grade: str
     rationale: str
     grading_meta: Dict[str, Any] = field(default_factory=dict)
     text_path: str = ""
@@ -98,9 +110,10 @@ class PaperRecord:
 
 
 @dataclass
-class RubricAxis:
+class RubricCriterion:
+    criterion_id: str
     axis_id: str
-    label: str
+    weight: str
     paper_roles: Tuple[str, ...]
 
 
@@ -110,67 +123,84 @@ class RubricSpec:
     microbe_path: Path
     host_version: str
     microbe_version: str
-    axes: Tuple[RubricAxis, ...]
+    host_rubric: Dict[str, Any]
+    microbe_rubric: Dict[str, Any]
+    criteria: Tuple[RubricCriterion, ...]
 
-    def axes_for_role(self, paper_role: str) -> Tuple[str, ...]:
+    def rubric_for_role(self, paper_role: str) -> Dict[str, Any]:
+        role = (paper_role or "").strip().lower()
+        if role in ("query", "microbe"):
+            return self.microbe_rubric
+        return self.host_rubric
+
+    def criteria_for_role(self, paper_role: str) -> Tuple[str, ...]:
         role = (paper_role or "").strip().lower()
         if role in ("query", "microbe"):
             return tuple(
-                a.axis_id
-                for a in self.axes
-                if "query" in a.paper_roles or "microbe" in a.paper_roles
+                c.criterion_id
+                for c in self.criteria
+                if "query" in c.paper_roles or "microbe" in c.paper_roles
             )
         return tuple(
-            a.axis_id
-            for a in self.axes
-            if "target" in a.paper_roles or "host" in a.paper_roles
+            c.criterion_id
+            for c in self.criteria
+            if "target" in c.paper_roles or "host" in c.paper_roles
         )
 
 
-def _load_rubric_axes(path: Path, paper_roles: Tuple[str, ...]) -> Tuple[str, Tuple[RubricAxis, ...]]:
+def _load_rubric_criteria(
+    path: Path, paper_roles: Tuple[str, ...]
+) -> Tuple[str, Dict[str, Any], Tuple[RubricCriterion, ...]]:
     data = json.loads(path.read_text(encoding="utf-8"))
     version = str(data.get("rubric_version") or "")
-    axes = tuple(
-        RubricAxis(
-            axis_id=str(axis.get("id") or ""),
-            label=str(axis.get("label") or axis.get("id") or ""),
+    scored, _ = rubric_criteria(data)
+    criteria = tuple(
+        RubricCriterion(
+            criterion_id=crit.id,
+            axis_id=crit.axis_id,
+            weight=crit.weight,
             paper_roles=paper_roles,
         )
-        for axis in (data.get("axes") or [])
-        if isinstance(axis, dict) and axis.get("id")
+        for crit in scored
     )
-    return version, axes
+    return version, data, criteria
 
 
 def load_rubric_spec(host_rubric: Path, microbe_rubric: Path) -> RubricSpec:
-    host_version, host_axes = _load_rubric_axes(host_rubric, ("target", "host"))
-    microbe_version, microbe_axes = _load_rubric_axes(microbe_rubric, ("query", "microbe"))
+    host_version, host_data, host_criteria = _load_rubric_criteria(
+        host_rubric, ("target", "host")
+    )
+    microbe_version, microbe_data, microbe_criteria = _load_rubric_criteria(
+        microbe_rubric, ("query", "microbe")
+    )
     seen: set[str] = set()
-    merged: List[RubricAxis] = []
-    for axis in host_axes + microbe_axes:
-        if axis.axis_id in seen:
+    merged: List[RubricCriterion] = []
+    for crit in host_criteria + microbe_criteria:
+        if crit.criterion_id in seen:
             continue
-        seen.add(axis.axis_id)
-        merged.append(axis)
+        seen.add(crit.criterion_id)
+        merged.append(crit)
     return RubricSpec(
         host_path=host_rubric,
         microbe_path=microbe_rubric,
         host_version=host_version,
         microbe_version=microbe_version,
-        axes=tuple(merged),
+        host_rubric=host_data,
+        microbe_rubric=microbe_data,
+        criteria=tuple(merged),
     )
 
 
 def blind_csv_fieldnames(
-    per_axis: bool,
+    per_criterion: bool,
     rubric_spec: Optional[RubricSpec],
     *,
     include_identifiers: bool,
 ) -> List[str]:
-    if per_axis and rubric_spec is not None:
+    if per_criterion and rubric_spec is not None:
         fields = list(BLIND_CSV_BASE_FIELDS)
-        for axis in rubric_spec.axes:
-            fields.append(f"human_{axis.axis_id}")
+        for crit in rubric_spec.criteria:
+            fields.append(f"human_{crit.criterion_id}")
         fields.append("human_notes")
         return fields
     fields = list(BLIND_CSV_FIELDS)
@@ -365,6 +395,14 @@ def load_candidate_pool(
                         str(k): str(v)
                         for k, v in (row.get("rubric_tags") or {}).items()
                     },
+                    criterion_scores={
+                        str(k): dict(v)
+                        for k, v in (row.get("criterion_scores") or {}).items()
+                        if isinstance(v, dict)
+                    },
+                    axis_totals=dict(row.get("axis_totals") or {}),
+                    paper_grade=str(row.get("paper_grade") or ""),
+                    primary_grade=str(row.get("primary_grade") or ""),
                     rationale=str(row.get("rationale") or ""),
                     grading_meta=dict(meta),
                 )
@@ -566,7 +604,7 @@ def write_outputs(
     seed: int,
     stats: Dict[str, Any],
     *,
-    per_axis: bool = False,
+    per_criterion: bool = False,
     rubric_spec: Optional[RubricSpec] = None,
     include_identifiers: bool = False,
 ) -> None:
@@ -578,15 +616,15 @@ def write_outputs(
     answer_key: Dict[str, Any] = {}
     blind_rows: List[Dict[str, str]] = []
     fieldnames = blind_csv_fieldnames(
-        per_axis,
+        per_criterion,
         rubric_spec,
         include_identifiers=include_identifiers,
     )
 
     for i, rec in enumerate(ordered, start=1):
         sample_id = f"audit_{i:03d}"
-        if per_axis and rubric_spec is not None:
-            applicable = rubric_spec.axes_for_role(rec.paper_role)
+        if per_criterion and rubric_spec is not None:
+            applicable = rubric_spec.criteria_for_role(rec.paper_role)
             row: Dict[str, str] = {
                 "sample_id": sample_id,
                 "doi": rec.doi,
@@ -597,11 +635,11 @@ def write_outputs(
                 "target_gene_id": rec.target_gene_id,
                 "file_name": rec.file_name,
                 **_identifier_row_fields(rec),
-                "applicable_axes": ";".join(applicable),
+                "applicable_criteria": ";".join(applicable),
                 "human_notes": "",
             }
-            for axis in rubric_spec.axes:
-                row[f"human_{axis.axis_id}"] = ""
+            for crit in rubric_spec.criteria:
+                row[f"human_{crit.criterion_id}"] = ""
             blind_rows.append(row)
         else:
             row = {
@@ -640,6 +678,10 @@ def write_outputs(
             "rubric_dimension_scores": rec.rubric_dimension_scores,
             "rubric_axis_rationales": rec.rubric_axis_rationales,
             "rubric_tags": rec.rubric_tags,
+            "criterion_scores": rec.criterion_scores,
+            "axis_totals": rec.axis_totals,
+            "paper_grade": rec.paper_grade,
+            "primary_grade": rec.primary_grade,
             "rationale": rec.rationale,
             "graded_at": rec.grading_meta.get("graded_at"),
             "grader_model": rec.grading_meta.get("grader_model"),
@@ -647,9 +689,9 @@ def write_outputs(
             "host_rubric_path": rec.grading_meta.get("host_rubric_path"),
             "microbe_rubric_path": rec.grading_meta.get("microbe_rubric_path"),
         }
-        if per_axis and rubric_spec is not None:
-            answer_key[sample_id]["applicable_axes"] = list(
-                rubric_spec.axes_for_role(rec.paper_role)
+        if per_criterion and rubric_spec is not None:
+            answer_key[sample_id]["applicable_criteria"] = list(
+                rubric_spec.criteria_for_role(rec.paper_role)
             )
             answer_key[sample_id]["rubric_spec"] = {
                 "host_rubric_path": str(rubric_spec.host_path),
@@ -670,22 +712,26 @@ def write_outputs(
         encoding="utf-8",
     )
 
-    if per_axis and rubric_spec is not None:
+    if per_criterion and rubric_spec is not None:
         guide_lines = [
-            "Per-axis human scoring sheet",
-            "Fill human_<axis_id> with a score from 0.0 to 1.0 for each applicable axis.",
-            "Leave blank for axes not listed in applicable_axes for that row.",
+            "Per-criterion human scoring sheet",
+            "Fill human_<criterion_id> with 0, 1, or 2 for each applicable criterion.",
+            "Leave blank for criteria not listed in applicable_criteria for that row.",
+            "Flag criteria (mimicry_potential_flag, novelty_flag) are not scored here.",
             "Open text_path and search for gene_focus_search_terms while grading.",
-            "See rubric_axis_guide.txt and rubric validation markdown guides.",
+            "Run score_human_grading_sheet.py on the filled CSV to compute paper_grade",
+            "and axis totals with the same math as the LLM grader.",
             "",
             f"host_rubric={rubric_spec.host_path} (v{rubric_spec.host_version})",
             f"microbe_rubric={rubric_spec.microbe_path} (v{rubric_spec.microbe_version})",
             "",
         ]
-        for axis in rubric_spec.axes:
-            roles = ", ".join(axis.paper_roles)
-            guide_lines.append(f"{axis.axis_id}\troles={roles}\t{axis.label}")
-        (out_dir / "rubric_axis_guide.txt").write_text(
+        for crit in rubric_spec.criteria:
+            roles = ", ".join(crit.paper_roles)
+            guide_lines.append(
+                f"{crit.criterion_id}\troles={roles}\taxis={crit.axis_id}\tweight={crit.weight}"
+            )
+        (out_dir / "rubric_criterion_guide.txt").write_text(
             "\n".join(guide_lines) + "\n",
             encoding="utf-8",
         )
@@ -722,8 +768,8 @@ def write_outputs(
     print(f"Wrote {blind_path}")
     print(f"Wrote {key_path}")
     print(f"Wrote {out_dir / 'sampling_report.txt'}")
-    if per_axis and rubric_spec is not None:
-        print(f"Wrote {out_dir / 'rubric_axis_guide.txt'}")
+    if per_criterion and rubric_spec is not None:
+        print(f"Wrote {out_dir / 'rubric_criterion_guide.txt'}")
 
 
 def main() -> int:
@@ -751,9 +797,14 @@ def main() -> int:
     p.add_argument("--irrelevant-min", type=float, default=0.10)
     p.add_argument("--irrelevant-max", type=float, default=0.30)
     p.add_argument(
+        "--per-criterion",
+        action="store_true",
+        help="Blind CSV with human_<criterion_id> columns (0-2 integers; requires rubric paths)",
+    )
+    p.add_argument(
         "--per-axis",
         action="store_true",
-        help="Blind CSV with one human_<axis_id> column per rubric axis (requires rubric paths)",
+        help=argparse.SUPPRESS,
     )
     p.add_argument(
         "--host-rubric",
@@ -785,15 +836,15 @@ def main() -> int:
         print(f"Not a directory: {args.output_root}", file=sys.stderr)
         return 2
 
+    per_criterion = args.per_criterion or args.per_axis
     rubric_spec: Optional[RubricSpec] = None
-    if args.per_axis:
-        if args.host_rubric is None or args.microbe_rubric is None:
-            print("--per-axis requires --host-rubric and --microbe-rubric", file=sys.stderr)
-            return 2
-        if not args.host_rubric.is_file() or not args.microbe_rubric.is_file():
+    if per_criterion:
+        host_rubric = args.host_rubric or _DEFAULT_HOST_RUBRIC
+        microbe_rubric = args.microbe_rubric or _DEFAULT_MICROBE_RUBRIC
+        if not host_rubric.is_file() or not microbe_rubric.is_file():
             print("Rubric JSON path not found", file=sys.stderr)
             return 2
-        rubric_spec = load_rubric_spec(args.host_rubric, args.microbe_rubric)
+        rubric_spec = load_rubric_spec(host_rubric, microbe_rubric)
 
     idmap: Dict[str, Dict[str, Any]] = {}
     if args.idmap_csv:
@@ -831,7 +882,7 @@ def main() -> int:
         out_dir,
         args.seed,
         stats,
-        per_axis=args.per_axis,
+        per_criterion=per_criterion,
         rubric_spec=rubric_spec,
         include_identifiers=bool(idmap),
     )
