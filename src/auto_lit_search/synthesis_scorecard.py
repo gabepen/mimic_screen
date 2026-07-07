@@ -260,9 +260,56 @@ def _parse_score_line(text: str, key: str) -> Optional[int]:
         return None
 
 
+def _extract_json_block_balanced(text: str) -> Optional[Dict[str, Any]]:
+    """Extract first balanced {...} object after Quick results summary header."""
+    lower = text.lower()
+    marker = "quick results summary:"
+    idx = lower.find(marker)
+    if idx < 0:
+        return None
+    chunk = text[idx + len(marker) :]
+    chunk = re.sub(r"^[\s`]*(?:json)?[\s`]*", "", chunk, count=1, flags=re.IGNORECASE)
+    start = chunk.find("{")
+    if start < 0:
+        return None
+    depth = 0
+    in_string = False
+    escape = False
+    end = -1
+    for i in range(start, len(chunk)):
+        ch = chunk[i]
+        if in_string:
+            if escape:
+                escape = False
+            elif ch == "\\":
+                escape = True
+            elif ch == '"':
+                in_string = False
+            continue
+        if ch == '"':
+            in_string = True
+            continue
+        if ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0:
+                end = i + 1
+                break
+    if end <= start:
+        return None
+    raw = chunk[start:end]
+    try:
+        obj = json.loads(raw)
+        return obj if isinstance(obj, dict) else None
+    except json.JSONDecodeError:
+        return None
+
+
 def _extract_json_block(text: str) -> Optional[Dict[str, Any]]:
     for pattern in (
         r"```json\s*(\{.*?\})\s*```",
+        r"Quick results summary:\s*```json\s*(\{.*?\})\s*```",
         r"Quick results summary:\s*(\{.*\})\s*(?:\n|$)",
     ):
         m = re.search(pattern, text, re.DOTALL | re.IGNORECASE)
@@ -274,7 +321,7 @@ def _extract_json_block(text: str) -> Optional[Dict[str, Any]]:
                 return obj
         except json.JSONDecodeError:
             continue
-    return None
+    return _extract_json_block_balanced(text)
 
 
 def parse_llm_scorecard(synthesis_text: str) -> Dict[str, Any]:
@@ -420,16 +467,43 @@ def _auto_headline(host: int, query: int, mimicry: int, pair: int) -> str:
     )
 
 
-def synthesis_output_well_formed(synthesis_text: str) -> bool:
+def synthesis_output_diagnosis(synthesis_text: str) -> str:
     text = (synthesis_text or "").strip()
-    if not text or "Quick results summary:" not in text:
-        return False
+    if not text:
+        return "empty_output"
+    if "Quick results summary:" not in text:
+        return "missing_quick_results_header"
     llm = parse_llm_scorecard(synthesis_text)
-    return (
-        llm.get("host_exploitation_score") is not None
-        and llm.get("query_effector_score") is not None
-        and bool(str(llm.get("headline") or "").strip())
-    )
+    if llm.get("host_exploitation_score") is None:
+        return "missing_host_exploitation_score"
+    if llm.get("query_effector_score") is None:
+        return "missing_query_effector_score"
+    if not str(llm.get("headline") or "").strip():
+        return "missing_headline"
+    return "ok"
+
+
+def synthesis_output_well_formed(synthesis_text: str) -> bool:
+    return synthesis_output_diagnosis(synthesis_text) == "ok"
+
+
+def merge_synthesis_repair(discussion: str, repair_text: str) -> str | None:
+    """Attach a repair-only JSON footer to a valid discussion when needed."""
+    disc = (discussion or "").strip()
+    repair = (repair_text or "").strip()
+    if not repair:
+        return None
+    if disc and "Quick results summary:" not in disc and "Quick results summary:" in repair:
+        merged = disc.rstrip() + "\n\n" + repair.lstrip()
+        if synthesis_output_well_formed(merged):
+            return merged
+    if synthesis_output_well_formed(repair):
+        return repair
+    if disc and "Quick results summary:" in repair:
+        merged = disc.rstrip() + "\n\n" + repair.lstrip()
+        if synthesis_output_well_formed(merged):
+            return merged
+    return None
 
 
 def quick_summary_prompt_footer() -> str:
@@ -460,6 +534,23 @@ def quick_summary_retry_suffix() -> str:
         "\n\nYour previous answer lacked a parseable Quick results summary JSON block. "
         "Reply with plain text discussion, then end with the exact header and JSON schema "
         "shown in the instructions.\n"
+    )
+
+
+def quick_summary_repair_prompt(prior_text: str) -> str:
+    """Ask the model to emit only a valid Quick results summary block."""
+    excerpt = (prior_text or "").strip()[:6000]
+    return (
+        "The following synthesis discussion may be valid but its Quick results summary "
+        "JSON block was missing or malformed.\n\n"
+        "Using ONLY the evidence implied in the discussion below, output NOTHING except:\n"
+        "1) The line: Quick results summary:\n"
+        "2) A fenced ```json block with exactly these keys:\n"
+        "headline, host_exploitation_score, query_effector_score, "
+        "mimicry_plausibility_score, pair_priority_score, best_host_paper, "
+        "best_query_paper, main_uncertainties\n\n"
+        "Prior discussion:\n"
+        f"{excerpt}\n"
     )
 
 

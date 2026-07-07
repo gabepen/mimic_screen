@@ -16,9 +16,15 @@ from auto_lit_search.analysis_packet import (
 )
 from auto_lit_search.env_config import env_positive_float, env_positive_int
 from auto_lit_search.paper_io import (
+    MAX_PAPER_CHARS,
     ensure_dir,
     identification_terms_block,
     read_text,
+)
+from auto_lit_search.mention_excerpt import (
+    MentionExcerptResult,
+    build_synthesis_mention_excerpt,
+    format_excerpt_block,
 )
 from auto_lit_search.rubric_scoring import (
     resolve_axis_rationales,
@@ -27,8 +33,11 @@ from auto_lit_search.rubric_scoring import (
 from auto_lit_search.synthesis_scorecard import (
     build_conclusion,
     format_fallback_discussion,
+    merge_synthesis_repair,
     quick_summary_prompt_footer,
+    quick_summary_repair_prompt,
     quick_summary_retry_suffix,
+    synthesis_output_diagnosis,
     synthesis_output_well_formed,
 )
 
@@ -167,16 +176,177 @@ def _paper_metadata_lines(
 def _excerpt_block(
     gp: Any,
     papers_dir: str,
+    *,
+    query_id: str,
+    target_id: str,
+    gene_context: Optional[Dict[str, Any]],
     excerpt_chars: int,
-) -> str:
+    mention_cluster_gap: int,
+    min_mention_chars: int,
+    max_mention_chars: int,
+    max_sites: int,
+    no_mention_fallback_chars: int,
+) -> MentionExcerptResult:
     path = os.path.join(papers_dir, gp.file_name)
     if not os.path.isfile(path):
-        return f"[excerpt missing: {gp.file_name}]"
-    text = read_text(path, max_chars=excerpt_chars)
-    return (
-        f"\n--- Excerpt: {gp.file_name} (role={gp.paper_role or 'unknown'}) ---\n"
-        f"{text}\n--- end excerpt ---\n"
+        return MentionExcerptResult(
+            excerpt=f"[excerpt missing: {gp.file_name}]",
+            focus_gene="",
+            matched_canonical_ids=[],
+            matched_terms=[],
+            n_mentions=0,
+            budget_per_mention=0,
+            excerpt_mode="missing_file",
+            expected_gene_id="",
+        )
+    text = read_text(path, max_chars=MAX_PAPER_CHARS)
+    return build_synthesis_mention_excerpt(
+        text,
+        gp,
+        query_id=query_id,
+        target_id=target_id,
+        gene_context=gene_context,
+        max_chars=excerpt_chars,
+        mention_cluster_gap=mention_cluster_gap,
+        min_mention_chars=min_mention_chars,
+        max_mention_chars=max_mention_chars,
+        max_sites=max_sites,
+        no_mention_fallback_chars=no_mention_fallback_chars,
     )
+
+
+def _estimate_prompt_tokens(text: str) -> int:
+    # Conservative vs Qwen tokenizer (~3–4 chars/token on mixed JSON/text).
+    return max(1, len(text) // 3)
+
+
+def _build_excerpt_sections(
+    papers: List[Any],
+    papers_dir: str,
+    *,
+    query_id: str,
+    target_id: str,
+    gene_context: Optional[Dict[str, Any]],
+    per_paper_chars: int,
+    total_chars: int,
+    mention_cluster_gap: int,
+    min_mention_chars: int,
+    max_mention_chars: int,
+    max_sites: int,
+    no_mention_fallback_chars: int,
+) -> Tuple[str, List[Dict[str, Any]], Dict[str, Any]]:
+    """Build mention-centered excerpts; trim lowest-ranked papers to total_chars budget."""
+    if not papers or not os.path.isdir(papers_dir):
+        return "", [], {"papers": 0, "total_chars": 0, "trimmed_papers": 0, "no_hit": 0}
+
+    pool = list(papers)
+    trimmed_papers = 0
+    per_paper_meta: List[Dict[str, Any]] = []
+    blocks: List[str] = []
+
+    while pool:
+        blocks = []
+        per_paper_meta = []
+        total = 0
+        no_hit = 0
+        for gp in pool:
+            result = _excerpt_block(
+                gp,
+                papers_dir,
+                query_id=query_id,
+                target_id=target_id,
+                gene_context=gene_context,
+                excerpt_chars=per_paper_chars,
+                mention_cluster_gap=mention_cluster_gap,
+                min_mention_chars=min_mention_chars,
+                max_mention_chars=max_mention_chars,
+                max_sites=max_sites,
+                no_mention_fallback_chars=no_mention_fallback_chars,
+            )
+            block = format_excerpt_block(gp, result)
+            blocks.append(block)
+            total += len(block)
+            if result.excerpt_mode == "no_mentions":
+                no_hit += 1
+            per_paper_meta.append(
+                {
+                    "file_name": gp.file_name,
+                    "paper_role": gp.paper_role or "unknown",
+                    "excerpt_mode": result.excerpt_mode,
+                    "n_mentions": result.n_mentions,
+                    "matched_terms": result.matched_terms[:20],
+                    "focus_gene": result.focus_gene,
+                    "excerpt_chars": len(result.excerpt),
+                }
+            )
+        if total <= total_chars or len(pool) <= 1:
+            break
+        pool.pop()
+        trimmed_papers += 1
+
+    stats = {
+        "papers": len(pool),
+        "total_chars": 0,
+        "trimmed_papers": trimmed_papers,
+        "no_hit": no_hit,
+        "per_paper": per_paper_meta,
+    }
+    if not blocks:
+        return "", per_paper_meta, stats
+
+    sections = (
+        "\nTop-paper text excerpts (verify grader claims; pair-level bridge):\n"
+        + "".join(blocks)
+    )
+    stats["total_chars"] = len(sections)
+    return sections, per_paper_meta, stats
+
+
+def _fit_synth_prompt_to_budget(
+    synth_prompt: str,
+    excerpt_sections: str,
+    *,
+    max_input_tokens: int,
+) -> tuple[str, str]:
+    """Trim excerpt blocks (then tail) until prompt fits vLLM context."""
+    notes = ""
+    if _estimate_prompt_tokens(synth_prompt) <= max_input_tokens:
+        return synth_prompt, notes
+
+    marker = "\nTop-paper text excerpts (verify grader claims; pair-level bridge):\n"
+    prefix = synth_prompt
+    if excerpt_sections and synth_prompt.endswith(excerpt_sections):
+        prefix = synth_prompt[: -len(excerpt_sections)]
+    elif excerpt_sections and excerpt_sections in synth_prompt:
+        prefix = synth_prompt.split(excerpt_sections, 1)[0]
+
+    body = excerpt_sections[len(marker) :] if excerpt_sections.startswith(marker) else ""
+    blocks: List[str] = []
+    for part in body.split("\n--- end excerpt ---\n"):
+        part = part.strip()
+        if not part:
+            continue
+        if not part.startswith("--- Excerpt:"):
+            part = f"--- Excerpt:{part}"
+        blocks.append(f"\n{part}\n--- end excerpt ---\n")
+
+    kept: List[str] = []
+    for i in range(len(blocks)):
+        trial = prefix + marker + "".join(blocks[: i + 1])
+        if _estimate_prompt_tokens(trial) > max_input_tokens:
+            break
+        kept = blocks[: i + 1]
+    dropped = len(blocks) - len(kept)
+    if dropped:
+        notes = f"trimmed {dropped} paper excerpt(s) for context budget"
+    prompt = prefix + (marker + "".join(kept) if kept else "")
+
+    if _estimate_prompt_tokens(prompt) > max_input_tokens:
+        over = _estimate_prompt_tokens(prompt) - max_input_tokens
+        prompt = prompt[: max(1000, len(prompt) - over * 3)]
+        extra = "truncated synthesis prompt tail for context budget"
+        notes = f"{notes}; {extra}" if notes else extra
+    return prompt, notes
 
 
 def _dedupe_keep_order(items: List[str]) -> List[str]:
@@ -212,11 +382,12 @@ def _synthesis_pair_context_block() -> str:
         "Pair context (apply to all synthesis steps):\n"
         "- This query–target pair was selected for structural similarity; do not expect "
         "papers to report explicit mimicry or direct query–target interaction.\n"
-        "- Semi-positive conclusions are appropriate when the target shows virulence, host "
-        "manipulation, or Legionella exploitation-pathway relevance (host Axis 2), and/or "
-        "the query shows effector / secretion / host-targeting evidence—even if genes are "
-        "never named together.\n"
-        "- Separate literature support for manipulation potential from proof of mimicry.\n\n"
+        "- Semi-positive conclusions are appropriate when the target shows strong "
+        "host-side rubric support (e.g. infection/symbiosis/interaction-relevant axes) "
+        "and/or the query shows effector, secretion, persistence, or host-targeting "
+        "evidence—even if genes are never named together.\n"
+        "- Separate literature support for manipulation or symbiont-relevant potential "
+        "from proof of mimicry.\n\n"
     )
 
 
@@ -432,6 +603,144 @@ def _run_role_batch_chain(
     return running_summary, memory_points, all_paper_summaries, batch_outputs
 
 
+def _synthesis_repair_enabled() -> bool:
+    val = os.environ.get("SYNTHESIS_ENABLE_REPAIR_PASS", "1").strip().lower()
+    return val in ("1", "true", "yes")
+
+
+def _record_synthesis_attempt(
+    raw_attempts: List[Dict[str, Any]],
+    *,
+    stage: str,
+    text: str,
+) -> None:
+    raw_attempts.append(
+        {
+            "stage": stage,
+            "text_len": len(text or ""),
+            "well_formed": synthesis_output_well_formed(text),
+            "diagnosis": synthesis_output_diagnosis(text),
+            "text": text or "",
+        }
+    )
+
+
+def _write_synthesis_raw_failure_debug(
+    output_root: str,
+    alignment_id: str,
+    raw_attempts: List[Dict[str, Any]],
+    notes: str,
+) -> Optional[str]:
+    if not raw_attempts:
+        return None
+    log_dir = os.path.join(output_root, "logs")
+    ensure_dir(log_dir)
+    debug_path = os.path.join(log_dir, f"{alignment_id}_synthesis_raw_failed.json")
+    payload = {
+        "alignment_id": alignment_id,
+        "notes": notes,
+        "attempts": raw_attempts,
+    }
+    with open(debug_path, "w", encoding="utf-8") as f:
+        json.dump(payload, f, indent=2, ensure_ascii=False)
+    txt_path = os.path.join(log_dir, f"{alignment_id}_synthesis_raw_failed.txt")
+    with open(txt_path, "w", encoding="utf-8") as f:
+        for attempt in raw_attempts:
+            f.write(f"=== {attempt['stage']} "
+                    f"(well_formed={attempt['well_formed']} "
+                    f"diagnosis={attempt['diagnosis']} "
+                    f"len={attempt['text_len']}) ===\n")
+            f.write(attempt.get("text") or "")
+            f.write("\n\n")
+    return debug_path
+
+
+def _run_final_synthesis_llm(
+    *,
+    synth_prompt: str,
+    llm_base_url: str,
+    call_llm: Any,
+    final_call_max_tokens: int,
+    temperature: float,
+    alignment_id: str,
+) -> Tuple[str, str, List[Dict[str, Any]], bool]:
+    """Run synthesis final LLM with retries + optional repair pass."""
+    synthesis_retry_suffix = quick_summary_retry_suffix()
+    max_attempts = env_positive_int("SYNTHESIS_MAX_ATTEMPTS", 3)
+    synthesis_text = ""
+    notes = ""
+    raw_attempts: List[Dict[str, Any]] = []
+    synth_ok = False
+
+    for attempt in range(max_attempts):
+        extra = ""
+        if attempt:
+            bad = synthesis_text.strip()[:2500]
+            extra = synthesis_retry_suffix
+            if bad:
+                extra += f"\n\nEarlier attempt (invalid or incomplete):\n{bad}\n"
+        try:
+            synthesis_text = call_llm(
+                synth_prompt + extra,
+                llm_base_url,
+                final_call_max_tokens,
+                temperature,
+            )
+        except Exception as e:
+            notes = str(e)
+            logger.warning("Synthesis LLM failed for {}: {}", alignment_id, e)
+            break
+        _record_synthesis_attempt(
+            raw_attempts,
+            stage=f"attempt_{attempt}",
+            text=synthesis_text,
+        )
+        if synthesis_text.strip() and synthesis_output_well_formed(synthesis_text):
+            synth_ok = True
+            break
+
+    discussion_before_repair = synthesis_text.strip()
+    repair_attempted = False
+    if not synth_ok and _synthesis_repair_enabled() and discussion_before_repair and not notes:
+        repair_attempted = True
+        try:
+            repair_text = call_llm(
+                quick_summary_repair_prompt(discussion_before_repair),
+                llm_base_url,
+                final_call_max_tokens,
+                temperature,
+            )
+            _record_synthesis_attempt(
+                raw_attempts,
+                stage="repair",
+                text=repair_text,
+            )
+            merged = merge_synthesis_repair(discussion_before_repair, repair_text)
+            if merged and synthesis_output_well_formed(merged):
+                synthesis_text = merged
+                synth_ok = True
+            elif repair_text.strip():
+                logger.warning(
+                    "Synthesis repair pass still ill-formed for {}",
+                    alignment_id,
+                )
+        except Exception as e:
+            notes = str(e)
+            logger.warning(
+                "Synthesis repair pass failed for {}: {}",
+                alignment_id,
+                e,
+            )
+
+    if not synth_ok and synthesis_text.strip() and not notes:
+        logger.warning(
+            "Synthesis output ill-formed for {}; using fallback",
+            alignment_id,
+        )
+
+    return synthesis_text, notes, raw_attempts, synth_ok
+
+
 def run_alignment_graded(
     req: RunAlignmentGradedRequest,
     *,
@@ -458,9 +767,18 @@ def run_alignment_graded(
     min_axis_score = env_positive_float("SYNTHESIS_MIN_AXIS_SCORE", 0.25)
     top_k_host = env_positive_int("SYNTHESIS_TOP_K_HOST", 40)
     top_k_query = env_positive_int("SYNTHESIS_TOP_K_QUERY", 40)
-    excerpt_k_host = env_positive_int("SYNTHESIS_EXCERPT_TOP_K_HOST", top_k_host)
-    excerpt_k_query = env_positive_int("SYNTHESIS_EXCERPT_TOP_K_QUERY", top_k_query)
-    excerpt_chars = env_positive_int("SYNTHESIS_EXCERPT_CHARS", 12000)
+    excerpt_k_host = env_positive_int("SYNTHESIS_EXCERPT_TOP_K_HOST", 20)
+    excerpt_k_query = env_positive_int("SYNTHESIS_EXCERPT_TOP_K_QUERY", 10)
+    mention_per_paper_chars = env_positive_int("SYNTHESIS_MENTION_EXCERPT_MAX_CHARS", 3000)
+    mention_total_chars = env_positive_int("SYNTHESIS_MENTION_TOTAL_CHARS", 70000)
+    mention_cluster_gap = env_positive_int("SYNTHESIS_MENTION_CLUSTER_GAP", 50)
+    mention_min_site_chars = env_positive_int("SYNTHESIS_MENTION_MIN_SITE_CHARS", 400)
+    mention_max_site_chars = env_positive_int("SYNTHESIS_MENTION_MAX_SITE_CHARS", 8000)
+    mention_max_sites = env_positive_int("SYNTHESIS_MENTION_MAX_SITES", 4)
+    mention_no_hit_fallback = env_positive_int("SYNTHESIS_MENTION_NO_HIT_FALLBACK_CHARS", 1500)
+    max_context_tokens = env_positive_int("SYNTHESIS_MAX_CONTEXT_TOKENS", 131072)
+    context_margin = env_positive_int("SYNTHESIS_CONTEXT_MARGIN", 4096)
+    final_max_tokens = env_positive_int("SYNTHESIS_FINAL_MAX_TOKENS", 8192)
     prior_summary_max_chars = env_positive_int("SYNTHESIS_PRIOR_SUMMARY_MAX_CHARS", 2500)
     filtered_rule = (
         f"relevance_grade > 0.0 OR max(axis_score) >= {min_axis_score}"
@@ -530,15 +848,20 @@ def run_alignment_graded(
     all_paper_summaries = host_paper_summaries + query_paper_summaries
     important_points_memory = _dedupe_keep_order(host_memory + query_memory)[-200:]
 
-    excerpt_sections = ""
-    if excerpt_pool and os.path.isdir(req.papers_dir):
-        parts = [
-            _excerpt_block(gp, req.papers_dir, excerpt_chars) for gp in excerpt_pool
-        ]
-        excerpt_sections = (
-            "\nTop-paper text excerpts (verify grader claims; pair-level bridge):\n"
-            + "".join(parts)
-        )
+    excerpt_sections, excerpt_paper_meta, excerpt_stats = _build_excerpt_sections(
+        excerpt_pool,
+        req.papers_dir,
+        query_id=req.query,
+        target_id=req.target_id,
+        gene_context=req.gene_context,
+        per_paper_chars=mention_per_paper_chars,
+        total_chars=mention_total_chars,
+        mention_cluster_gap=mention_cluster_gap,
+        min_mention_chars=mention_min_site_chars,
+        max_mention_chars=mention_max_site_chars,
+        max_sites=mention_max_sites,
+        no_mention_fallback_chars=mention_no_hit_fallback,
+    )
 
     host_batch_count = len(host_batch_outputs)
     query_batch_count = len(query_batch_outputs)
@@ -566,51 +889,69 @@ def run_alignment_graded(
         f"Grading meta: {json.dumps(grading_meta, ensure_ascii=False)}\n"
         f"Synthesis filtering: kept={len(kept_for_synthesis)} filtered_out={len(filtered_out)} "
         f"batch_pool={len(batch_pool)} host_pool={len(host_pool)} query_pool={len(query_pool)} "
-        f"excerpt_pool={len(excerpt_pool)} top_k_host={top_k_host} top_k_query={top_k_query} "
-        f"rule={filtered_rule}\n"
+        f"excerpt_pool={len(excerpt_pool)} top_k_host={top_k_host} "
+        f"top_k_query={top_k_query} rule={filtered_rule}\n"
         f"Cross-track memory points:\n"
         f"{json.dumps(important_points_memory, ensure_ascii=False)}\n"
         + excerpt_sections
     )
+    max_input_tokens = max(
+        8192,
+        max_context_tokens - min(max_tokens, final_max_tokens) - context_margin,
+    )
+    synth_prompt, budget_notes = _fit_synth_prompt_to_budget(
+        synth_prompt,
+        excerpt_sections,
+        max_input_tokens=max_input_tokens,
+    )
+    if budget_notes:
+        logger.info(
+            "Synthesis prompt trimmed for {}: {}",
+            req.alignment_id,
+            budget_notes,
+        )
 
-    synthesis_retry_suffix = quick_summary_retry_suffix()
-
+    final_call_max_tokens = min(max_tokens, final_max_tokens)
     synthesis_text = ""
-    notes = ""
+    notes = budget_notes
+    raw_attempts: List[Dict[str, Any]] = []
+    synthesis_debug: Optional[Dict[str, Any]] = None
     if llm_base_url:
-        synth_ok = False
-        for attempt in range(2):
-            extra = ""
-            if attempt:
-                bad = synthesis_text.strip()[:2500]
-                extra = synthesis_retry_suffix
-                if bad:
-                    extra += f"\n\nEarlier attempt (invalid or incomplete):\n{bad}\n"
-            try:
-                synthesis_text = call_llm(
-                    synth_prompt + extra,
-                    llm_base_url,
-                    max_tokens,
-                    temperature,
-                )
-            except Exception as e:
-                notes = str(e)
-                logger.warning("Synthesis LLM failed for {}: {}", req.alignment_id, e)
-                break
-            if synthesis_text.strip() and synthesis_output_well_formed(synthesis_text):
-                synth_ok = True
-                break
-        if not synth_ok and synthesis_text.strip() and not notes:
-            logger.warning(
-                "Synthesis output ill-formed for {}; using fallback",
-                req.alignment_id,
-            )
+        synthesis_text, llm_notes, raw_attempts, _synth_ok = _run_final_synthesis_llm(
+            synth_prompt=synth_prompt,
+            llm_base_url=llm_base_url,
+            call_llm=call_llm,
+            final_call_max_tokens=final_call_max_tokens,
+            temperature=temperature,
+            alignment_id=req.alignment_id,
+        )
+        if llm_notes:
+            notes = llm_notes if not notes else f"{notes}; {llm_notes}"
 
     synth_needs_fallback = not synthesis_text.strip() or (
         bool(llm_base_url) and not notes and not synthesis_output_well_formed(synthesis_text)
     )
     synthesis_status = "ok"
     if synth_needs_fallback:
+        raw_debug_path = _write_synthesis_raw_failure_debug(
+            req.output_root,
+            req.alignment_id,
+            raw_attempts,
+            notes,
+        )
+        if raw_debug_path:
+            last_diagnosis = raw_attempts[-1]["diagnosis"] if raw_attempts else "unknown"
+            synthesis_debug = {
+                "raw_failed_path": raw_debug_path,
+                "attempt_count": len(raw_attempts),
+                "repair_attempted": any(a["stage"] == "repair" for a in raw_attempts),
+                "last_diagnosis": last_diagnosis,
+            }
+            logger.warning(
+                "Saved synthesis failure debug for {}: {}",
+                req.alignment_id,
+                raw_debug_path,
+            )
         if notes:
             notes = f"{notes}; synthesis fallback applied"
             synthesis_status = "error"
@@ -619,6 +960,8 @@ def run_alignment_graded(
             synthesis_status = "error"
         else:
             notes = "synthesis missing parseable Quick results JSON after retry"
+            if synthesis_debug and synthesis_debug.get("repair_attempted"):
+                notes += " (repair pass attempted)"
             synthesis_status = "error"
         conclusion = build_conclusion(
             batch_pool,
@@ -646,9 +989,15 @@ def run_alignment_graded(
                 f"n_kept={len(kept_for_synthesis)} n_filtered={len(filtered_out)} "
                 f"batch_pool={len(batch_pool)} host_pool={len(host_pool)} "
                 f"query_pool={len(query_pool)} excerpt_pool={len(excerpt_pool)} "
+                f"mention_excerpt_papers={excerpt_stats.get('papers', 0)} "
+                f"mention_excerpt_chars={excerpt_stats.get('total_chars', 0)} "
+                f"trimmed={excerpt_stats.get('trimmed_papers', 0)} "
+                f"no_hit={excerpt_stats.get('no_hit', 0)} "
                 f"rule={filtered_rule}\n"
             )
             f.write(f"synthesis_len={len(synthesis_text)} notes={notes}\n")
+            if synthesis_debug:
+                f.write(f"raw_debug_path={synthesis_debug.get('raw_failed_path')}\n")
 
     graded_path = os.path.join(req.output_root, f"{req.alignment_id}_graded.json")
     analysis_payload: Dict[str, Any] = {
@@ -671,6 +1020,14 @@ def run_alignment_graded(
             "host_pool_count": len(host_pool),
             "query_pool_count": len(query_pool),
             "excerpt_pool_count": len(excerpt_pool),
+            "excerpt_stats": excerpt_stats,
+            "excerpt_paper_meta": excerpt_paper_meta,
+            "mention_excerpt_config": {
+                "per_paper_chars": mention_per_paper_chars,
+                "total_chars": mention_total_chars,
+                "excerpt_k_host": excerpt_k_host,
+                "excerpt_k_query": excerpt_k_query,
+            },
             "top_k_host": top_k_host,
             "top_k_query": top_k_query,
             "batch_size": batch_size,
@@ -684,6 +1041,7 @@ def run_alignment_graded(
             "important_points_memory": important_points_memory,
             "filtered_out_papers": [gp.file_name for gp in filtered_out],
             "excerpt_papers": [gp.file_name for gp in excerpt_pool],
+            **({"debug": synthesis_debug} if synthesis_debug else {}),
         },
         "meta": {
             "finished_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
