@@ -14,6 +14,8 @@ import re
 import subprocess
 import sys
 import time
+import urllib.error
+import urllib.request
 from typing import Literal
 
 # Forwarded into the CPU/download job if set in the environment when launching.
@@ -35,6 +37,53 @@ def _publisher_env_from_os() -> dict[str, str]:
         if v:
             out[k] = v
     return out
+
+
+def _wait_healthz(
+    service: str,
+    host: str,
+    port: int,
+    *,
+    job_id: str | None = None,
+    timeout: int = 900,
+    interval: int = 5,
+) -> tuple[bool, str]:
+    """Poll /healthz until OK or timeout. Refresh host from Slurm job_id when provided."""
+    deadline = time.monotonic() + max(60, timeout)
+    current_host = (host or "").strip()
+    started = time.monotonic()
+    attempt = 0
+    while time.monotonic() < deadline:
+        attempt += 1
+        if job_id:
+            node = _try_get_node_name(job_id)
+            if node:
+                current_host = node
+        if not current_host:
+            time.sleep(interval)
+            continue
+        url = f"http://{current_host}:{port}/healthz"
+        try:
+            with urllib.request.urlopen(url, timeout=10) as resp:
+                if resp.status == 200:
+                    print(
+                        f"{service} health OK at {url} "
+                        f"(after {time.monotonic() - started:.0f}s, {attempt} tries)"
+                    )
+                    return True, current_host
+        except (urllib.error.URLError, TimeoutError, OSError) as e:
+            if attempt == 1 or attempt % 12 == 0:
+                print(
+                    f"Waiting for {service} at {url} "
+                    f"({time.monotonic() - started:.0f}s / {timeout}s): {e!r}",
+                    file=sys.stderr,
+                )
+        time.sleep(interval)
+    print(
+        f"Timed out waiting for {service} /healthz on {current_host}:{port} after {timeout}s",
+        file=sys.stderr,
+    )
+    return False, current_host
 
 
 def _sbatch(
@@ -391,6 +440,8 @@ def main() -> int:
             "GPU_API_PORT": str(gpu_port_i),
             "GPU_IMAGE": gpu_image,
             "REPO_ROOT": repo_root,
+            "HOST_RUBRIC_PATH": os.path.abspath(args.host_rubric_path),
+            "MICROBE_RUBRIC_PATH": os.path.abspath(args.microbe_rubric_path),
         }
         gpu_log = os.path.join(logs_root, f"auto_lit_gpu_{i}_%j.log")
         gpu_job_id = _sbatch(gpu_script, gpu_env, log_path=gpu_log)
@@ -461,7 +512,24 @@ def main() -> int:
                 file=sys.stderr,
             )
         else:
-            print(f"Docling node: {docling_host}")
+            print(f"Docling node (initial): {docling_host}")
+            _health_wait = int(
+                os.environ.get("SERVICE_HEALTH_WAIT_SECONDS", "900").strip() or "900"
+            )
+            _doc_ok, docling_host = _wait_healthz(
+                "Docling",
+                docling_host,
+                args.docling_port,
+                job_id=docling_job_id,
+                timeout=_health_wait,
+            )
+            if not _doc_ok:
+                print(
+                    "Docling /healthz not ready yet; CPU job will retry using DOCLING_JOB_ID.",
+                    file=sys.stderr,
+                )
+            else:
+                print(f"Docling node (healthy): {docling_host}")
 
         print(
             f"Waiting for first Grader GPU job ({grader_job_ids[0]}) to get a node name "
@@ -508,6 +576,7 @@ def main() -> int:
         "GPU_JOB_IDS": ":".join(gpu_job_ids),
         "NUM_SYNTHESIS_NODES": str(args.num_synthesis_nodes),
         "DOCLING_HOST": docling_host or "",
+        "DOCLING_JOB_ID": docling_job_id,
         "DOCLING_API_PORT": str(args.docling_port),
         "GRADER_HOST": grader_host or "",
         "GRADER_API_PORT": str(args.grader_port),
@@ -525,6 +594,8 @@ def main() -> int:
         "COLLECT_DISABLE_SEMANTIC_SCHOLAR": (
             "1" if args.collect_disable_semantic_scholar else ""
         ),
+        "RUN_LOGS_DIR": os.path.join(output_root, "logs"),
+        "SCHEDULER_STATE_DIR": os.path.join(output_root, "scheduler_state"),
     }
     if args.instructions_file and os.path.isfile(args.instructions_file):
         cpu_env["INSTRUCTIONS_FILE"] = os.path.abspath(args.instructions_file)
