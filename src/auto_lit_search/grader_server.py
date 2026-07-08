@@ -21,15 +21,27 @@ from auto_lit_search.analysis_packet import (
     RunAlignmentResponse,
 )
 from auto_lit_search.env_config import env_flag
+from auto_lit_search.paper_excerpt import (
+    build_grader_excerpt_with_meta,
+    excerpt_meta_dict,
+)
 from auto_lit_search.paper_io import (
     DOWNLOAD_MANIFEST_FILENAME,
-    MAX_PAPER_CHARS,
     ensure_dir as _ensure_dir,
     extract_paper_role as _extract_paper_role,
     identification_terms_block,
     list_paper_files as _list_paper_files,
     paper_id_by_artifact_basename as _paper_id_by_artifact_basename,
     read_text as _read_text,
+)
+from auto_lit_search.rubric_scoring import (
+    GRADING_SCHEMA_VERSION,
+    aggregate_paper_scores,
+    criteria_prompt_block,
+    normalize_criterion_scores,
+    required_flag_ids,
+    required_scored_criterion_ids,
+    rubric_role_for_paper_role,
 )
 from auto_lit_search.scheduler_http import post_run_alignment_graded
 
@@ -43,8 +55,8 @@ _GRADER_LLM_JSONL_LOCK = threading.Lock()
 _MODEL_ID_CACHE_LOCK = threading.Lock()
 _DEFAULT_GRADER_MAX_TOKENS = 4096
 _DEFAULT_GRADER_PAPER_WORKERS = 3
-_GRADER_AXIS_RATIONALE_MAX_CHARS = 280
-_GRADER_CROSS_AXIS_RATIONALE_MAX_CHARS = 150
+_GRADER_CRITERION_NOTE_MAX_CHARS = 60
+_GRADER_CLAIM_SUMMARY_MAX_CHARS = 150
 
 
 def _grader_paper_workers() -> int:
@@ -58,34 +70,50 @@ def _grader_max_tokens(req: GradeAlignmentRequest) -> int:
     return _env_positive_int("GRADER_MAX_TOKENS", _DEFAULT_GRADER_MAX_TOKENS)
 
 
-def _grader_json_output_instructions() -> str:
+def _grader_json_output_instructions(rubric: Dict[str, Any], rubric_role: str) -> str:
+    scored_ids = required_scored_criterion_ids(rubric)
+    flag_ids = required_flag_ids(rubric)
+    scored_list = ", ".join(scored_ids)
+    flag_line = (
+        f"rubric_tags (object: include {', '.join(flag_ids)} when applicable; "
+        "values from rubric flag_values)\n"
+        if flag_ids
+        else ""
+    )
+    host_meta = (
+        "infection_naive (boolean),\n"
+        if rubric_role == "host"
+        else ""
+    )
     return (
-        "OUTPUT (pipeline JSON schema; not part of the rubric file):\n"
+        "OUTPUT (pipeline JSON schema v2; not part of the rubric file):\n"
         "Return strict JSON only with keys:\n"
-        "rubric_dimension_scores (object: each axis id below → number 0..1),\n"
-        f"rubric_axis_rationales (object: SAME axis ids → string; per axis at most "
-        f"{_GRADER_AXIS_RATIONALE_MAX_CHARS} characters: one short quote or phrase from the excerpt "
-        "plus one sentence on how the axis score follows from rubric criteria; "
-        "do not enumerate sub-criteria or repeat rubric text; no empty strings),\n"
-        "rubric_tags (optional object: include mimicry_potential_flag and/or novelty_flag "
-        "when rubric criteria apply; values from rubric flag_values, else omit key),\n"
-        f"rationale (optional string: at most {_GRADER_CROSS_AXIS_RATIONALE_MAX_CHARS} characters; "
-        "one-sentence cross-axis takeaway; may be \"\").\n"
-        "Keep the JSON object compact. Do not output relevance_grade; it will be computed "
-        "server-side from axis scores (with rubric-specific aggregation rules).\n"
+        "criterion_scores (object: each scored criterion id → "
+        f"{{score: 0|1|2, note: optional string ≤{_GRADER_CRITERION_NOTE_MAX_CHARS} chars}}),\n"
+        "mention_type (string: focal_study | supporting_evidence | incidental_mention | "
+        "negative_result | methodological_reference),\n"
+        "no_meaningful_mention (boolean),\n"
+        f"{host_meta}"
+        f"{flag_line}"
+        f"claim_summary (optional string ≤{_GRADER_CLAIM_SUMMARY_MAX_CHARS} chars).\n"
+        "Required criterion_scores ids:\n"
+        f"{scored_list}\n"
+        "Do not output rubric_dimension_scores, axis totals, paper_grade, or relevance_grade; "
+        "the server computes weighted axis totals and readable grades from criterion_scores.\n"
     )
 
 
-def _clamp_parsed_rationales(parsed: Dict[str, Any], dims: List[Dict[str, Any]]) -> None:
-    rax = parsed.get("rubric_axis_rationales")
-    if isinstance(rax, dict):
-        for d in dims:
-            dn = d["name"]
-            if dn in rax:
-                rax[dn] = str(rax[dn] or "").strip()[:_GRADER_AXIS_RATIONALE_MAX_CHARS]
-    if parsed.get("rationale"):
-        parsed["rationale"] = str(parsed["rationale"]).strip()[
-            :_GRADER_CROSS_AXIS_RATIONALE_MAX_CHARS
+def _clamp_parsed_metadata(parsed: Dict[str, Any]) -> None:
+    cs = parsed.get("criterion_scores")
+    if isinstance(cs, dict):
+        for crit_id, entry in cs.items():
+            if not isinstance(entry, dict):
+                continue
+            if entry.get("note"):
+                entry["note"] = str(entry["note"]).strip()[:_GRADER_CRITERION_NOTE_MAX_CHARS]
+    if parsed.get("claim_summary"):
+        parsed["claim_summary"] = str(parsed["claim_summary"]).strip()[
+            :_GRADER_CLAIM_SUMMARY_MAX_CHARS
         ]
 
 
@@ -266,6 +294,44 @@ def _append_grader_llm_jsonl(output_root: str, alignment_id: str, record: Dict[s
             f.write(line)
 
 
+def _build_grader_system_prompt(
+    req: GradeAlignmentRequest,
+    rubric: Dict[str, Any],
+    rubric_role: str,
+    *,
+    role: Optional[str],
+) -> str:
+    criterion_block = criteria_prompt_block(rubric)
+    term_block = identification_terms_block(req.query, req.target_id, req.gene_context)
+    gene_focus = (
+        "the QUERY gene (pathogen / microbe-side rubric context)"
+        if role == "query"
+        else (
+            "the TARGET gene (host-side rubric context)"
+            if role == "target"
+            else "the gene implied by this paper's role in the pair below (query vs target)"
+        )
+    )
+    return (
+        "Grade using the RUBRIC JSON object below. If `grader_instructions` exists, read it first; "
+        "then `system_context`, `evaluation_unit`, `scoring_scale`, and each `axis` with criteria.\n\n"
+        "Alignment context (pair-level; the rubric file is per side):\n"
+        f"- alignment_id={req.alignment_id}\n"
+        f"- query_gene_id={req.query}\n"
+        f"- target_gene_id={req.target_id}\n"
+        f"- paper_role={role or 'unknown'} (query → microbe rubric; target → host rubric)\n"
+        f"- gene_focus_for_this_paper: {gene_focus}\n"
+        f"{term_block}\n"
+        f"{_grader_json_output_instructions(rubric, rubric_role)}\n"
+        f"Scored criteria by axis:\n{criterion_block}\n\n"
+        f"RUBRIC:\n{json.dumps(rubric, ensure_ascii=False)}"
+    )
+
+
+def _build_grader_user_prompt(excerpt: str) -> str:
+    return f"Paper excerpt:\n{excerpt}"
+
+
 def _call_llm(
     user_content: str,
     base_url: str,
@@ -273,10 +339,11 @@ def _call_llm(
     temperature: float,
     log_context: str = "",
     *,
+    system_content: Optional[str] = None,
     emit_event: Optional[Callable[[Dict[str, Any]], None]] = None,
     log_static: Optional[Dict[str, Any]] = None,
 ) -> GraderLLMCallResult:
-    prompt_char_len = len(user_content)
+    prompt_char_len = len(user_content) + (len(system_content) if system_content else 0)
     configured = (os.environ.get("VLLM_MODEL_NAME") or "").strip()
     root_url = base_url.rstrip("/")
     api_base = root_url
@@ -284,9 +351,13 @@ def _call_llm(
         api_base = f"{api_base}/v1"
     url = f"{api_base}/chat/completions"
     model_id = configured or _resolve_model_id(root_url)
+    messages: List[Dict[str, str]] = []
+    if system_content:
+        messages.append({"role": "system", "content": system_content})
+    messages.append({"role": "user", "content": user_content})
     payload: Dict[str, Any] = {
         "model": model_id,
-        "messages": [{"role": "user", "content": user_content}],
+        "messages": messages,
         "max_tokens": max_tokens,
         "temperature": temperature,
         "response_format": {"type": "json_object"},
@@ -486,28 +557,6 @@ def _safe_float(v: Any, default: float = 0.0) -> float:
     return max(0.0, min(1.0, x))
 
 
-def _compute_relevance_grade(dim_scores: Dict[str, float]) -> float:
-    """
-    Compute aggregate relevance from per-axis scores.
-
-    Host rubric Axis 3 (`disease_population_relevance`) is bonus-only:
-    it can increase the aggregate when present, but a low/absent value
-    must not reduce the baseline formed by other axes.
-    """
-    if not dim_scores:
-        return 0.0
-    axis3_key = "disease_population_relevance"
-    if axis3_key in dim_scores and len(dim_scores) > 1:
-        base_keys = [k for k in dim_scores.keys() if k != axis3_key]
-        base = sum(float(dim_scores[k]) for k in base_keys) / len(base_keys)
-        # Keep Axis 3 on the same nominal weight scale as one axis in the legacy mean.
-        bonus = float(dim_scores[axis3_key]) / len(dim_scores)
-        return _safe_float(base + bonus, default=0.0)
-    return _safe_float(
-        sum(float(v) for v in dim_scores.values()) / len(dim_scores), default=0.0
-    )
-
-
 def _strip_markdown_json_fence(text: str) -> str:
     t = text.strip()
     if not t.startswith("```"):
@@ -523,7 +572,7 @@ def _strip_markdown_json_fence(text: str) -> str:
 
 def _build_grade_repair_prompt(
     bad_output: str,
-    dim_names: str,
+    criterion_ids: str,
 ) -> str:
     excerpt = _strip_markdown_json_fence(bad_output)[:4000]
     return (
@@ -531,11 +580,9 @@ def _build_grade_repair_prompt(
         "Do NOT re-grade the paper and do NOT add new evidence.\n"
         "Only reformat/recover the previous response into strict JSON.\n\n"
         "Return JSON only with keys:\n"
-        "- rubric_dimension_scores (object: axis id -> number 0..1)\n"
-        "- rubric_axis_rationales (object: same axis ids -> non-empty string; "
-        f"keep each under {_GRADER_AXIS_RATIONALE_MAX_CHARS} characters)\n"
-        f"- rationale (optional string; at most {_GRADER_CROSS_AXIS_RATIONALE_MAX_CHARS} characters)\n\n"
-        f"Axis ids must be exactly: {dim_names}\n\n"
+        "- criterion_scores (object: criterion id -> {score: 0|1|2, note: optional string})\n"
+        "- mention_type, no_meaningful_mention, rubric_tags, claim_summary (as applicable)\n\n"
+        f"Scored criterion ids must be exactly: {criterion_ids}\n\n"
         "Invalid output to repair:\n"
         f"{excerpt}\n"
     )
@@ -574,15 +621,26 @@ def _extract_first_json_object(raw: str) -> Optional[str]:
     return None
 
 
-def _try_parse_grade_json(raw: str, dims: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+def _parse_bool_field(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        return value.strip().lower() in {"true", "1", "yes"}
+    return bool(value)
+
+
+def _try_parse_grade_json(
+    raw: str,
+    rubric: Dict[str, Any],
+    rubric_role: str,
+) -> Optional[Dict[str, Any]]:
     s = raw.strip()
     if not s:
         return None
-    candidate = s
     try:
-        obj = json.loads(candidate)
+        obj = json.loads(s)
     except Exception:
-        wrapped = _extract_first_json_object(candidate)
+        wrapped = _extract_first_json_object(s)
         if not wrapped:
             return None
         try:
@@ -591,25 +649,21 @@ def _try_parse_grade_json(raw: str, dims: List[Dict[str, Any]]) -> Optional[Dict
             return None
     if not isinstance(obj, dict):
         return None
-    dsc = obj.get("rubric_dimension_scores")
-    if not isinstance(dsc, dict):
+    raw_scores = obj.get("criterion_scores")
+    if not isinstance(raw_scores, dict):
         return None
-    rax = obj.get("rubric_axis_rationales")
-    if not isinstance(rax, dict):
-        return None
-    dim_scores: Dict[str, float] = {}
-    axis_rationales: Dict[str, str] = {}
-    for d in dims:
-        dn = d["name"]
-        if dn not in dsc:
+    required = required_scored_criterion_ids(rubric)
+    criterion_scores = normalize_criterion_scores(raw_scores)
+    for crit_id in required:
+        if crit_id not in criterion_scores:
             return None
-        if dn not in rax:
-            return None
-        dim_scores[dn] = _safe_float(dsc.get(dn), 0.0)
-        rtext = str(rax.get(dn) or "").strip()
-        if not rtext:
-            return None
-        axis_rationales[dn] = rtext
+
+    no_mention = _parse_bool_field(obj.get("no_meaningful_mention"))
+    if no_mention:
+        criterion_scores = {
+            crit_id: {"score": 0, "note": ""} for crit_id in required
+        }
+
     tags_raw = obj.get("rubric_tags")
     rubric_tags: Dict[str, str] = {}
     if isinstance(tags_raw, dict):
@@ -617,35 +671,56 @@ def _try_parse_grade_json(raw: str, dims: List[Dict[str, Any]]) -> Optional[Dict
             sv = str(v or "").strip()
             if sv:
                 rubric_tags[str(k)] = sv
-    grade = _compute_relevance_grade(dim_scores)
-    parsed = {
-        "relevance_grade": grade,
-        "rubric_dimension_scores": dim_scores,
-        "rubric_axis_rationales": axis_rationales,
-        "rationale": str(obj.get("rationale") or "").strip(),
+
+    agg = aggregate_paper_scores(
+        rubric, criterion_scores, rubric_role=rubric_role
+    )
+    parsed: Dict[str, Any] = {
+        **agg,
+        "criterion_scores": criterion_scores,
+        "mention_type": str(obj.get("mention_type") or "").strip() or None,
+        "infection_naive": (
+            _parse_bool_field(obj["infection_naive"])
+            if "infection_naive" in obj
+            else None
+        ),
+        "no_meaningful_mention": no_mention,
+        "claim_summary": str(obj.get("claim_summary") or "").strip(),
         "rubric_tags": rubric_tags,
+        "rationale": str(obj.get("claim_summary") or obj.get("rationale") or "").strip(),
     }
-    _clamp_parsed_rationales(parsed, dims)
+    _clamp_parsed_metadata(parsed)
     return parsed
 
 
-def _parse_grade_output(raw: str, dims: List[Dict[str, Any]]) -> Dict[str, Any]:
+def _parse_grade_output(
+    raw: str,
+    rubric: Dict[str, Any],
+    rubric_role: str,
+) -> Dict[str, Any]:
     stripped = _strip_markdown_json_fence(raw)
-    parsed = _try_parse_grade_json(stripped, dims)
+    parsed = _try_parse_grade_json(stripped, rubric, rubric_role)
     if parsed is not None:
         return parsed
-    dim_scores = {d["name"]: 0.0 for d in dims}
-    axr = {d["name"]: "" for d in dims}
-    if stripped and dims:
-        axr[dims[0]["name"]] = (
-            f"[Grader JSON parse failed; raw output excerpt:] {stripped[:2000]}"
-        )
+    required = required_scored_criterion_ids(rubric)
+    criterion_scores = {crit_id: {"score": 0, "note": ""} for crit_id in required}
+    agg = aggregate_paper_scores(
+        rubric, criterion_scores, rubric_role=rubric_role
+    )
     return {
-        "relevance_grade": 0.0,
-        "rubric_dimension_scores": dim_scores,
-        "rubric_axis_rationales": axr,
-        "rationale": stripped[:800],
+        **agg,
+        "criterion_scores": criterion_scores,
+        "mention_type": None,
+        "infection_naive": None,
+        "no_meaningful_mention": False,
+        "claim_summary": "",
         "rubric_tags": {},
+        "rationale": (
+            f"[Grader JSON parse failed; raw output excerpt:] {stripped[:2000]}"
+            if stripped
+            else ""
+        ),
+        "notes_parse_failed": True,
     }
 
 
@@ -655,49 +730,34 @@ def _grade_single_paper(
     rubric: Dict[str, Any],
     llm_base_url: Optional[str],
     paper_id_by_file: Optional[Dict[str, str]] = None,
+    *,
+    system_prompt: Optional[str] = None,
 ) -> Tuple[GradedPaper, Dict[str, int]]:
     fname = os.path.basename(file_path)
     lookup = paper_id_by_file or {}
     paper_id = lookup.get(fname) or os.path.splitext(fname)[0]
     role = _extract_paper_role(fname)
+    rubric_role = rubric_role_for_paper_role(role or "")
     text = _read_text(file_path)
-    dims = _rubric_dimensions(rubric)
-    term_block = identification_terms_block(req.query, req.target_id, req.gene_context)
-    dim_lines = "\n".join(
-        f"- {d['name']}: {d['description']} (weight={d['weight']})" for d in dims
+    excerpt_meta = build_grader_excerpt_with_meta(text)
+    excerpt = excerpt_meta.excerpt
+    excerpt_log = excerpt_meta_dict(excerpt_meta)
+    system_content = system_prompt or _build_grader_system_prompt(
+        req, rubric, rubric_role, role=role
     )
-    gene_focus = (
-        "the QUERY gene (pathogen / microbe-side rubric context)"
-        if role == "query"
-        else (
-            "the TARGET gene (host-side rubric context)"
-            if role == "target"
-            else "the gene implied by this paper's role in the pair below (query vs target)"
-        )
-    )
-    prompt = (
-        "Grade using the RUBRIC JSON object below. If `grader_instructions` exists, read it first; "
-        "then `system_context`, `evaluation_unit`, `scoring_scale`, and each `axis` with criteria.\n\n"
-        "Alignment context (pair-level; the rubric file is per side):\n"
-        f"- alignment_id={req.alignment_id}\n"
-        f"- query_gene_id={req.query}\n"
-        f"- target_gene_id={req.target_id}\n"
-        f"- paper_role={role or 'unknown'} (query → microbe rubric; target → host rubric)\n"
-        f"- gene_focus_for_this_paper: {gene_focus}\n"
-        f"{term_block}\n"
-        f"{_grader_json_output_instructions()}\n"
-        f"RUBRIC:\n{json.dumps(rubric, ensure_ascii=False)}\n"
-        f"rubric_dimension_scores and rubric_axis_rationales must each include exactly these "
-        f"axis ids:\n{dim_lines}\n\n"
-        f"Paper excerpt:\n{text[:100000]}"
-    )
-    dim_names = ", ".join(d["name"] for d in dims)
+    user_prompt = _build_grader_user_prompt(excerpt)
+    criterion_ids = ", ".join(required_scored_criterion_ids(rubric))
     notes = ""
     raw = ""
+    required = required_scored_criterion_ids(rubric)
+    zero_scores = {crit_id: {"score": 0, "note": ""} for crit_id in required}
     parsed: Dict[str, Any] = {
-        "relevance_grade": 0.0,
-        "rubric_dimension_scores": {d["name"]: 0.0 for d in dims},
-        "rubric_axis_rationales": {d["name"]: "" for d in dims},
+        **aggregate_paper_scores(rubric, zero_scores, rubric_role=rubric_role),
+        "criterion_scores": zero_scores,
+        "mention_type": None,
+        "infection_naive": None,
+        "no_meaningful_mention": False,
+        "claim_summary": "",
         "rationale": "",
         "rubric_tags": {},
     }
@@ -711,14 +771,14 @@ def _grade_single_paper(
         row.setdefault("file_name", fname)
         _append_grader_llm_jsonl(req.output_root, req.alignment_id, row)
 
-    excerpt_char_len = len(text)
-    excerpt_in_prompt_chars = min(100000, excerpt_char_len)
+    excerpt_char_len = excerpt_meta.raw_char_len
+    excerpt_in_prompt_chars = excerpt_meta.excerpt_char_len
 
     if not llm_base_url or not str(llm_base_url).strip():
         _emit_llm_row(
             {
                 "call_kind": "skipped_no_vllm_url",
-                "excerpt_char_len": excerpt_char_len,
+                **excerpt_log,
                 "excerpt_in_prompt_chars": excerpt_in_prompt_chars,
             }
         )
@@ -726,7 +786,7 @@ def _grade_single_paper(
         _emit_llm_row(
             {
                 "call_kind": "skipped_no_excerpt",
-                "excerpt_char_len": excerpt_char_len,
+                **excerpt_log,
                 "excerpt_in_prompt_chars": excerpt_in_prompt_chars,
             }
         )
@@ -748,26 +808,26 @@ def _grade_single_paper(
                     "\n\nYour previous reply was not usable (empty, prose, markdown fences, "
                     "or missing required JSON keys). Follow rubric.grader_instructions and the axes, "
                     "then respond with ONLY one JSON object—no other text.\n"
-                    "Required keys: rubric_dimension_scores (numbers 0..1), "
-                    f"rubric_axis_rationales (brief strings, max "
-                    f"{_GRADER_AXIS_RATIONALE_MAX_CHARS} chars per axis; same keys), "
-                    f"optional rationale (max {_GRADER_CROSS_AXIS_RATIONALE_MAX_CHARS} chars). "
-                    f"Axis ids: {dim_names}.\n"
+                    "Required keys: criterion_scores (each scored criterion id -> "
+                    f"{{score: 0|1|2, note: optional ≤{_GRADER_CRITERION_NOTE_MAX_CHARS} chars}}), "
+                    "mention_type, no_meaningful_mention. "
+                    f"Criterion ids: {criterion_ids}.\n"
                 )
                 if bad:
                     retry_extra += f"Invalid earlier reply (excerpt):\n{bad}\n"
             try:
                 llm_res = _call_llm(
-                    prompt + retry_extra,
+                    user_prompt + retry_extra,
                     llm_base_url,
                     max_tokens=max_tokens,
                     temperature=temperature,
                     log_context=fname,
+                    system_content=system_content,
                     emit_event=_emit_llm_row,
                     log_static={
                         "call_kind": "grade",
                         "grade_attempt": attempt,
-                        "excerpt_char_len": excerpt_char_len,
+                        **excerpt_log,
                         "excerpt_in_prompt_chars": excerpt_in_prompt_chars,
                     },
                 )
@@ -783,14 +843,15 @@ def _grade_single_paper(
                             "phase": "client_exception",
                             "error": str(e),
                             "error_type": type(e).__name__,
-                            "prompt_char_len": len(prompt + retry_extra),
-                            "excerpt_char_len": excerpt_char_len,
+                            "prompt_char_len": len(system_content)
+                            + len(user_prompt + retry_extra),
+                            **excerpt_log,
                             "excerpt_in_prompt_chars": excerpt_in_prompt_chars,
                         }
                     )
                 break
             candidate = _strip_markdown_json_fence(raw)
-            maybe = _try_parse_grade_json(candidate, dims)
+            maybe = _try_parse_grade_json(candidate, rubric, rubric_role)
             if maybe is not None:
                 parsed = maybe
                 graded_ok = True
@@ -808,7 +869,7 @@ def _grade_single_paper(
                     f"Grader LLM ({fname}): non-empty invalid JSON; attempting repair pass "
                     "before full regrade retry"
                 )
-                repair_prompt = _build_grade_repair_prompt(raw, dim_names)
+                repair_prompt = _build_grade_repair_prompt(raw, criterion_ids)
                 try:
                     repair_llm = _call_llm(
                         repair_prompt,
@@ -820,7 +881,7 @@ def _grade_single_paper(
                         log_static={
                             "call_kind": "repair",
                             "grade_attempt": attempt,
-                            "excerpt_char_len": excerpt_char_len,
+                            **excerpt_log,
                             "excerpt_in_prompt_chars": excerpt_in_prompt_chars,
                         },
                     )
@@ -836,13 +897,13 @@ def _grade_single_paper(
                                 "error": str(e),
                                 "error_type": type(e).__name__,
                                 "prompt_char_len": len(repair_prompt),
-                                "excerpt_char_len": excerpt_char_len,
+                                **excerpt_log,
                                 "excerpt_in_prompt_chars": excerpt_in_prompt_chars,
                             }
                         )
                     repaired_raw = ""
                 repaired_candidate = _strip_markdown_json_fence(repaired_raw)
-                repaired = _try_parse_grade_json(repaired_candidate, dims)
+                repaired = _try_parse_grade_json(repaired_candidate, rubric, rubric_role)
                 if repaired is not None:
                     parsed = repaired
                     graded_ok = True
@@ -860,17 +921,28 @@ def _grade_single_paper(
                     f"Grader LLM ({fname}): invalid JSON after retry; "
                     "using default scores and rationale excerpt"
                 )
-            parsed = _parse_grade_output(raw, dims)
-    rdim = parsed["rubric_dimension_scores"]
-    grade = _compute_relevance_grade(rdim)
+            parsed = _parse_grade_output(raw, rubric, rubric_role)
+    if parsed.pop("notes_parse_failed", False) and not notes:
+        notes = "grader JSON parse failed"
     paper = GradedPaper(
         paper_id=paper_id,
         file_name=fname,
         paper_role=role,
-        relevance_grade=_safe_float(grade),
-        rubric_dimension_scores=parsed["rubric_dimension_scores"],
-        rubric_axis_rationales=parsed.get("rubric_axis_rationales")
-        or {d["name"]: "" for d in dims},
+        grading_schema_version=int(
+            parsed.get("grading_schema_version") or GRADING_SCHEMA_VERSION
+        ),
+        relevance_grade=_safe_float(parsed.get("relevance_grade", 0.0)),
+        relevance_sort=int(parsed.get("relevance_sort") or 0),
+        paper_grade=str(parsed.get("paper_grade") or ""),
+        primary_grade=str(parsed.get("primary_grade") or ""),
+        criterion_scores=parsed.get("criterion_scores") or {},
+        axis_totals=parsed.get("axis_totals") or {},
+        rubric_dimension_scores=parsed.get("rubric_dimension_scores") or {},
+        rubric_axis_rationales=parsed.get("rubric_axis_rationales") or {},
+        mention_type=parsed.get("mention_type"),
+        infection_naive=parsed.get("infection_naive"),
+        no_meaningful_mention=bool(parsed.get("no_meaningful_mention")),
+        claim_summary=str(parsed.get("claim_summary") or ""),
         rationale=parsed.get("rationale") or "",
         rubric_tags=parsed.get("rubric_tags") or {},
         model_output=raw or None,
@@ -896,10 +968,18 @@ def _write_rubric_score_csvs(
     microbe_path = os.path.join(output_root, f"{alignment_id}_microbe_rubric_scores.csv")
     host_axes = [d["name"] for d in _rubric_dimensions(host_rubric)]
     microbe_axes = [d["name"] for d in _rubric_dimensions(microbe_rubric)]
-    base_cols = ["paper_id", "file_name", "relevance_grade"]
+    base_cols = [
+        "paper_id",
+        "file_name",
+        "paper_grade",
+        "primary_grade",
+        "relevance_sort",
+        "relevance_grade",
+    ]
 
     def _write(path: str, papers: List[GradedPaper], axis_cols: List[str]) -> None:
-        fieldnames = base_cols + axis_cols + ["rationale"]
+        axis_total_cols = [f"{ax}_total" for ax in axis_cols]
+        fieldnames = base_cols + axis_total_cols + axis_cols + ["claim_summary"]
         with open(path, "w", encoding="utf-8", newline="") as f:
             w = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
             w.writeheader()
@@ -907,11 +987,17 @@ def _write_rubric_score_csvs(
                 row: Dict[str, Any] = {
                     "paper_id": gp.paper_id,
                     "file_name": gp.file_name,
+                    "paper_grade": gp.paper_grade,
+                    "primary_grade": gp.primary_grade,
+                    "relevance_sort": gp.relevance_sort,
                     "relevance_grade": gp.relevance_grade,
-                    "rationale": (gp.rationale or "")[:2000],
+                    "claim_summary": (gp.claim_summary or gp.rationale or "")[:2000],
                 }
                 scores = gp.rubric_dimension_scores or {}
+                totals = gp.axis_totals or {}
                 for ax in axis_cols:
+                    total = totals.get(ax) or {}
+                    row[f"{ax}_total"] = total.get("label", "")
                     row[ax] = scores.get(ax, "")
                 w.writerow(row)
 
@@ -938,6 +1024,12 @@ def _grade_alignment_sync(req: GradeAlignmentRequest) -> RunAlignmentResponse:
     microbe_rubric = _load_json_file(req.microbe_rubric_path)
     llm_base_url = os.environ.get("VLLM_BASE_URL")
     paper_id_by_file = _paper_id_by_artifact_basename(req.papers_dir)
+    system_by_role = {
+        "host": _build_grader_system_prompt(req, host_rubric, "host", role="target"),
+        "microbe": _build_grader_system_prompt(
+            req, microbe_rubric, "microbe", role="query"
+        ),
+    }
     paper_workers = _grader_paper_workers()
     logger.info(
         "Grader {}: grading {} papers with {} parallel workers",
@@ -949,12 +1041,14 @@ def _grade_alignment_sync(req: GradeAlignmentRequest) -> RunAlignmentResponse:
     def _grade_one(fname: str) -> Tuple[str, GradedPaper, Dict[str, int]]:
         role = _extract_paper_role(fname)
         rubric = microbe_rubric if role == "query" else host_rubric
+        rubric_role = rubric_role_for_paper_role(role or "")
         gp, retry_meta = _grade_single_paper(
             file_path=os.path.join(req.papers_dir, fname),
             req=req,
             rubric=rubric,
             llm_base_url=llm_base_url,
             paper_id_by_file=paper_id_by_file,
+            system_prompt=system_by_role[rubric_role],
         )
         return fname, gp, retry_meta
 
@@ -991,11 +1085,8 @@ def _grade_alignment_sync(req: GradeAlignmentRequest) -> RunAlignmentResponse:
     graded = [graded_by_file[fname] for fname in files]
 
     def _parse_fallback_paper(g: GradedPaper) -> bool:
-        rax = g.rubric_axis_rationales or {}
-        return any(
-            str(v).strip().startswith("[Grader JSON parse failed")
-            for v in rax.values()
-        )
+        rationale = str(g.rationale or "").strip()
+        return rationale.startswith("[Grader JSON parse failed")
 
     llm_enabled = bool(llm_base_url and str(llm_base_url).strip())
     n_llm_exceptions = sum(1 for g in graded if (g.notes or "").strip())
@@ -1012,6 +1103,7 @@ def _grade_alignment_sync(req: GradeAlignmentRequest) -> RunAlignmentResponse:
     _ensure_dir(req.output_root)
     graded_path = os.path.join(req.output_root, f"{req.alignment_id}_graded.json")
     grading_meta: Dict[str, Any] = {
+        "grading_schema_version": GRADING_SCHEMA_VERSION,
         "grader_model": os.environ.get("VLLM_MODEL_NAME", "unknown"),
         "host_rubric_path": req.host_rubric_path,
         "microbe_rubric_path": req.microbe_rubric_path,
@@ -1146,8 +1238,24 @@ def _ensure_async_worker_started() -> None:
 
 
 @app.get("/healthz")
-def healthz() -> Dict[str, str]:
-    return {"status": "ok", "detail": "ready"}
+def healthz() -> Dict[str, Any]:
+    """Ready only when the local vLLM server responds on /v1/models."""
+    base = (os.environ.get("VLLM_BASE_URL") or "").strip().rstrip("/")
+    if not base:
+        return {"status": "ok", "vllm": "disabled", "detail": "VLLM_BASE_URL unset"}
+    try:
+        resp = requests.get(f"{base}/v1/models", timeout=5)
+        if resp.ok:
+            data = resp.json()
+            if isinstance(data, dict) and data.get("data"):
+                return {"status": "ok", "vllm": "ready", "detail": "vllm models available"}
+        return {
+            "status": "degraded",
+            "vllm": "unreachable",
+            "detail": (resp.text or "")[:300],
+        }
+    except Exception as e:
+        return {"status": "degraded", "vllm": "unreachable", "detail": str(e)}
 
 
 @app.post("/grade_alignment", response_model=RunAlignmentResponse)

@@ -129,6 +129,32 @@ def paper_id_by_artifact_basename(papers_dir: str) -> Dict[str, str]:
     return out
 
 
+def meta_search_literals(meta: Dict[str, Any], canonical_id: str) -> List[str]:
+    """All searchable strings for a gene (UniProt, Entrez, locus, symbol, synonyms, etc.)."""
+    out: List[str] = []
+    for key in (
+        "uniprot_id",
+        "entrez_id",
+        "gene_name",
+        "locus_tag",
+        "genbank_acc",
+        "common_name",
+    ):
+        v = str(meta.get(key) or "").strip()
+        if v and v.lower() not in {x.lower() for x in out}:
+            out.append(v)
+    gt = gene_terms(meta, canonical_id)
+    for v in (gt["symbol"], gt["common_name"]):
+        if v and v != "none" and v.lower() not in {x.lower() for x in out}:
+            out.append(v)
+    for s in gt["synonyms"]:
+        if s and s.lower() not in {x.lower() for x in out}:
+            out.append(s)
+    if canonical_id and canonical_id.lower() not in {x.lower() for x in out}:
+        out.insert(0, canonical_id)
+    return out
+
+
 def gene_terms(meta: Dict[str, Any], fallback_id: str) -> Dict[str, Any]:
     symbol = str(meta.get("gene_name") or "").strip() or fallback_id
     common_name = str(meta.get("common_name") or "").strip()

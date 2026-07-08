@@ -14,6 +14,8 @@ import re
 import subprocess
 import sys
 import time
+import urllib.error
+import urllib.request
 from typing import Literal
 
 # Forwarded into the CPU/download job if set in the environment when launching.
@@ -35,6 +37,53 @@ def _publisher_env_from_os() -> dict[str, str]:
         if v:
             out[k] = v
     return out
+
+
+def _wait_healthz(
+    service: str,
+    host: str,
+    port: int,
+    *,
+    job_id: str | None = None,
+    timeout: int = 900,
+    interval: int = 5,
+) -> tuple[bool, str]:
+    """Poll /healthz until OK or timeout. Refresh host from Slurm job_id when provided."""
+    deadline = time.monotonic() + max(60, timeout)
+    current_host = (host or "").strip()
+    started = time.monotonic()
+    attempt = 0
+    while time.monotonic() < deadline:
+        attempt += 1
+        if job_id:
+            node = _try_get_node_name(job_id)
+            if node:
+                current_host = node
+        if not current_host:
+            time.sleep(interval)
+            continue
+        url = f"http://{current_host}:{port}/healthz"
+        try:
+            with urllib.request.urlopen(url, timeout=10) as resp:
+                if resp.status == 200:
+                    print(
+                        f"{service} health OK at {url} "
+                        f"(after {time.monotonic() - started:.0f}s, {attempt} tries)"
+                    )
+                    return True, current_host
+        except (urllib.error.URLError, TimeoutError, OSError) as e:
+            if attempt == 1 or attempt % 12 == 0:
+                print(
+                    f"Waiting for {service} at {url} "
+                    f"({time.monotonic() - started:.0f}s / {timeout}s): {e!r}",
+                    file=sys.stderr,
+                )
+        time.sleep(interval)
+    print(
+        f"Timed out waiting for {service} /healthz on {current_host}:{port} after {timeout}s",
+        file=sys.stderr,
+    )
+    return False, current_host
 
 
 def _sbatch(
@@ -148,7 +197,12 @@ def main() -> int:
     p.add_argument(
         "--model-dir",
         required=True,
-        help="Path to model weights (for vLLM)",
+        help="Path to model weights for synthesis LLM (vLLM on gpu_llm_node)",
+    )
+    p.add_argument(
+        "--grader-model-dir",
+        default=None,
+        help="Path to grader model weights (default: same as --model-dir)",
     )
     p.add_argument(
         "--gpu-image",
@@ -210,6 +264,12 @@ def main() -> int:
         help="Number of parallel grader GPU jobs (one alignment per grader at a time)",
     )
     p.add_argument(
+        "--num-synthesis-nodes",
+        type=int,
+        default=int(os.environ.get("NUM_SYNTHESIS_NODES", "1")),
+        help="Number of parallel synthesis LLM GPU jobs (ports gpu-port + i)",
+    )
+    p.add_argument(
         "--instructions-file",
         default="",
         help="Path to prompt/instructions file for GPU",
@@ -262,6 +322,7 @@ def main() -> int:
         help="Do not wait for GPU node to be RUNNING before submitting CPU job",
     )
     args = p.parse_args()
+    grader_model_dir = args.grader_model_dir or args.model_dir
 
     _mw_env = os.environ.get("COLLECT_MAX_WORKERS", "").strip()
     if _mw_env.isdigit():
@@ -325,8 +386,17 @@ def main() -> int:
     if args.num_grader_nodes < 1:
         print("--num-grader-nodes must be >= 1", file=sys.stderr)
         return 1
+    if args.num_synthesis_nodes < 1:
+        print("--num-synthesis-nodes must be >= 1", file=sys.stderr)
+        return 1
     if args.num_grader_nodes > 1 and args.grader_port + args.num_grader_nodes - 1 > 65535:
         print("grader-port + num-grader-nodes - 1 exceeds 65535", file=sys.stderr)
+        return 1
+    if args.num_synthesis_nodes > 1 and args.gpu_port + args.num_synthesis_nodes - 1 > 65535:
+        print("gpu-port + num-synthesis-nodes - 1 exceeds 65535", file=sys.stderr)
+        return 1
+    if not os.path.isdir(grader_model_dir):
+        print(f"Grader model dir not found: {grader_model_dir}", file=sys.stderr)
         return 1
     if not os.path.isfile(args.paper_ids):
         print(f"Paper IDs file not found: {args.paper_ids}", file=sys.stderr)
@@ -359,18 +429,35 @@ def main() -> int:
     docling_job_id = _sbatch(docling_script, docling_env, log_path=docling_log)
     print(f"Submitted Docling GPU job: {docling_job_id}")
 
-    # LLM before graders so synthesis GPU is not stuck behind grader queue depth.
-    gpu_env = {
-        "DATA_ROOT": args.data_root,
-        "MODEL_DIR": args.model_dir,
-        "OUTPUT_ROOT": output_root,
-        "GPU_API_PORT": str(args.gpu_port),
-        "GPU_IMAGE": gpu_image,
-        "REPO_ROOT": repo_root,
-    }
-    gpu_log = os.path.join(logs_root, "auto_lit_gpu_%j.log")
-    gpu_job_id = _sbatch(gpu_script, gpu_env, log_path=gpu_log)
-    print(f"Submitted LLM GPU job: {gpu_job_id}")
+    # Launch one or more synthesis LLM GPU nodes (distinct API ports when colocated).
+    gpu_job_ids: list[str] = []
+    for i in range(args.num_synthesis_nodes):
+        gpu_port_i = args.gpu_port + i
+        gpu_env = {
+            "DATA_ROOT": args.data_root,
+            "MODEL_DIR": args.model_dir,
+            "OUTPUT_ROOT": output_root,
+            "GPU_API_PORT": str(gpu_port_i),
+            "GPU_IMAGE": gpu_image,
+            "REPO_ROOT": repo_root,
+            "HOST_RUBRIC_PATH": os.path.abspath(args.host_rubric_path),
+            "MICROBE_RUBRIC_PATH": os.path.abspath(args.microbe_rubric_path),
+        }
+        gpu_log = os.path.join(logs_root, f"auto_lit_gpu_{i}_%j.log")
+        gpu_job_id = _sbatch(gpu_script, gpu_env, log_path=gpu_log)
+        gpu_job_ids.append(gpu_job_id)
+        print(
+            f"Submitted LLM GPU job {i + 1}/{args.num_synthesis_nodes}: "
+            f"{gpu_job_id} (port {gpu_port_i})"
+        )
+
+    _grader_optional_env_keys = (
+        "GRADER_MAX_TOKENS",
+        "GRADER_PAPER_WORKERS",
+        "VLLM_MAX_NUM_SEQS",
+        "VLLM_MAX_MODEL_LEN",
+        "VLLM_GPU_MEMORY_UTILIZATION",
+    )
 
     # Launch one or more Grader GPU nodes (distinct API ports when colocated on one host).
     grader_job_ids: list[str] = []
@@ -378,13 +465,17 @@ def main() -> int:
         grader_port_i = args.grader_port + i
         grader_env = {
             "DATA_ROOT": args.data_root,
-            "MODEL_DIR": args.model_dir,
+            "MODEL_DIR": grader_model_dir,
             "OUTPUT_ROOT": output_root,
             "GRADER_API_PORT": str(grader_port_i),
             "GRADER_IMAGE": grader_image,
             "REPO_ROOT": repo_root,
             "GRADER_SKIP_SYNTHESIS": "1",
         }
+        for key in _grader_optional_env_keys:
+            val = os.environ.get(key, "").strip()
+            if val:
+                grader_env[key] = val
         grader_log = os.path.join(logs_root, f"auto_lit_grader_{i}_%j.log")
         grader_job_id = _sbatch(grader_script, grader_env, log_path=grader_log)
         grader_job_ids.append(grader_job_id)
@@ -396,17 +487,22 @@ def main() -> int:
     gpu_host = None
     docling_host = None
     grader_host = None
+    gpu_urls: list[str] = []
     grader_urls: list[str] = []
     if not args.no_wait:
-        print("Waiting for LLM GPU job to run and get node name...")
-        gpu_host = _get_node_name(gpu_job_id)
+        print(
+            f"Waiting for first LLM GPU job ({gpu_job_ids[0]}) to get a node name "
+            f"({len(gpu_job_ids)} synthesis job(s) submitted; others discovered at runtime)..."
+        )
+        gpu_host = _get_node_name(gpu_job_ids[0])
         if not gpu_host:
             print(
-                "Could not get GPU node name; submit CPU job manually with GPU_HOST set.",
+                "Could not get GPU node name; submit CPU job manually with GPU_URLS / GPU_JOB_IDS set.",
                 file=sys.stderr,
             )
         else:
-            print(f"LLM GPU node: {gpu_host}")
+            gpu_urls.append(f"http://{gpu_host}:{args.gpu_port}")
+            print(f"LLM GPU node 1 (initial): {gpu_host}:{args.gpu_port}")
 
         print("Waiting for Docling GPU job to run and get node name...")
         docling_host = _get_node_name(docling_job_id)
@@ -416,7 +512,24 @@ def main() -> int:
                 file=sys.stderr,
             )
         else:
-            print(f"Docling node: {docling_host}")
+            print(f"Docling node (initial): {docling_host}")
+            _health_wait = int(
+                os.environ.get("SERVICE_HEALTH_WAIT_SECONDS", "900").strip() or "900"
+            )
+            _doc_ok, docling_host = _wait_healthz(
+                "Docling",
+                docling_host,
+                args.docling_port,
+                job_id=docling_job_id,
+                timeout=_health_wait,
+            )
+            if not _doc_ok:
+                print(
+                    "Docling /healthz not ready yet; CPU job will retry using DOCLING_JOB_ID.",
+                    file=sys.stderr,
+                )
+            else:
+                print(f"Docling node (healthy): {docling_host}")
 
         print(
             f"Waiting for first Grader GPU job ({grader_job_ids[0]}) to get a node name "
@@ -459,7 +572,11 @@ def main() -> int:
         "CPU_IMAGE": cpu_image,
         "REPO_ROOT": repo_root,
         "GPU_HOST": gpu_host or "",
+        "GPU_URLS": ";".join(gpu_urls),
+        "GPU_JOB_IDS": ":".join(gpu_job_ids),
+        "NUM_SYNTHESIS_NODES": str(args.num_synthesis_nodes),
         "DOCLING_HOST": docling_host or "",
+        "DOCLING_JOB_ID": docling_job_id,
         "DOCLING_API_PORT": str(args.docling_port),
         "GRADER_HOST": grader_host or "",
         "GRADER_API_PORT": str(args.grader_port),
@@ -477,6 +594,8 @@ def main() -> int:
         "COLLECT_DISABLE_SEMANTIC_SCHOLAR": (
             "1" if args.collect_disable_semantic_scholar else ""
         ),
+        "RUN_LOGS_DIR": os.path.join(output_root, "logs"),
+        "SCHEDULER_STATE_DIR": os.path.join(output_root, "scheduler_state"),
     }
     if args.instructions_file and os.path.isfile(args.instructions_file):
         cpu_env["INSTRUCTIONS_FILE"] = os.path.abspath(args.instructions_file)
@@ -485,9 +604,10 @@ def main() -> int:
 
     cpu_env.update(_publisher_env_from_os())
 
-    grader_hosts_ready = len(grader_urls) >= 1
-    if gpu_host and docling_host and grader_hosts_ready:
-        dep_ids = [gpu_job_id, docling_job_id, grader_job_ids[0]]
+    gpu_hosts_ready = len(gpu_urls) >= 1 or bool(gpu_job_ids)
+    grader_hosts_ready = len(grader_urls) >= 1 or bool(grader_job_ids)
+    if gpu_host and docling_host and grader_hosts_ready and gpu_hosts_ready:
+        dep_ids = [gpu_job_ids[0], docling_job_id, grader_job_ids[0]]
         dep = ":".join(dep_ids)
         cpu_log = os.path.join(logs_root, "auto_lit_cpu_%j.log")
         cpu_job_id = _sbatch(
@@ -505,13 +625,16 @@ def main() -> int:
             "GPU and/or Docling and/or Grader node name not available. Submit the CPU job manually "
             "after all GPU jobs are RUNNING:"
         )
-        all_gpu_jobs = ",".join([gpu_job_id, docling_job_id, *grader_job_ids])
+        all_gpu_jobs = ",".join([*gpu_job_ids, docling_job_id, *grader_job_ids])
         print(f"  squeue -j {all_gpu_jobs}   # then note the NODELIST values")
         export_str = (
             f"DATA_ROOT={args.data_root},"
             f"PAPER_IDS_PATH={os.path.abspath(args.paper_ids)},"
             f"OUTPUT_ROOT={output_root},"
             f"GPU_HOST=<LLM_NODELIST>,"
+            f"GPU_URLS=<http://host0:{args.gpu_port}>,"
+            f"GPU_JOB_IDS=<job_id:job_id:...>,"
+            f"NUM_SYNTHESIS_NODES={args.num_synthesis_nodes},"
             f"GPU_API_PORT={args.gpu_port},"
             f"DOCLING_HOST=<DOCLING_NODELIST>,"
             f"DOCLING_API_PORT={args.docling_port},"
@@ -539,7 +662,7 @@ def main() -> int:
             export_str += "," + ",".join(f"{k}={v}" for k, v in _extra.items())
         first_grader = grader_job_ids[0] if grader_job_ids else "<GRADER_JOB_ID>"
         print(
-            f"  sbatch --dependency=after:{gpu_job_id}:{docling_job_id}:{first_grader} "
+            f"  sbatch --dependency=after:{gpu_job_ids[0]}:{docling_job_id}:{first_grader} "
             f"--export=ALL,{export_str} {cpu_script}"
         )
 

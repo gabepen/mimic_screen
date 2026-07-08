@@ -12,10 +12,20 @@ class GradedPaper(BaseModel):
     paper_id: str
     file_name: str
     paper_role: Optional[str] = None
-    relevance_grade: float  # computed server-side from rubric_dimension_scores
-    rubric_dimension_scores: Dict[str, float]
+    grading_schema_version: int = 2
+    relevance_grade: float  # legacy 0..1 sort key; derived from weighted axis totals
+    relevance_sort: int = 0  # primary-axis weighted total (readable integer rank key)
+    paper_grade: str = ""  # e.g. 12/26 across all scored criteria
+    primary_grade: str = ""  # e.g. 4/12 on primary relevance axis
+    criterion_scores: Dict[str, Any] = Field(default_factory=dict)
+    axis_totals: Dict[str, Any] = Field(default_factory=dict)
+    rubric_dimension_scores: Dict[str, float] = Field(default_factory=dict)
     rubric_axis_rationales: Dict[str, str] = Field(default_factory=dict)
-    rationale: str = ""  # optional brief cross-axis summary
+    mention_type: Optional[str] = None
+    infection_naive: Optional[bool] = None
+    no_meaningful_mention: bool = False
+    claim_summary: str = ""
+    rationale: str = ""
     rubric_tags: Dict[str, str] = Field(default_factory=dict)
     model_output: Optional[str] = None
     notes: Optional[str] = None
