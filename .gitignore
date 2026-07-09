@@ -4,8 +4,11 @@
 **/*.db
 data/nltk_data/corpora/
 
-# publisher tokens (sourced by literature_analysis_launcher.sh)
+# publisher tokens (sourced by launchers/run_lit_*.sh)
 .env.publishers
+
+# legacy local launchers (use pipelines/auto_lit/launchers/ + pipelines/auto_lit/configs/)
+literature_*.sh
 
 # python cache
 **/__pycache__

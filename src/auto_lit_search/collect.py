@@ -25,6 +25,8 @@ import pandas as pd
 import requests
 from loguru import logger
 
+from auto_lit_search.env_config import auto_lit_data_root
+
 try:
     from .ucsc_paper_collection_tools import (
         download_elsevier_article_pdf,
@@ -2172,7 +2174,7 @@ def _iter_paper_ids_from_search_df(df: pd.DataFrame) -> Iterable[Tuple[str, str]
 
 def run(
     df_or_path,
-    data_root: str = "/private/groups/corbettlab/gabe/auto_lit_eval_data",
+    data_root: str | None = None,
     batch_size: int = 500,
     max_papers: Optional[int] = None,
     delete_pdf_after_text: bool = False,
@@ -2199,6 +2201,8 @@ def run(
     Returns:
         DataFrame of DownloadRecord rows.
     """
+    if data_root is None:
+        data_root = str(auto_lit_data_root())
     os.makedirs(data_root, exist_ok=True)
     pdf_dir = os.path.join(data_root, "pdf")
     text_dir = os.path.join(data_root, "text")
@@ -2608,8 +2612,9 @@ def main() -> int:
     )
     parser.add_argument(
         "--data-root",
-        default="/private/groups/corbettlab/gabe/auto_lit_eval_data",
-        help="Shared data root with pdf/, text/, llm_queue/, logs/ (default: %(default)s).",
+        default=None,
+        help="Shared data root with pdf/, text/, llm_queue/, logs/ "
+        "(default: AUTO_LIT_DATA_ROOT or sibling auto_lit_eval_data checkout).",
     )
     parser.add_argument(
         "--batch-size",

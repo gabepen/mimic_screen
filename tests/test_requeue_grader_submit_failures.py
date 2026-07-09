@@ -1,4 +1,4 @@
-"""Tests for scripts/requeue_grader_submit_failures.py"""
+"""Tests for pipelines/auto_lit/scripts/requeue_grader_submit_failures.py"""
 
 from __future__ import annotations
 
@@ -7,7 +7,7 @@ import sys
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(REPO_ROOT / "scripts"))
+sys.path.insert(0, str(REPO_ROOT / "pipelines" / "auto_lit" / "scripts"))
 
 from requeue_grader_submit_failures import requeue_grader_submit_failures  # noqa: E402
 

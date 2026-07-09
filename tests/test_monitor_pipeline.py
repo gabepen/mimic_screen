@@ -1,4 +1,4 @@
-"""Unit tests for scripts/monitor_pipeline.py (pure helpers)."""
+"""Unit tests for pipelines/auto_lit/scripts/monitor_pipeline.py (pure helpers)."""
 
 from __future__ import annotations
 
@@ -10,7 +10,7 @@ from pathlib import Path
 import pytest
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(REPO_ROOT / "scripts"))
+sys.path.insert(0, str(REPO_ROOT / "pipelines" / "auto_lit" / "scripts"))
 
 import monitor_pipeline as mp  # noqa: E402
 

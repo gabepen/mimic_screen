@@ -1,0 +1,13 @@
+cluster:
+  repo_root: auto
+  pipeline_root: auto
+  mamba_bin: ${MAMBA_BIN}
+  conda_env: evorate
+  model_dir: ${MODEL_DIR}
+  grader_model_dir: ${GRADER_MODEL_DIR}
+  logs_dir: ${AUTO_LIT_DATA_ROOT}/logs
+  containers:
+    gpu: docker://gabrielpenun/lit-llm:amd64
+    docling: docker://gabrielpenun/docling_gpu:amd64
+    grader: docker://gabrielpenun/lit-llm:amd64
+    cpu: docker://gabrielpenun/lit-download:amd64

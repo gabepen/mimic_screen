@@ -3,9 +3,13 @@
 from __future__ import annotations
 
 import json
+import sys
 from pathlib import Path
 
-from scripts.fix_it_synthesis import _needs_fix, _verify_synthesis_results
+REPO_ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(REPO_ROOT / "pipelines" / "auto_lit" / "scripts"))
+
+from fix_it_synthesis import _needs_fix, _verify_synthesis_results  # noqa: E402
 
 
 def _valid_synthesis_text() -> str:

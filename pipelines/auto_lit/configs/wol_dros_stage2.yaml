@@ -1,0 +1,29 @@
+extends: cluster_ucsc.yaml
+dataset: wol-dros-v1
+data_root: ${AUTO_LIT_DATA_ROOT}
+
+stage2:
+  output_root: llm_results/wol-dros-v1
+  host_rubric: rubrics/drosophila_host_rubric_v1.json
+  microbe_rubric: rubrics/wolbachia_wmel_rubric_v1.json
+  instructions_file: prompts/wol_dros_instructions.txt
+  slurm:
+    num_grader_nodes: 10
+    num_synthesis_nodes: 2
+    grader_script: slurm/gpu_grader_a5500.slurm
+    gpu_port: 9000
+    docling_port: 9100
+    grader_port: 9200
+  collection:
+    org: ucsc
+    auth_scope: email_only
+    collector_email: ${COLLECTOR_EMAIL}
+    max_workers: 4
+    disable_semantic_scholar: true
+  runtime_env:
+    SERVICE_HEALTH_WAIT_SECONDS: "900"
+    DOCLING_INFLIGHT_CAP: "2"
+    SCHEDULER_TICK_SECONDS: "5"
+    STAGE_WATCHDOG_SECONDS: "3600"
+    GRADER_PAPER_WORKERS: "1"
+    VLLM_MAX_NUM_SEQS: "1"

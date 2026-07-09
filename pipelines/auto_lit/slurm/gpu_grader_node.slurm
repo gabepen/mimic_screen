@@ -1,0 +1,84 @@
+#!/bin/bash
+#SBATCH --job-name=auto-lit-grader
+#SBATCH --partition=gpu
+#SBATCH --gres=gpu:A100:1
+#SBATCH --cpus-per-task=8
+#SBATCH --mem=64G
+#SBATCH --time=86:00:00
+#SBATCH --output=auto_lit_grader_%j.log
+
+set -euo pipefail
+set -x
+
+: "${DATA_ROOT:?DATA_ROOT must be set}"
+: "${MODEL_DIR:?MODEL_DIR must be set}"
+: "${OUTPUT_ROOT:?OUTPUT_ROOT must be set}"
+: "${GRADER_API_PORT:=9200}"
+: "${GRADER_MAX_TOKENS:=4096}"
+: "${GRADER_PAPER_WORKERS:=3}"
+: "${VLLM_MAX_NUM_SEQS:=4}"
+: "${GRADER_IMAGE:?GRADER_IMAGE must be set (e.g. docker://user/auto-lit-gpu:latest or path to .sif)}"
+
+REPO_ROOT="${REPO_ROOT:-$PWD}"
+VLLM_PORT="${VLLM_PORT:-8000}"
+
+singularity exec --nv \
+    -B "${DATA_ROOT}:${DATA_ROOT}" \
+    -B "${MODEL_DIR}:${MODEL_DIR}" \
+    -B "${OUTPUT_ROOT}:${OUTPUT_ROOT}" \
+    -B "${REPO_ROOT}:${REPO_ROOT}" \
+    "${GRADER_IMAGE}" \
+    bash -c "
+set -euo pipefail
+
+export PYTHONPATH=\"${REPO_ROOT}/src:\${PYTHONPATH:-}\"
+export VLLM_MODEL_NAME=\"\${VLLM_MODEL_NAME:-qwen3}\"
+
+PY=\"\${AUTO_LIT_PYTHON:-python3.11}\"
+\"\$PY\" -c \"import sys; print('PYTHON', sys.executable, sys.version)\"
+
+vllm serve \"${MODEL_DIR}\" \
+    --served-model-name qwen3 \
+    --port \"${VLLM_PORT}\" \
+    --max-model-len 131072 \
+    --max-num-seqs \"${VLLM_MAX_NUM_SEQS}\" \
+    --reasoning-parser qwen3 \
+    --trust-remote-code &
+
+VLLM_PID=\$!
+
+for i in \$(seq 1 60); do
+    if \"\$PY\" - << 'PY' 2>/dev/null; then break; fi
+import os
+import socket
+import sys
+
+host = '127.0.0.1'
+port = int(os.environ.get('VLLM_PORT', '8000'))
+s = socket.socket()
+s.settimeout(1)
+try:
+    s.connect((host, port))
+    s.close()
+    sys.exit(0)
+except Exception:
+    sys.exit(1)
+PY
+    if [ \$? -eq 0 ]; then
+        break
+    fi
+    sleep 2
+done
+
+export VLLM_BASE_URL=\"http://127.0.0.1:${VLLM_PORT}\"
+export GRADER_API_PORT=\"${GRADER_API_PORT}\"
+export GRADER_MAX_TOKENS=\"${GRADER_MAX_TOKENS}\"
+export GRADER_PAPER_WORKERS=\"${GRADER_PAPER_WORKERS}\"
+export GRADER_SKIP_SYNTHESIS=\"${GRADER_SKIP_SYNTHESIS:-1}\"
+
+\"\$PY\" -m uvicorn auto_lit_search.grader_server:app --host 0.0.0.0 --port \"${GRADER_API_PORT}\"
+
+kill \"\${VLLM_PID}\" || true
+wait \"\${VLLM_PID}\" 2>/dev/null || true
+"
+

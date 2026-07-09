@@ -1,0 +1,14 @@
+extends: cluster_ucsc.yaml
+dataset: lp-human-all
+data_root: ${AUTO_LIT_DATA_ROOT}
+
+stage1:
+  alignments_csv: inputs/lp-human-all_alignments.csv
+  search_output_dir: search_results
+  query_taxid: 272624
+  target_taxid: 9606
+  query_col: query
+  target_col: target
+  no_cache: false
+  run_mapping: true
+  run_search: true
