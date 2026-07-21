@@ -1031,10 +1031,43 @@ def _grade_alignment_sync(req: GradeAlignmentRequest) -> RunAlignmentResponse:
         ),
     }
     paper_workers = _grader_paper_workers()
+    graded_path = os.path.join(req.output_root, f"{req.alignment_id}_graded.json")
+    reuse_existing = env_flag("GRADER_REUSE_EXISTING", False)
+    existing_by_file: Dict[str, GradedPaper] = {}
+    if reuse_existing and os.path.isfile(graded_path):
+        try:
+            with open(graded_path, encoding="utf-8") as f:
+                prev = json.load(f)
+            for row in prev.get("graded_papers") or []:
+                if not isinstance(row, dict):
+                    continue
+                fname = str(row.get("file_name") or "").strip()
+                if not fname:
+                    continue
+                try:
+                    existing_by_file[fname] = GradedPaper(**row)
+                except Exception:
+                    continue
+            logger.info(
+                "Grader {}: GRADER_REUSE_EXISTING loaded {} prior grades",
+                req.alignment_id,
+                len(existing_by_file),
+            )
+        except Exception as e:
+            logger.warning(
+                "Grader {}: could not load existing graded.json for reuse: {}",
+                req.alignment_id,
+                e,
+            )
+            existing_by_file = {}
+
+    files_to_grade = [f for f in files if f not in existing_by_file]
     logger.info(
-        "Grader {}: grading {} papers with {} parallel workers",
+        "Grader {}: grading {}/{} papers (reuse={}) with {} parallel workers",
         req.alignment_id,
+        len(files_to_grade),
         len(files),
+        reuse_existing,
         paper_workers,
     )
 
@@ -1052,12 +1085,12 @@ def _grade_alignment_sync(req: GradeAlignmentRequest) -> RunAlignmentResponse:
         )
         return fname, gp, retry_meta
 
-    graded_by_file: Dict[str, GradedPaper] = {}
+    graded_by_file: Dict[str, GradedPaper] = dict(existing_by_file)
     n_repair_attempted = 0
     n_repair_succeeded = 0
     n_regrade_retry_used = 0
     if paper_workers <= 1:
-        for fname in files:
+        for fname in files_to_grade:
             _, gp, retry_meta = _grade_one(fname)
             graded_by_file[fname] = gp
             n_repair_attempted += int(retry_meta.get("repair_attempted", 0))
@@ -1065,7 +1098,7 @@ def _grade_alignment_sync(req: GradeAlignmentRequest) -> RunAlignmentResponse:
             n_regrade_retry_used += int(retry_meta.get("regrade_retry_used", 0))
     else:
         with ThreadPoolExecutor(max_workers=paper_workers) as pool:
-            futures = {pool.submit(_grade_one, fname): fname for fname in files}
+            futures = {pool.submit(_grade_one, fname): fname for fname in files_to_grade}
             for fut in as_completed(futures):
                 fname = futures[fut]
                 try:
@@ -1082,7 +1115,7 @@ def _grade_alignment_sync(req: GradeAlignmentRequest) -> RunAlignmentResponse:
                 n_repair_attempted += int(retry_meta.get("repair_attempted", 0))
                 n_repair_succeeded += int(retry_meta.get("repair_succeeded", 0))
                 n_regrade_retry_used += int(retry_meta.get("regrade_retry_used", 0))
-    graded = [graded_by_file[fname] for fname in files]
+    graded = [graded_by_file[fname] for fname in files if fname in graded_by_file]
 
     def _parse_fallback_paper(g: GradedPaper) -> bool:
         rationale = str(g.rationale or "").strip()
@@ -1101,7 +1134,6 @@ def _grade_alignment_sync(req: GradeAlignmentRequest) -> RunAlignmentResponse:
     )
 
     _ensure_dir(req.output_root)
-    graded_path = os.path.join(req.output_root, f"{req.alignment_id}_graded.json")
     grading_meta: Dict[str, Any] = {
         "grading_schema_version": GRADING_SCHEMA_VERSION,
         "grader_model": os.environ.get("VLLM_MODEL_NAME", "unknown"),
@@ -1109,6 +1141,9 @@ def _grade_alignment_sync(req: GradeAlignmentRequest) -> RunAlignmentResponse:
         "microbe_rubric_path": req.microbe_rubric_path,
         "graded_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         "n_papers": len(graded),
+        "n_reused_grades": len(existing_by_file),
+        "n_newly_graded": len(files_to_grade),
+        "grader_reuse_existing": reuse_existing,
         "llm_enabled": llm_enabled,
         "n_llm_exceptions": n_llm_exceptions,
         "n_without_model_output": n_without_model_output,

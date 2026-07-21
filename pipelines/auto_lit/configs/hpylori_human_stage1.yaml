@@ -1,0 +1,14 @@
+extends: cluster_ucsc.yaml
+dataset: hpylori-human-all
+data_root: ${AUTO_LIT_DATA_ROOT}
+
+stage1:
+  alignments_csv: alignment_input/new_results/helicobacter_human_best.csv
+  search_output_dir: search_results
+  query_taxid: 210
+  target_taxid: 9606
+  query_col: query
+  target_col: target
+  no_cache: false
+  run_mapping: true
+  run_search: true

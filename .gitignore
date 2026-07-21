@@ -4,11 +4,15 @@
 **/*.db
 data/nltk_data/corpora/
 
-# publisher tokens (sourced by literature_analysis_launcher.sh)
+# publisher tokens (sourced by launchers/run_lit_*.sh)
 .env.publishers
+
+# legacy local launchers (use pipelines/auto_lit/launchers/ + pipelines/auto_lit/configs/)
+literature_*.sh
 
 # python cache
 **/__pycache__
+*.egg-info/
 
 # evorate_workflow outputs
 /evorate_workflow/*outputs/
@@ -25,3 +29,6 @@ data/nltk_data/corpora/
 
 # taxon selection outputs
 /src/taxon_selection/*.csv
+
+# dev run books
+/pipelines/auto_lit/docs

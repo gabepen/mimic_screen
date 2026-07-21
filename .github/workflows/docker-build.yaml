@@ -25,7 +25,7 @@ jobs:
       - name: Build and push
         run: |
           docker build --platform linux/amd64 \
-            -f containers/${{ github.event.inputs.dockerfile }} \
+            -f pipelines/auto_lit/containers/${{ github.event.inputs.dockerfile }} \
             -t ${{ vars.DOCKERHUB_REPO }}/${{ github.event.inputs.tag }} \
-            .
+            pipelines/auto_lit/containers
           docker push ${{ vars.DOCKERHUB_REPO }}/${{ github.event.inputs.tag }}

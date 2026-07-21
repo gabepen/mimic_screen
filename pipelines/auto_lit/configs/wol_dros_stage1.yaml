@@ -1,0 +1,14 @@
+extends: cluster_ucsc.yaml
+dataset: wol-dros-v1
+data_root: ${AUTO_LIT_DATA_ROOT}
+
+stage1:
+  alignments_csv: inputs/wol-dros-v1_alignments.csv
+  search_output_dir: search_results
+  query_taxid: 295747
+  target_taxid: 7227
+  query_col: query
+  target_col: target
+  no_cache: false
+  run_mapping: true
+  run_search: true

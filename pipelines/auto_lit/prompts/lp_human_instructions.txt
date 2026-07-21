@@ -1,0 +1,58 @@
+You are analyzing scientific literature for a host–microbe protein pair in
+Legionella pneumophila (microbe/query) and Homo sapiens (host/target).
+
+Research questions for this system:
+1) Host exploitation: Is there literature support that the human (target) gene
+   product participates in infection-, immunity-, virulence-, or
+   pathogen-interaction–relevant processes that Legionella could exploit?
+2) Query effector biology: Is there literature support that the Legionella
+   (query) gene product acts as an effector / secreted / host-targeting factor
+   (or otherwise has virulence-relevant activity)?
+3) Mimicry / manipulation plausibility: Score TWO independent positive signals
+   (do not require both):
+   (a) Query-side molecular mimicry — literature establishes that the Legionella
+       product mimics a eukaryotic fold, catalytic strategy, or pathway
+       regulator (e.g. F-box/SCF, Sec7/GEF, SET/HMT, kinase-pathway mimic,
+       PNPLA/phospholipase catalysis of eukaryotic substrates). Score ≥80 even
+       if the Foldseek host gene is not the published substrate.
+   (b) Pair/pathway plausibility — Foldseek structural similarity plus host
+       pathway overlap with the query effector’s biochemistry (typically
+       40–79) without requiring co-mention of both genes.
+   Score <40 only when neither (a) nor useful pathway overlap is supported.
+4) Pair priority: How strongly should this pair be prioritized for follow-up
+   relative to typical structural-similarity hits?
+
+Pair context (always apply):
+- This alignment was included because the query and target proteins share
+  structural similarity (Foldseek-selected pair).
+- Do not require papers to describe a direct query–target interaction or
+  co-mention; that is rare.
+- Base your conclusion on: (1) structural similarity as the pairing rationale,
+  (2) rubric evidence that the target participates in virulence, host
+  manipulation, or pathways Legionella exploits, and (3) rubric evidence that
+  the query is a relevant effector / secretion / host-targeting factor,
+  including published molecular-mimicry mechanisms when present.
+- Semi-positive conclusions are appropriate when host papers show strong
+  infection_process_relevance or exploitation-pathway overlap, or when microbe
+  papers support effector biology—even without both genes named together.
+- Do not reduce mimicry_plausibility_score because the Foldseek host gene is
+  not named with the effector; note that only under main_uncertainties.
+- Query-side published molecular mimicry is Strong for Q3 even when host
+  infection literature for the Foldseek partner is sparse.
+- Do not treat “no direct interaction in text” as a reason for near-zero scores
+  if pathway-level evidence or query mimetic mechanism exists.
+- Do not frame this pair as Helicobacter pylori, Wolbachia, or Drosophila;
+  use Legionella pneumophila and Homo sapiens only.
+
+Per-paper work (batched):
+1. Summarize how each paper bears on the query or target gene (role is
+   indicated per file).
+2. Use rubric axis scores, grader reasoning, and rubric_tags when present.
+
+Final pair conclusion:
+- Write a running discussion addressing the research questions above, citing
+  which papers and axis patterns support or weaken the case.
+- Distinguish host exploitation pathway support from molecular mimicry
+  plausibility; credit query-side mimetic mechanisms under Q3.
+- End with Quick results summary as a JSON object with integer scores 0–100
+  (see synthesis prompt schema). Do not use None/Minimal/Some/High labels.
