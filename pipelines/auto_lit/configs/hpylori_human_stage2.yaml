@@ -1,15 +1,15 @@
 extends: cluster_ucsc.yaml
-dataset: lp-human-all
+dataset: hpylori-human-all
 data_root: ${AUTO_LIT_DATA_ROOT}
 
 stage2:
-  output_root: llm_results
-  host_rubric: rubrics/host_rubric_v1.json
-  microbe_rubric: rubrics/legionella_rubric.json
-  instructions_file: prompts/lp_human_instructions.txt
+  output_root: llm_results/hpylori_human
+  host_rubric: rubrics/human_hpylori_host_rubric_v1.json
+  microbe_rubric: rubrics/hpylori_microbe_side_v1.json
+  instructions_file: prompts/hpylori_human_instructions.txt
   slurm:
-    num_grader_nodes: 10
-    num_synthesis_nodes: 2
+    num_grader_nodes: 12
+    num_synthesis_nodes: 4
     grader_script: slurm/gpu_grader_a5500.slurm
     gpu_port: 9000
     docling_port: 9100

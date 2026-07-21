@@ -1,11 +1,38 @@
 # Auto-lit pipeline configs
 
 YAML configs drive stage1 (mapping + EPMC search) and stage2 (GPU + CPU analysis).
-Requires **PyYAML**: `pip install pyyaml` (or install in your `evorate` conda env).
 
 ## Setup
 
-1. Export required environment variables (no hardcoded paths in committed configs):
+### 1. Conda env for stage 1 (mapping + search on Slurm)
+
+Stage 1 cluster jobs run `mamba run -n <conda_env> python -m auto_lit_search.mapping`.
+That env must include stage 1 Python deps (not just `pip install -e .`).
+
+```bash
+export MAMBA_BIN=/path/to/miniforge3/bin/mamba   # your path
+
+mamba create -n auto_lit python=3.12 -y
+mamba activate auto_lit
+cd /path/to/mimic_screen
+pip install -e ".[auto-lit]"
+```
+
+`auto-lit` extra installs `mygene`, `lxml`, and `tqdm` (required by mapping; checked in `slurm/mapping_node.slurm`).
+
+Set the env name in [`cluster_ucsc.yaml`](cluster_ucsc.yaml):
+
+```yaml
+conda_env: auto_lit
+```
+
+Verify:
+
+```bash
+mamba run -n auto_lit python -c "import mygene, lxml; print('ok')"
+```
+
+### 2. Export required environment variables
 
    ```bash
    export AUTO_LIT_DATA_ROOT=/path/to/auto_lit_eval_data
@@ -17,9 +44,9 @@ Requires **PyYAML**: `pip install pyyaml` (or install in your `evorate` conda en
 
    Optional: `export SLURM_MAIL_USER="$COLLECTOR_EMAIL"` for job failure notifications.
 
-2. Copy [`cluster_ucsc.yaml`](cluster_ucsc.yaml) if you need site-specific container images or conda env name.
+3. Copy [`cluster_ucsc.yaml`](cluster_ucsc.yaml) if you need site-specific container images or conda env name.
 
-3. Optional publisher tokens in repo-root `.env.publishers` (gitignored):
+4. Optional publisher tokens in repo-root `.env.publishers` (gitignored):
 
    ```bash
    export ELS_API_KEY='...'
@@ -67,4 +94,23 @@ Override with explicit `stage2.paper_ids_json` / `stage2.idmap_csv` if needed.
 
 1. Duplicate `lp_human_stage1.yaml` / `lp_human_stage2.yaml`.
 2. Set `dataset`, `alignments_csv`, taxids, rubrics, `output_root`.
-3. Place alignment CSV under `{AUTO_LIT_DATA_ROOT}/inputs/`.
+3. Add a **system-specific** synthesis prompt under `prompts/` (copy an existing
+   `*_instructions.txt` and rewrite the research questions + organism framing).
+   There is no shared default prompt — `stage2.instructions_file` must point at
+   that file.
+4. Place alignment CSV under `{AUTO_LIT_DATA_ROOT}/inputs/`.
+
+### Synthesis prompts (required per system)
+
+| Config | Instructions |
+|--------|----------------|
+| `lp_human_stage2.yaml` | `prompts/lp_human_instructions.txt` |
+| `hpylori_human_stage2.yaml` | `prompts/hpylori_human_instructions.txt` |
+| `wol_dros_stage2.yaml` | `prompts/wol_dros_instructions.txt` |
+
+After changing instructions, re-run synthesis (grades can be reused):
+
+```bash
+./pipelines/auto_lit/launchers/run_lit_resynth.sh pipelines/auto_lit/configs/hpylori_human_stage2.yaml
+# (omit --failed-only to resynthesize all alignments)
+```

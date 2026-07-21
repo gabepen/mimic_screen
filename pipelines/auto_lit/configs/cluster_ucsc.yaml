@@ -2,7 +2,7 @@ cluster:
   repo_root: auto
   pipeline_root: auto
   mamba_bin: ${MAMBA_BIN}
-  conda_env: evorate
+  conda_env: auto_lit
   model_dir: ${MODEL_DIR}
   grader_model_dir: ${GRADER_MODEL_DIR}
   logs_dir: ${AUTO_LIT_DATA_ROOT}/logs

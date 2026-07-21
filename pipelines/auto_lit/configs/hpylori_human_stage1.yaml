@@ -1,11 +1,11 @@
 extends: cluster_ucsc.yaml
-dataset: lp-human-all
+dataset: hpylori-human-all
 data_root: ${AUTO_LIT_DATA_ROOT}
 
 stage1:
-  alignments_csv: inputs/lp-human-all_alignments.csv
+  alignments_csv: alignment_input/new_results/helicobacter_human_best.csv
   search_output_dir: search_results
-  query_taxids: [272624, 446]
+  query_taxid: 210
   target_taxid: 9606
   query_col: query
   target_col: target
