@@ -7,8 +7,10 @@ stage1:
   search_output_dir: search_results
   query_taxid: 210
   target_taxid: 9606
+  query_organism_terms: [Helicobacter pylori, Helicobacter]
+  target_organism_terms: [Homo sapiens, human]
   query_col: query
   target_col: target
-  no_cache: false
+  no_cache: true
   run_mapping: true
   run_search: true

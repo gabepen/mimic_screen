@@ -7,8 +7,10 @@ stage1:
   search_output_dir: search_results
   query_taxid: 295747
   target_taxid: 7227
+  query_organism_terms: [Wolbachia pipientis, Wolbachia]
+  target_organism_terms: [Drosophila melanogaster, Drosophila]
   query_col: query
   target_col: target
-  no_cache: false
+  no_cache: true
   run_mapping: true
   run_search: true
