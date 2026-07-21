@@ -16,7 +16,7 @@ set -euo pipefail
 REPO_ROOT="${REPO_ROOT:-$PWD}"
 PIPELINE_ROOT="${PIPELINE_ROOT:-${REPO_ROOT}}"
 PAPERS_ROOT="${PAPERS_ROOT:-${DATA_ROOT}/papers}"
-INSTRUCTIONS_FILE="${INSTRUCTIONS_FILE:-${PIPELINE_ROOT}/prompts/default_instructions.txt}"
+: "${INSTRUCTIONS_FILE:?INSTRUCTIONS_FILE must be set to a system-specific prompt}"
 WORKERS="${WORKERS:-1}"
 RESYNTH_ALL="${RESYNTH_ALL:-0}"
 
