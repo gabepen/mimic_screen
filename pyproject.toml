@@ -15,6 +15,14 @@ dependencies = [
     "loguru",
 ]
 
+[project.optional-dependencies]
+# Stage 1 Slurm jobs (mapping + EPMC search) and local CLI use.
+auto-lit = [
+    "mygene",
+    "lxml",
+    "tqdm",
+]
+
 [tool.setuptools.packages.find]
 where = ["src"]
 

@@ -12,6 +12,7 @@ literature_*.sh
 
 # python cache
 **/__pycache__
+*.egg-info/
 
 # evorate_workflow outputs
 /evorate_workflow/*outputs/
@@ -28,3 +29,6 @@ literature_*.sh
 
 # taxon selection outputs
 /src/taxon_selection/*.csv
+
+# dev run books
+/pipelines/auto_lit/docs
