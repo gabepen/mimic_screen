@@ -9,7 +9,7 @@ Runnable cluster pipeline for literature search, download, grading, and synthesi
 | [`slurm/`](slurm/) | Slurm job scripts |
 | [`scripts/`](scripts/) | Ops/maintenance CLIs (monitor, requeue, prune, …) |
 | [`containers/`](containers/) | Dockerfiles for GPU/CPU images |
-| [`prompts/`](prompts/) | Synthesis instruction templates |
+| [`prompts/`](prompts/) | System-specific synthesis research questions (no shared default) |
 | [`run_pipeline_slurm.py`](run_pipeline_slurm.py) | Stage2 Slurm submitter |
 
 **Library code** lives in [`src/auto_lit_search/`](../../src/auto_lit_search/) (importable Python modules).
@@ -19,7 +19,10 @@ Runnable cluster pipeline for literature search, download, grading, and synthesi
 From the **mimic_screen repo root**:
 
 ```bash
-pip install -e .   # optional; makes auto_lit_search importable
+# Conda env for stage 1 Slurm jobs (once)
+mamba create -n auto_lit python=3.12 -y
+mamba activate auto_lit
+pip install -e ".[auto-lit]"
 
 export AUTO_LIT_DATA_ROOT=/path/to/auto_lit_eval_data
 export COLLECTOR_EMAIL='you@ucsc.edu'
@@ -32,3 +35,5 @@ export GRADER_MODEL_DIR=/path/to/grader-model-weights
 ```
 
 See [`configs/README.md`](configs/README.md) for full config documentation.
+
+For symbol+alias search reruns and incremental stage2 sync after term fixes, see [`docs/symbol_alias_stage1_rerun.md`](docs/symbol_alias_stage1_rerun.md).
