@@ -1,0 +1,71 @@
+You are analyzing scientific literature for a host–microbe protein pair in
+Helicobacter pylori (microbe/query) and Homo sapiens (host/target).
+
+Research questions for this system (answer these; do not substitute a
+Legionella, Wolbachia, or generic pathogen framing):
+1) Host exploitation: Does the human (target) gene product participate in
+   gastric epithelial processes that H. pylori is known to exploit — e.g.
+   tyrosine phosphorylation / SH2 adapter recruitment, adherens or tight
+   junction regulation, apical–basal polarity, PI3K-Akt / MAPK / NF-κB,
+   apoptosis / autophagy, cytoskeletal remodelling, ubiquitin–proteasome
+   biology, inflammasome / cytokine regulation, DNA damage response, acid /
+   ion / mucus barrier biology — even if the paper never mentions H. pylori?
+2) Query effector biology: Does the H. pylori (query) gene product act as an
+   effector or host-targeting factor — secretion / Cag T4SS translocation or
+   surface exposure, gastric epithelial phenotypes (including junction /
+   polarity / “hummingbird” / barrier defects), colonisation or persistence
+   support, or other host-manipulation activity?
+3) Mimicry / manipulation plausibility: Score TWO independent positive signals
+   (do not require both):
+   (a) Query-side molecular mimicry — literature establishes that the H. pylori
+       product mimics a eukaryotic fold, catalytic strategy, or pathway
+       regulator. Score ≥80 even if the Foldseek host gene is not the published
+       substrate.
+   (b) Pair/pathway plausibility — Foldseek structural similarity plus host
+       pathway overlap with the query effector’s biochemistry (typically
+       40–79) without requiring co-mention of both genes.
+   Score <40 only when neither (a) nor useful pathway overlap is supported.
+4) Pair priority: How strongly should this pair be prioritized for follow-up
+   relative to typical structural-similarity hits in this system?
+
+Pair context (always apply):
+- This alignment was included because the query and target proteins share
+  structural similarity (Foldseek-selected pair).
+- H. pylori is an extracellular gastric coloniser that engages host cells via
+  adhesins and the Cag pathogenicity island Type IV secretion system. Do not
+  expect intracellular replication evidence; colonisation and epithelial-niche
+  phenotypes are the right microbe-side signals.
+- Most host papers will be infection-naive. Relevance is inferred from
+  functional overlap with H. pylori exploitation processes, not from infection
+  wording in the paper. Note when infection_naive applies.
+- Do not require papers to describe a direct query–target interaction or
+  co-mention; that is rare.
+- Semi-positive conclusions are appropriate when host papers show strong
+  infection_process_relevance / exploitation_process_overlap (or mimicry tags)
+  and/or microbe papers support effector / T4SS / epithelial-niche biology —
+  even without both genes named together.
+- Do not reduce mimicry_plausibility_score because the Foldseek host gene is
+  not named with the effector; note that only under main_uncertainties.
+- Query-side published molecular mimicry is Strong for Q3 even when host
+  infection literature for the Foldseek partner is sparse.
+- When the microbe-side stack is thin (<3 focal studies), weight host Axis 2
+  and mimicry_potential_flag more heavily and state that the conclusion is
+  driven primarily by host biology + predicted effector potential.
+- Surface mimicry_strong / mimicry_possible and novelty flags explicitly.
+- Do not frame this pair as Legionella pneumophila, Wolbachia, or Drosophila;
+  use Helicobacter pylori and human gastric epithelium only.
+
+Per-paper work (batched):
+1. Summarize how each paper bears on the query or target gene (role is
+   indicated per file).
+2. Use rubric axis scores, grader reasoning, and rubric_tags when present.
+
+Final pair conclusion:
+- Write a running discussion addressing the research questions above, citing
+  which papers and axis patterns support or weaken the case.
+- Distinguish host exploitation pathway support from molecular mimicry
+  plausibility; credit query-side mimetic mechanisms under Q3. Report
+  infection-naive inference as an epistemic caveat, not a near-zero score
+  reason by itself.
+- End with Quick results summary as a JSON object with integer scores 0–100
+  (see synthesis prompt schema). Do not use None/Minimal/Some/High labels.
