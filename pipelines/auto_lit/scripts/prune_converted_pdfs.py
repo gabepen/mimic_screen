@@ -27,6 +27,12 @@ from pathlib import Path
 
 _REPO = Path(__file__).resolve().parents[3]
 sys.path.insert(0, str(_REPO / "src"))
+from auto_lit_search.download_manifest import (  # noqa: E402
+    DOWNLOAD_MANIFEST_FILENAME,
+    _canonical_paper_stem,
+    _load_download_manifest,
+    _paper_has_usable_text,
+)
 from auto_lit_search.env_config import auto_lit_data_root  # noqa: E402
 
 # Matches download_node.py scheduler states.
@@ -50,6 +56,7 @@ class AlignmentSummary:
     bytes_deleted: int = 0
     pdfs_kept_no_txt: int = 0
     pdfs_kept_bytes: int = 0
+    manifest_rows_updated: int = 0
 
 
 @dataclass
@@ -103,12 +110,39 @@ def _scheduler_looks_active(scheduler_state_dir: Path, alignment_id: str) -> boo
     return state in ACTIVE_SCHEDULER_STATES
 
 
-def _nonempty_txt_stems(papers_dir: Path) -> set[str]:
-    stems: set[str] = set()
-    for txt_path in papers_dir.glob("*.txt"):
-        if txt_path.is_file() and txt_path.stat().st_size > 0:
-            stems.add(txt_path.stem)
-    return stems
+def _clear_deleted_pdfs_from_manifest(
+    papers_dir: Path,
+    deleted_stems: set[str],
+) -> int:
+    manifest_path = papers_dir / DOWNLOAD_MANIFEST_FILENAME
+    if not deleted_stems or not manifest_path.is_file():
+        return 0
+
+    manifest_map = _load_download_manifest(str(manifest_path))
+    deleted_canonical = {_canonical_paper_stem(stem) for stem in deleted_stems}
+    updated = 0
+    for row in manifest_map.values():
+        pdf_path = str(row.get("pdf_path") or "")
+        if not pdf_path:
+            continue
+        row_stem = Path(pdf_path).stem
+        if (
+            row_stem not in deleted_stems
+            and _canonical_paper_stem(row_stem) not in deleted_canonical
+        ):
+            continue
+        row["pdf_path"] = None
+        row["pdf_docling_required"] = False
+        details = row.get("details")
+        if isinstance(details, dict):
+            details["pdf_docling_required"] = False
+        updated += 1
+
+    if updated:
+        with manifest_path.open("w", encoding="utf-8") as manifest:
+            for row in manifest_map.values():
+                manifest.write(json.dumps(row, ensure_ascii=False) + "\n")
+    return updated
 
 
 def _prune_alignment(
@@ -122,12 +156,12 @@ def _prune_alignment(
     if not pdf_dir.is_dir():
         return summary
 
-    txt_stems = _nonempty_txt_stems(papers_dir)
+    deleted_stems: set[str] = set()
     for pdf_path in sorted(pdf_dir.glob("*.pdf")):
         if not pdf_path.is_file() or pdf_path.stat().st_size <= 0:
             continue
         size = pdf_path.stat().st_size
-        if pdf_path.stem not in txt_stems:
+        if not _paper_has_usable_text(str(papers_dir), pdf_path.stem):
             summary.pdfs_kept_no_txt += 1
             summary.pdfs_kept_bytes += size
             continue
@@ -135,12 +169,18 @@ def _prune_alignment(
         summary.bytes_deleted += size
         if delete:
             pdf_path.unlink()
+            deleted_stems.add(pdf_path.stem)
 
-    if delete and pdf_dir.is_dir() and not any(pdf_dir.iterdir()):
-        try:
-            pdf_dir.rmdir()
-        except OSError:
-            pass
+    if delete:
+        summary.manifest_rows_updated = _clear_deleted_pdfs_from_manifest(
+            papers_dir,
+            deleted_stems,
+        )
+        if pdf_dir.is_dir() and not any(pdf_dir.iterdir()):
+            try:
+                pdf_dir.rmdir()
+            except OSError:
+                pass
 
     return summary
 
@@ -216,10 +256,13 @@ def _print_summary(run: RunSummary, *, delete: bool) -> None:
         kept = ""
         if item.pdfs_kept_no_txt:
             kept = f", kept {item.pdfs_kept_no_txt} PDF(s) without .txt ({_format_gib(item.pdfs_kept_bytes)})"
+        manifest = ""
+        if item.manifest_rows_updated:
+            manifest = f", updated {item.manifest_rows_updated} manifest row(s)"
         verb = "deleted" if delete else "would delete"
         print(
             f"  {item.alignment_id}: {verb} {item.pdfs_deleted} PDF(s) "
-            f"({_format_gib(item.bytes_deleted)}){kept}"
+            f"({_format_gib(item.bytes_deleted)}){kept}{manifest}"
         )
 
 
