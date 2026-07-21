@@ -130,6 +130,8 @@ class Stage1Config:
     target_taxid: int
     query_taxids: tuple[int, ...]
     target_taxids: tuple[int, ...]
+    query_organism_terms: tuple[str, ...]
+    target_organism_terms: tuple[str, ...]
     query_col: str
     target_col: str
     no_cache: bool
@@ -332,6 +334,24 @@ def load_stage1_config(
     query_taxids = _taxids("query")
     target_taxids = _taxids("target")
 
+    def _organism_terms(side: str) -> tuple[str, ...]:
+        raw_values = stage1.get(f"{side}_organism_terms")
+        if raw_values is None:
+            return ()
+        if isinstance(raw_values, (list, tuple)):
+            values = raw_values
+        elif isinstance(raw_values, str):
+            values = raw_values.split("|")
+        else:
+            raise ValueError(f"stage1.{side}_organism_terms must be a list or string")
+        return tuple(
+            dict.fromkeys(
+                value
+                for raw_value in values
+                if (value := str(raw_value).strip())
+            )
+        )
+
     return Stage1Config(
         config_path=path,
         dataset=dataset,
@@ -346,6 +366,8 @@ def load_stage1_config(
         target_taxid=target_taxids[0],
         query_taxids=query_taxids,
         target_taxids=target_taxids,
+        query_organism_terms=_organism_terms("query"),
+        target_organism_terms=_organism_terms("target"),
         query_col=str(stage1.get("query_col") or "query"),
         target_col=str(stage1.get("target_col") or "target"),
         no_cache=bool(stage1.get("no_cache", False)),

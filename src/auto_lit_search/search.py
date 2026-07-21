@@ -687,8 +687,35 @@ def _organism_query_clause(taxids: TaxidInput) -> Optional[str]:
     return "(" + " OR ".join(f"ORGANISM_ID:{value}" for value in values) + ")"
 
 
+def _normalize_organism_terms(terms: Optional[Sequence[str]]) -> Tuple[str, ...]:
+    if not terms:
+        return ()
+    return tuple(
+        dict.fromkeys(
+            value
+            for raw in terms
+            if (value := str(raw).strip())
+        )
+    )
+
+
+def _organism_text_query_clause(
+    organism_terms: Optional[Sequence[str]],
+) -> Optional[str]:
+    terms = _normalize_organism_terms(organism_terms)
+    if not terms:
+        return None
+    clauses = []
+    for term in terms:
+        escaped = term.replace('"', '\\"')
+        clauses.append(f'(TITLE_ABS:"{escaped}" OR BODY:"{escaped}")')
+    return "(" + " OR ".join(clauses) + ")"
+
+
 def _build_europepmc_text_query_from_terms(
-    id_terms: List[Tuple[str, str]], taxid: TaxidInput
+    id_terms: List[Tuple[str, str]],
+    taxid: TaxidInput,
+    organism_terms: Optional[Sequence[str]] = None,
 ) -> Tuple[Optional[str], List[str]]:
     # Dedupe/clean terms and force title/abstract scoped text search.
     cleaned_terms = _clean_europepmc_text_terms(id_terms)
@@ -712,6 +739,9 @@ def _build_europepmc_text_query_from_terms(
     organism_clause = _organism_query_clause(taxid)
     if organism_clause:
         query = f"{query} AND {organism_clause}"
+    organism_text_clause = _organism_text_query_clause(organism_terms)
+    if organism_text_clause:
+        query = f"{query} AND {organism_text_clause}"
 
     id_types_used = [kind for (kind, _val) in cleaned_terms]
     return query, id_types_used
@@ -869,7 +899,14 @@ def _run_europepmc_search_query(
         data = resp.json()
     except Exception as e:
         logger.warning(f"Europe PMC search failed for query={query!r}: {e}")
-        result = {"dois": [], "titles": [], "hit_count": 0, "n_raw": 0, "truncated": False}
+        result = {
+            "dois": [],
+            "titles": [],
+            "hit_count": 0,
+            "n_raw": 0,
+            "truncated": False,
+            "request_ok": False,
+        }
         cache[query] = result
         return result
     finally:
@@ -900,6 +937,7 @@ def _run_europepmc_search_query(
         "hit_count": hit_count,
         "n_raw": len(records),
         "truncated": hit_count > int(params["pageSize"]),
+        "request_ok": True,
     }
     cache[query] = result
     return result
@@ -916,6 +954,7 @@ def _attribute_result_ids_to_terms(
     *,
     pass_name: str,
     taxid: TaxidInput,
+    organism_terms: Optional[Sequence[str]] = None,
     session: requests.Session,
     cache: Dict[str, Dict[str, List[str]]],
     delay: float,
@@ -936,8 +975,13 @@ def _attribute_result_ids_to_terms(
 
     hits: Dict[str, List[Dict[str, Any]]] = {}
     normalized_taxids = _normalize_taxids(taxid)
+    normalized_organism_terms = _normalize_organism_terms(organism_terms)
     for kind, term in _clean_europepmc_text_terms(id_terms):
-        query, _ = _build_europepmc_text_query_from_terms([(kind, term)], taxid)
+        query, _ = _build_europepmc_text_query_from_terms(
+            [(kind, term)],
+            taxid,
+            organism_terms=normalized_organism_terms,
+        )
         if not query:
             continue
         response = _run_europepmc_search_query(query, session, cache, delay=delay)
@@ -948,6 +992,7 @@ def _attribute_result_ids_to_terms(
                     "kind": kind,
                     "pass": pass_name,
                     "taxids": list(normalized_taxids),
+                    "organism_terms": list(normalized_organism_terms),
                     "scope": "TITLE_ABS_OR_BODY",
                 }
             )
@@ -967,6 +1012,7 @@ def _merge_term_hit_maps(
                 record.get("kind"),
                 record.get("pass"),
                 tuple(record.get("taxids") or []),
+                tuple(record.get("organism_terms") or []),
             )
             for record in existing
         }
@@ -976,6 +1022,7 @@ def _merge_term_hit_maps(
                 record.get("kind"),
                 record.get("pass"),
                 tuple(record.get("taxids") or []),
+                tuple(record.get("organism_terms") or []),
             )
             if key not in seen:
                 seen.add(key)
@@ -985,10 +1032,11 @@ def _merge_term_hit_maps(
 def _summarize_term_hits(
     paper_term_hits: Dict[str, List[Dict[str, Any]]],
 ) -> List[Dict[str, Any]]:
-    counts: Dict[Tuple[str, str, str, Tuple[int, ...]], int] = {}
-    display: Dict[Tuple[str, str, str, Tuple[int, ...]], str] = {}
+    HitKey = Tuple[str, str, str, Tuple[int, ...], Tuple[str, ...]]
+    counts: Dict[HitKey, int] = {}
+    display: Dict[HitKey, str] = {}
     for records in paper_term_hits.values():
-        per_paper: set[Tuple[str, str, str, Tuple[int, ...]]] = set()
+        per_paper: set[HitKey] = set()
         for record in records:
             term = str(record.get("term") or "")
             key = (
@@ -996,6 +1044,7 @@ def _summarize_term_hits(
                 str(record.get("kind") or ""),
                 str(record.get("pass") or ""),
                 tuple(record.get("taxids") or []),
+                tuple(record.get("organism_terms") or []),
             )
             display.setdefault(key, term)
             per_paper.add(key)
@@ -1007,6 +1056,7 @@ def _summarize_term_hits(
             "kind": key[1],
             "pass": key[2],
             "taxids": list(key[3]),
+            "organism_terms": list(key[4]),
             "n_papers": count,
         }
         for key, count in sorted(
@@ -1023,6 +1073,7 @@ def run_europepmc_search_for_row(
     delay: float = 0.35,
     prefix: str = "query",
     extra_terms: Optional[List[str]] = None,
+    organism_terms: Optional[Sequence[str]] = None,
 ) -> Dict[str, Any]:
     """
     Run a Europe PMC search for a single mapping row.
@@ -1086,8 +1137,11 @@ def run_europepmc_search_for_row(
     pass2_overlap_n = 0
     pass2_base_effective_taxid = taxid
     pass2_synonym_effective_taxid = taxid
+    pass2_base_effective_organism_terms: Tuple[str, ...] = ()
+    pass2_synonym_effective_organism_terms: Tuple[str, ...] = ()
     organism_fallbacks: List[Dict[str, Any]] = []
     row_taxids = _normalize_taxids(taxid)
+    row_organism_terms = _normalize_organism_terms(organism_terms)
 
     def _record_organism_fallback(
         pass_name: str,
@@ -1100,6 +1154,8 @@ def run_europepmc_search_for_row(
             "prefix": prefix,
             "row_label": row_label,
             "dropped_taxids": list(row_taxids),
+            "fallback_scope": "organism_text",
+            "organism_terms": list(row_organism_terms),
             "terms": term_strs,
             "hit_count": int(result.get("hit_count") or 0),
             "n_raw": int(result.get("n_raw") or 0),
@@ -1108,12 +1164,14 @@ def run_europepmc_search_for_row(
         }
         organism_fallbacks.append(info)
         logger.warning(
-            "[{}] Europe PMC {} fell back to NO organism filter for row={!r}: "
-            "dropped_taxids={} terms={} hit_count={} kept={} truncated={}",
+            "[{}] Europe PMC {} fell back from organism taxids to organism-name "
+            "text for row={!r}: dropped_taxids={} organism_terms={} terms={} "
+            "hit_count={} kept={} truncated={}",
             prefix,
             pass_name,
             row_label,
             info["dropped_taxids"],
+            info["organism_terms"],
             info["terms"][:8],
             info["hit_count"],
             info["n_kept"],
@@ -1135,13 +1193,22 @@ def run_europepmc_search_for_row(
         r2_base = _run_europepmc_search_query(q2_base, session, cache, delay=delay)
         pass2_base_dois = list(r2_base["dois"])
         pass2_base_n = len(pass2_base_dois)
-        if pass2_base_n == 0 and row_taxids:
-            q2_base_alt, q2_base_alt_types = _build_europepmc_text_query_pass2_base_only(
-                row, None, prefix=prefix
+        if (
+            pass2_base_n == 0
+            and row_taxids
+            and row_organism_terms
+            and bool(r2_base.get("request_ok"))
+            and int(r2_base.get("hit_count") or 0) == 0
+        ):
+            q2_base_alt, q2_base_alt_types = _build_europepmc_text_query_from_terms(
+                pass2_base_terms,
+                None,
+                organism_terms=row_organism_terms,
             )
             if q2_base_alt:
                 logger.debug(
-                    f"Europe PMC pass2-base retry without ORGANISM_ID (orig taxid={taxid}) ids={q2_base_alt_types}"
+                    f"Europe PMC pass2-base retry with organism-name text "
+                    f"(orig taxid={taxid}) ids={q2_base_alt_types}"
                 )
                 r2_base_alt = _run_europepmc_search_query(
                     q2_base_alt, session, cache, delay=delay
@@ -1149,6 +1216,7 @@ def run_europepmc_search_for_row(
                 pass2_base_dois = list(r2_base_alt["dois"])
                 pass2_base_n = len(pass2_base_dois)
                 pass2_base_effective_taxid = None
+                pass2_base_effective_organism_terms = row_organism_terms
                 _record_organism_fallback("pass2_base", pass2_base_terms, r2_base_alt)
 
     if q2_syn:
@@ -1159,13 +1227,22 @@ def run_europepmc_search_for_row(
         r2_syn = _run_europepmc_search_query(q2_syn, session, cache, delay=delay)
         pass2_synonym_dois = list(r2_syn["dois"])
         pass2_synonym_n = len(pass2_synonym_dois)
-        if pass2_synonym_n == 0 and row_taxids:
-            q2_syn_alt, q2_syn_alt_types = _build_europepmc_text_query_pass2_synonym_only(
-                None, extra_terms=extra_terms
+        if (
+            pass2_synonym_n == 0
+            and row_taxids
+            and row_organism_terms
+            and bool(r2_syn.get("request_ok"))
+            and int(r2_syn.get("hit_count") or 0) == 0
+        ):
+            q2_syn_alt, q2_syn_alt_types = _build_europepmc_text_query_from_terms(
+                pass2_synonym_terms,
+                None,
+                organism_terms=row_organism_terms,
             )
             if q2_syn_alt:
                 logger.debug(
-                    f"Europe PMC pass2-synonym retry without ORGANISM_ID (orig taxid={taxid}) ids={q2_syn_alt_types}"
+                    f"Europe PMC pass2-synonym retry with organism-name text "
+                    f"(orig taxid={taxid}) ids={q2_syn_alt_types}"
                 )
                 r2_syn_alt = _run_europepmc_search_query(
                     q2_syn_alt, session, cache, delay=delay
@@ -1173,31 +1250,41 @@ def run_europepmc_search_for_row(
                 pass2_synonym_dois = list(r2_syn_alt["dois"])
                 pass2_synonym_n = len(pass2_synonym_dois)
                 pass2_synonym_effective_taxid = None
+                pass2_synonym_effective_organism_terms = row_organism_terms
                 _record_organism_fallback("pass2_synonym", pass2_synonym_terms, r2_syn_alt)
 
     paper_term_hits: Dict[str, List[Dict[str, Any]]] = {}
     unattributed_by_pass: Dict[str, List[str]] = {}
     attribution_jobs = (
-        ("pass1", pass1_dois, pass1_terms, None),
+        ("pass1", pass1_dois, pass1_terms, None, ()),
         (
             "pass2_base",
             pass2_base_dois,
             pass2_base_terms,
             pass2_base_effective_taxid,
+            pass2_base_effective_organism_terms,
         ),
         (
             "pass2_synonym",
             pass2_synonym_dois,
             pass2_synonym_terms,
             pass2_synonym_effective_taxid,
+            pass2_synonym_effective_organism_terms,
         ),
     )
-    for pass_name, paper_ids, terms, effective_taxid in attribution_jobs:
+    for (
+        pass_name,
+        paper_ids,
+        terms,
+        effective_taxid,
+        effective_organism_terms,
+    ) in attribution_jobs:
         attributed, unresolved = _attribute_result_ids_to_terms(
             paper_ids,
             terms,
             pass_name=pass_name,
             taxid=effective_taxid,
+            organism_terms=effective_organism_terms,
             session=session,
             cache=cache,
             delay=delay,
@@ -1328,6 +1415,8 @@ def run(
     target_taxid: Optional[int] = None,
     query_taxids: Optional[Sequence[int]] = None,
     target_taxids: Optional[Sequence[int]] = None,
+    query_organism_terms: Optional[Sequence[str]] = None,
+    target_organism_terms: Optional[Sequence[str]] = None,
     output_dir: str = ".",
     delay: float = 0.35,
     use_cache: bool = True,
@@ -1356,6 +1445,10 @@ def run(
             query_taxid when provided.
         target_taxids: Ordered target-organism taxids searched together. Overrides
             target_taxid when provided.
+        query_organism_terms: Organism names required by the query-side text
+            fallback when taxid-constrained pass2 finds no matches.
+        target_organism_terms: Organism names required by the target-side text
+            fallback when taxid-constrained pass2 finds no matches.
         output_dir: Directory for logs and cache file (search_cache.json).
         use_cache: If True, load cache at start (if exists) and save at end.
         accession_text_overlap: If set, overrides env ``AUTO_LIT_ACCESSION_REQUIRES_TEXT_OVERLAP``.
@@ -1575,6 +1668,7 @@ def run(
                 text_cache,
                 prefix="query",
                 extra_terms=gene_synonyms_by_entrez.get(q_entrez_id or -1, []),
+                organism_terms=query_organism_terms,
             )
             q_search_terms = list(text_res_query.get("search_terms") or [])
             q_paper_term_hits = dict(text_res_query.get("paper_term_hits") or {})
@@ -1698,6 +1792,7 @@ def run(
                 text_cache,
                 prefix="target",
                 extra_terms=gene_synonyms_by_entrez.get(t_entrez_id or -1, []),
+                organism_terms=target_organism_terms,
             )
             t_search_terms = list(text_res_target.get("search_terms") or [])
             t_paper_term_hits = dict(text_res_target.get("paper_term_hits") or {})
@@ -1879,14 +1974,14 @@ def run(
         n_truncated = sum(1 for e in fb_events if e.get("truncated"))
         hit_counts = sorted((int(e.get("hit_count") or 0) for e in fb_events), reverse=True)
         logger.info(
-            "Unscoped organism fallback fired {} time(s): {} returned >200 hits "
+            "Organism-name text fallback fired {} time(s): {} returned >200 hits "
             "(truncated at pageSize). Largest hit_counts: {}",
             len(fb_events),
             n_truncated,
             hit_counts[:15],
         )
     else:
-        logger.info("Unscoped organism fallback never fired this run")
+        logger.info("Organism-name text fallback never fired this run")
 
     return result_df
 
@@ -2092,6 +2187,24 @@ def main() -> int:
         help="Comma-separated target-organism taxids searched together (overrides --target-taxid).",
     )
     parser.add_argument(
+        "--query-organism-terms",
+        type=str,
+        default=None,
+        help=(
+            "Pipe-separated query-organism names used as a constrained text "
+            "fallback when taxid-scoped pass2 has zero matches."
+        ),
+    )
+    parser.add_argument(
+        "--target-organism-terms",
+        type=str,
+        default=None,
+        help=(
+            "Pipe-separated target-organism names used as a constrained text "
+            "fallback when taxid-scoped pass2 has zero matches."
+        ),
+    )
+    parser.add_argument(
         "--output-dir",
         type=str,
         default=None,
@@ -2142,6 +2255,12 @@ def main() -> int:
             parser.error("taxid lists must contain positive comma-separated integers")
         return list(dict.fromkeys(values))
 
+    def _parse_organism_terms(raw: Optional[str]) -> Optional[List[str]]:
+        if raw is None:
+            return None
+        values = [part.strip() for part in raw.split("|") if part.strip()]
+        return list(dict.fromkeys(values)) or None
+
     result_df = run(
         df,
         query_id_col=args.query_id_col,
@@ -2153,6 +2272,8 @@ def main() -> int:
         target_taxid=args.target_taxid,
         query_taxids=_parse_taxid_csv(args.query_taxids),
         target_taxids=_parse_taxid_csv(args.target_taxids),
+        query_organism_terms=_parse_organism_terms(args.query_organism_terms),
+        target_organism_terms=_parse_organism_terms(args.target_organism_terms),
         output_dir=output_dir,
         use_cache=not args.no_cache,
     )

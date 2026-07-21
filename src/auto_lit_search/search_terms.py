@@ -35,6 +35,36 @@ _METHOD_BLOCKLIST = frozenset(
     }
 )
 
+# Functional descriptions that are not gene symbols, even when an upstream
+# source exposes them through a gene-name or alias field.
+_GENERIC_FUNCTIONAL_TERMS = frozenset(
+    {
+        "atpase",
+        "dehydrogenase",
+        "enzyme",
+        "helicase",
+        "homodimer",
+        "homolog",
+        "homologue",
+        "hydrolase",
+        "kinase",
+        "ligase",
+        "methyltransferase",
+        "oxidase",
+        "peptidase",
+        "protein",
+        "protease",
+        "receptor",
+        "reductase",
+        "regulator",
+        "subunit",
+        "synthase",
+        "synthetase",
+        "transferase",
+        "transporter",
+    }
+)
+
 # Short all-letter symbols that match huge unrelated literature when searched alone.
 _SHORT_AMBIGUOUS_SYMBOLS = frozenset(
     {
@@ -115,6 +145,10 @@ def is_method_word(term: str) -> bool:
     return term.strip().lower() in _METHOD_BLOCKLIST
 
 
+def is_generic_functional_term(term: str) -> bool:
+    return term.strip().lower() in _GENERIC_FUNCTIONAL_TERMS
+
+
 def is_generic_protein_phrase(term: str) -> bool:
     s = term.strip()
     if not s:
@@ -182,6 +216,8 @@ def is_usable_search_term(
         return not s.isdigit()
 
     if is_method_word(s):
+        return False
+    if is_generic_functional_term(s):
         return False
 
     if kind_l in {"alias", "synonym"} and is_technical_alias(s):
@@ -256,6 +292,8 @@ def term_reject_reasons(term: Optional[str], *, kind: str = "synonym") -> list[s
         reasons.append("too_long")
     if is_method_word(s):
         reasons.append("method_word")
+    if is_generic_functional_term(s):
+        reasons.append("generic_functional_term")
     if is_generic_protein_phrase(s):
         reasons.append("generic_protein_phrase")
     if is_short_ambiguous_symbol(s):

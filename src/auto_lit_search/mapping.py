@@ -44,6 +44,7 @@ from .gene_symbols import (
     infer_gene_name_from_protein_description,
     prefer_gene_name_uniprot,
 )
+from .search_terms import filter_terms, is_usable_search_term
 
 logger.remove()
 
@@ -1158,16 +1159,29 @@ def run(df, query_col="query", target_col="target",
         except (ValueError, TypeError):
             return None
 
+    def _safe_gene_name(uid):
+        info = fallback_ids.get(uid, {})
+        gene_name = info.get("gene_name")
+        if is_usable_search_term(gene_name, kind="gene_name"):
+            return gene_name
+        locus_tag = info.get("locus_tag")
+        if is_usable_search_term(locus_tag, kind="locus_tag"):
+            return locus_tag
+        return None
+
+    def _safe_gene_aliases(uid):
+        primary = _safe_gene_name(uid)
+        aliases = filter_terms(
+            list(fallback_ids.get(uid, {}).get("gene_aliases") or []),
+            kind="alias",
+        )
+        return format_gene_aliases(aliases_excluding_primary(aliases, primary))
+
     result_df = df.copy()
     if query_col in result_df.columns:
         result_df["query_entrez_id"] = result_df[query_col].map(id_mapping)
-        result_df["query_gene_name"] = result_df[query_col].map(
-            lambda uid: fallback_ids.get(uid, {}).get("gene_name"))
-        result_df["query_gene_aliases"] = result_df[query_col].map(
-            lambda uid: format_gene_aliases(
-                fallback_ids.get(uid, {}).get("gene_aliases")
-            )
-        )
+        result_df["query_gene_name"] = result_df[query_col].map(_safe_gene_name)
+        result_df["query_gene_aliases"] = result_df[query_col].map(_safe_gene_aliases)
         result_df["query_locus_tag"] = result_df[query_col].map(
             lambda uid: fallback_ids.get(uid, {}).get("locus_tag"))
         result_df["query_genbank_acc"] = result_df[query_col].map(
@@ -1184,13 +1198,8 @@ def run(df, query_col="query", target_col="target",
         result_df["query_common_name"] = q_fb.combine_first(q_desc)
     if target_col in result_df.columns:
         result_df["target_entrez_id"] = result_df[target_col].map(id_mapping)
-        result_df["target_gene_name"] = result_df[target_col].map(
-            lambda uid: fallback_ids.get(uid, {}).get("gene_name"))
-        result_df["target_gene_aliases"] = result_df[target_col].map(
-            lambda uid: format_gene_aliases(
-                fallback_ids.get(uid, {}).get("gene_aliases")
-            )
-        )
+        result_df["target_gene_name"] = result_df[target_col].map(_safe_gene_name)
+        result_df["target_gene_aliases"] = result_df[target_col].map(_safe_gene_aliases)
         result_df["target_locus_tag"] = result_df[target_col].map(
             lambda uid: fallback_ids.get(uid, {}).get("locus_tag"))
         result_df["target_genbank_acc"] = result_df[target_col].map(

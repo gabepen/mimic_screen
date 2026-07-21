@@ -94,6 +94,8 @@ stage1:
   search_output_dir: search_results
   query_taxids: [272624, 446]
   target_taxid: 9606
+  query_organism_terms: [Legionella pneumophila, Legionella]
+  target_organism_terms: [Homo sapiens, human]
 """,
         encoding="utf-8",
     )
@@ -108,6 +110,8 @@ stage1:
     assert cfg.query_taxids == (272624, 446)
     assert cfg.target_taxid == 9606
     assert cfg.target_taxids == (9606,)
+    assert cfg.query_organism_terms == ("Legionella pneumophila", "Legionella")
+    assert cfg.target_organism_terms == ("Homo sapiens", "human")
 
 
 def test_load_stage2_derived_paths(tmp_path: Path):

@@ -23,6 +23,8 @@ NO_CACHE="${NO_CACHE:-}"
 ACCESSION_TEXT_OVERLAP="${ACCESSION_TEXT_OVERLAP:-}"
 QUERY_TAXIDS="${QUERY_TAXIDS:-${QUERY_TAXID}}"
 TARGET_TAXIDS="${TARGET_TAXIDS:-${TARGET_TAXID}}"
+QUERY_ORGANISM_TERMS="${QUERY_ORGANISM_TERMS:-}"
+TARGET_ORGANISM_TERMS="${TARGET_ORGANISM_TERMS:-}"
 
 export PYTHONPATH="${REPO_ROOT}/src:${PYTHONPATH:-}"
 export PYTHONUNBUFFERED=1
@@ -32,6 +34,8 @@ echo "search_node: INPUT_IDMAP_CSV=${INPUT_IDMAP_CSV}"
 echo "search_node: OUTPUT_SEARCH_JSON=${OUTPUT_SEARCH_JSON}"
 echo "search_node: OUTPUT_DIR=${OUTPUT_DIR}"
 echo "search_node: QUERY_TAXIDS=${QUERY_TAXIDS} TARGET_TAXIDS=${TARGET_TAXIDS}"
+echo "search_node: QUERY_ORGANISM_TERMS=${QUERY_ORGANISM_TERMS}"
+echo "search_node: TARGET_ORGANISM_TERMS=${TARGET_ORGANISM_TERMS}"
 echo "search_node: QUERY_COL=${QUERY_COL} TARGET_COL=${TARGET_COL}"
 echo "search_node: CONDA_ENV=${CONDA_ENV}"
 
@@ -59,6 +63,12 @@ PY_ARGS=(
     --query-taxids "${QUERY_TAXIDS}"
     --target-taxids "${TARGET_TAXIDS}"
 )
+if [[ -n "${QUERY_ORGANISM_TERMS}" ]]; then
+    PY_ARGS+=(--query-organism-terms "${QUERY_ORGANISM_TERMS}")
+fi
+if [[ -n "${TARGET_ORGANISM_TERMS}" ]]; then
+    PY_ARGS+=(--target-organism-terms "${TARGET_ORGANISM_TERMS}")
+fi
 if [[ "${NO_CACHE}" == "1" ]]; then
     PY_ARGS+=(--no-cache)
 fi

@@ -102,6 +102,7 @@ _GENERIC_PROTEIN_NAME_ENDS = frozenset(
         "system", "factor", "membrane", "synthase", "peptidase", "lipase",
         "ligase", "reductase", "dehydrogenase", "oxidase", "subunit",
         "component", "type", "chain",
+        "atpase", "homodimer",
     }
 )
 
@@ -120,6 +121,8 @@ def is_symbol_like_token(token: Optional[str]) -> bool:
     if len(s) < 3 or len(s) > 24:
         return False
     if not re.match(r"^[A-Za-z][A-Za-z0-9\-]*$", s):
+        return False
+    if s.lower() in _GENERIC_PROTEIN_NAME_ENDS:
         return False
     if any(ch.isdigit() for ch in s):
         return True

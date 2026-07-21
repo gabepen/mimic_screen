@@ -42,6 +42,34 @@ def test_doi_attribution_precedence_and_unscoped_fallback():
         assert diff_stage1_runs._doi_attribution(search, "query", doi) == category
 
 
+def test_organism_name_fallback_is_still_scoped():
+    search = {
+        "query_sources": {},
+        "query_term_hits": {
+            "attributed": [
+                {
+                    "pass": "pass2_base",
+                    "taxids": [],
+                    "organism_terms": ["Legionella"],
+                }
+            ],
+        },
+        "query_unattributed": {"pass2_base": ["combined-only"]},
+        "query_fallbacks": [
+            {
+                "pass": "pass2_base",
+                "n_kept": 2,
+                "organism_terms": ["Legionella"],
+            }
+        ],
+    }
+    for doi in ("attributed", "combined-only"):
+        assert (
+            diff_stage1_runs._doi_attribution(search, "query", doi)
+            == "organism_scoped_text"
+        )
+
+
 def test_fallback_metrics_distinguish_page_truncation_from_kept_count():
     search = {
         "query_fallbacks": [
@@ -68,4 +96,5 @@ def test_fallback_metrics_distinguish_page_truncation_from_kept_count():
         "n_kept": 154,
         "max_hit_count": 957,
         "taxid_sets": "272624,446",
+        "organism_term_sets": "",
     }

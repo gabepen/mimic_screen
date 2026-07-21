@@ -63,6 +63,12 @@ def test_rejects_generic_protein_phrases():
     assert not is_usable_search_term("Iron regulatory protein 1B", kind="common_name")
 
 
+def test_rejects_generic_functional_terms():
+    for term in ("ATPase", "peptidase", "homodimer", "methyltransferase"):
+        assert not is_usable_search_term(term, kind="gene_name"), term
+        assert not is_usable_search_term(term, kind="alias"), term
+
+
 def test_keeps_cg_and_accessions():
     assert is_usable_search_term("CG3861", kind="synonym")
     assert is_usable_search_term("Dmel_CG3861", kind="locus_tag")
@@ -173,6 +179,8 @@ def test_symbol_like_token_rejects_description_words():
         "Oxidoreductase",
         "Glycosyltransferase",
         "containing",
+        "ATPase",
+        "homodimer",
         "III",
         "an",
     ):
@@ -244,6 +252,7 @@ def test_term_hit_attribution_records_exact_matching_term(monkeypatch):
             "kind": "alias",
             "pass": "pass2_base",
             "taxids": [7227],
+            "organism_terms": [],
             "n_papers": 2,
         },
         {
@@ -251,23 +260,32 @@ def test_term_hit_attribution_records_exact_matching_term(monkeypatch):
             "kind": "gene_name",
             "pass": "pass2_base",
             "taxids": [7227],
+            "organism_terms": [],
             "n_papers": 1,
         },
     ]
 
 
-def test_organism_fallback_is_tracked_with_hit_size(monkeypatch):
+def test_taxid_fallback_requires_organism_name_text(monkeypatch):
     def fake_search(query, _session, _cache, delay=0):
-        # Scoped queries (with an organism filter) return nothing, forcing the
-        # unscoped retry; the unscoped query returns a large truncated set.
         if "ORGANISM_ID" in query:
-            return {"dois": [], "titles": [], "hit_count": 0, "n_raw": 0, "truncated": False}
+            return {
+                "dois": [],
+                "titles": [],
+                "hit_count": 0,
+                "n_raw": 0,
+                "truncated": False,
+                "request_ok": True,
+            }
+        assert 'TITLE_ABS:"Legionella"' in query
+        assert "ORGANISM_ID" not in query
         return {
             "dois": ["doi:a", "doi:b"],
             "titles": ["a", "b"],
-            "hit_count": 4321,
-            "n_raw": 200,
-            "truncated": True,
+            "hit_count": 2,
+            "n_raw": 2,
+            "truncated": False,
+            "request_ok": True,
         }
 
     monkeypatch.setattr(search_module, "_run_europepmc_search_query", fake_search)
@@ -280,13 +298,50 @@ def test_organism_fallback_is_tracked_with_hit_size(monkeypatch):
         }
     )
     res = search_module.run_europepmc_search_for_row(
-        row, [272624, 446], session=object(), cache={}, prefix="query", delay=0
+        row,
+        [272624, 446],
+        session=object(),
+        cache={},
+        prefix="query",
+        delay=0,
+        organism_terms=["Legionella pneumophila", "Legionella"],
     )
 
     fallbacks = res["organism_fallbacks"]
     assert len(fallbacks) >= 1
     base = next(f for f in fallbacks if f["pass"] == "pass2_base")
     assert base["dropped_taxids"] == [272624, 446]
-    assert base["hit_count"] == 4321
-    assert base["truncated"] is True
+    assert base["fallback_scope"] == "organism_text"
+    assert base["organism_terms"] == ["Legionella pneumophila", "Legionella"]
+    assert base["hit_count"] == 2
+    assert base["truncated"] is False
     assert base["n_kept"] == 2
+    assert all(
+        hit["organism_terms"] == ["Legionella pneumophila", "Legionella"]
+        for hit in res["paper_term_hits"]["doi:a"]
+    )
+
+
+def test_failed_taxid_request_does_not_trigger_fallback(monkeypatch):
+    def fake_search(_query, _session, _cache, delay=0):
+        return {
+            "dois": [],
+            "titles": [],
+            "hit_count": 0,
+            "n_raw": 0,
+            "truncated": False,
+            "request_ok": False,
+        }
+
+    monkeypatch.setattr(search_module, "_run_europepmc_search_query", fake_search)
+    row = pd.Series({"query": "Q5ZSQ2", "query_gene_name": "sidD"})
+    result = search_module.run_europepmc_search_for_row(
+        row,
+        [272624, 446],
+        session=object(),
+        cache={},
+        prefix="query",
+        delay=0,
+        organism_terms=["Legionella"],
+    )
+    assert result["organism_fallbacks"] == []
