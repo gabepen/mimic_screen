@@ -34,6 +34,7 @@ from auto_lit_search.synthesis_scorecard import (
     build_conclusion,
     format_fallback_discussion,
     merge_synthesis_repair,
+    mimicry_flag_handling_block,
     quick_summary_prompt_footer,
     quick_summary_repair_prompt,
     quick_summary_retry_suffix,
@@ -380,14 +381,22 @@ def _chunk_items(items: List[Any], chunk_size: int) -> List[List[Any]]:
 def _synthesis_pair_context_block() -> str:
     return (
         "Pair context (apply to all synthesis steps):\n"
-        "- This query–target pair was selected for structural similarity; do not expect "
-        "papers to report explicit mimicry or direct query–target interaction.\n"
+        "- This query–target pair was selected for structural similarity; do not "
+        "require papers to report co-mention or a direct query–target interaction.\n"
         "- Semi-positive conclusions are appropriate when the target shows strong "
         "host-side rubric support (e.g. infection/symbiosis/interaction-relevant axes) "
         "and/or the query shows effector, secretion, persistence, or host-targeting "
         "evidence—even if genes are never named together.\n"
-        "- Separate literature support for manipulation or symbiont-relevant potential "
-        "from proof of mimicry.\n\n"
+        "- Mimicry plausibility has two independent positive signals:\n"
+        "  (1) Query-side molecular mimicry of a eukaryotic fold, catalytic strategy, "
+        "or pathway regulator (score ≥80 even if Foldseek host ≠ published substrate);\n"
+        "  (2) Pair/pathway plausibility from structural similarity + host pathway "
+        "overlap with the query effector’s biochemistry (typically 40–79 without "
+        "co-mention).\n"
+        "- Do not penalize mimicry_plausibility because the Foldseek host gene is "
+        "unnamed with the effector; put that only in main_uncertainties.\n"
+        "- Separate host exploitation / symbiont-relevant pathway support from "
+        "molecular mimicry plausibility in the discussion.\n\n"
     )
 
 
@@ -869,9 +878,12 @@ def run_alignment_graded(
     synth_prompt = (
         f"{req.instructions}\n\n"
         f"{_synthesis_pair_context_block()}"
+        f"{mimicry_flag_handling_block(host_rubric)}"
         f"{term_block}\n\n"
         "You are in final pair-level synthesis. Bridge host (target) exploitation evidence "
-        "with query (microbe) effector evidence. Do not require co-mention of both genes.\n\n"
+        "with query (microbe) effector evidence. Do not require co-mention of both genes.\n"
+        "Credit query-side published molecular mimicry under mimicry_plausibility "
+        "(≥80) even when the Foldseek host is not the published substrate.\n\n"
         f"Host track summary ({len(host_pool)} papers, {host_batch_count} batches):\n"
         f"{host_running_summary or '(no host papers in synthesis pool)'}\n\n"
         f"Query track summary ({len(query_pool)} papers, {query_batch_count} batches):\n"
