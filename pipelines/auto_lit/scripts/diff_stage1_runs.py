@@ -161,13 +161,22 @@ def _doi_attribution(search: Dict[str, Any], side: str, doi: str) -> str:
         return "unscoped_text"
 
     unattributed = search.get(f"{side}_unattributed") or {}
-    fallback_passes = {
-        str(event.get("pass") or "")
+    fallback_events = [
+        event
         for event in search.get(f"{side}_fallbacks") or []
         if int(event.get("n_kept") or 0) > 0
-    }
+    ]
     for pass_name, dois in unattributed.items():
-        if doi in (dois or []) and pass_name in fallback_passes:
+        if doi not in (dois or []):
+            continue
+        matching = [
+            event
+            for event in fallback_events
+            if str(event.get("pass") or "") == pass_name
+        ]
+        if any(event.get("organism_terms") for event in matching):
+            return "organism_scoped_text"
+        if matching:
             return "unscoped_text"
     return "unattributed"
 
@@ -189,6 +198,13 @@ def _fallback_metrics(search: Dict[str, Any], side: str) -> Dict[str, Any]:
         }
         - {""}
     )
+    organism_term_sets = sorted(
+        {
+            "|".join(str(term) for term in event.get("organism_terms") or [])
+            for event in events
+            if event.get("organism_terms")
+        }
+    )
     return {
         "events": len(events),
         "retained_events": len(retained),
@@ -198,6 +214,7 @@ def _fallback_metrics(search: Dict[str, Any], side: str) -> Dict[str, Any]:
             (int(event.get("hit_count") or 0) for event in events), default=0
         ),
         "taxid_sets": ";".join(taxid_sets),
+        "organism_term_sets": ";".join(organism_term_sets),
     }
 
 
@@ -316,12 +333,14 @@ def diff_runs(
                 "query_fallback_n_kept": q_fallback["n_kept"],
                 "query_fallback_max_hit_count": q_fallback["max_hit_count"],
                 "query_fallback_dropped_taxid_sets": q_fallback["taxid_sets"],
+                "query_fallback_organism_term_sets": q_fallback["organism_term_sets"],
                 "target_fallback_events": t_fallback["events"],
                 "target_fallback_retained_events": t_fallback["retained_events"],
                 "target_fallback_truncated_events": t_fallback["truncated_events"],
                 "target_fallback_n_kept": t_fallback["n_kept"],
                 "target_fallback_max_hit_count": t_fallback["max_hit_count"],
                 "target_fallback_dropped_taxid_sets": t_fallback["taxid_sets"],
+                "target_fallback_organism_term_sets": t_fallback["organism_term_sets"],
             }
         )
         doi_rows.append(
@@ -396,6 +415,16 @@ def _write_md(
                     if value
                 }
             ),
+            "organism_term_sets": sorted(
+                {
+                    value
+                    for r in rows
+                    for value in str(
+                        r[f"{side}_fallback_organism_term_sets"]
+                    ).split(";")
+                    if value
+                }
+            ),
         }
 
     query_fallback = _fallback_summary("query")
@@ -444,24 +473,26 @@ def _write_md(
         "`unattributed` means the combined query returned the DOI but the audit "
         "queries could not assign it to a specific direct/scoped/identifier source.",
         "",
-        "## Organism-fallback risk in the new search",
+        "## Organism-name fallback in the new search",
         "",
         "| side | alignments fallback fired | alignments retained fallback papers | "
         "alignments with truncated fallback | fallback events | truncated events | "
-        "sum n_kept | largest raw hit count | dropped taxid sets |",
-        "|---|---:|---:|---:|---:|---:|---:|---:|---|",
+        "sum n_kept | largest raw hit count | dropped taxid sets | organism terms |",
+        "|---|---:|---:|---:|---:|---:|---:|---:|---|---|",
         f"| query | {query_fallback['alignments']} | "
         f"{query_fallback['retained_alignments']} | "
         f"{query_fallback['truncated_alignments']} | "
         f"{query_fallback['events']} | {query_fallback['truncated_events']} | "
         f"{query_fallback['n_kept']} | {query_fallback['max_hit_count']} | "
-        f"{', '.join(query_fallback['taxid_sets']) or 'none'} |",
+        f"{', '.join(query_fallback['taxid_sets']) or 'none'} | "
+        f"{', '.join(query_fallback['organism_term_sets']) or 'none'} |",
         f"| target | {target_fallback['alignments']} | "
         f"{target_fallback['retained_alignments']} | "
         f"{target_fallback['truncated_alignments']} | "
         f"{target_fallback['events']} | {target_fallback['truncated_events']} | "
         f"{target_fallback['n_kept']} | {target_fallback['max_hit_count']} | "
-        f"{', '.join(target_fallback['taxid_sets']) or 'none'} |",
+        f"{', '.join(target_fallback['taxid_sets']) or 'none'} | "
+        f"{', '.join(target_fallback['organism_term_sets']) or 'none'} |",
         "",
         "`truncated` means Europe PMC reported more than the 200-record page size. "
         "`n_kept` is after filtering and can therefore be below 200.",

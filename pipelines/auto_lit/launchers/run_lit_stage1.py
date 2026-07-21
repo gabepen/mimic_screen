@@ -54,6 +54,9 @@ def run_stage1(cfg: Stage1Config) -> int:
     logs_dir = cfg.cluster.logs_dir
     logs_dir.mkdir(parents=True, exist_ok=True)
     cfg.search_output_dir.mkdir(parents=True, exist_ok=True)
+    work_root = cfg.search_output_dir / "stage1_work" / cfg.dataset
+    mapping_work_dir = work_root / "mapping"
+    search_work_dir = work_root / "search"
 
     if cfg.run_mapping and not cfg.alignments_csv.is_file():
         print(f"Input alignment CSV not found: {cfg.alignments_csv}", file=sys.stderr)
@@ -69,11 +72,13 @@ def run_stage1(cfg: Stage1Config) -> int:
         "PIPELINE_ROOT": str(pipeline),
         "INPUT_CSV": str(cfg.alignments_csv),
         "OUTPUT_IDMAP_CSV": str(cfg.idmap_csv),
-        "OUTPUT_DIR": str(cfg.search_output_dir),
+        "OUTPUT_DIR": str(mapping_work_dir),
         "QUERY_TAXID": str(cfg.query_taxid),
         "TARGET_TAXID": str(cfg.target_taxid),
         "QUERY_TAXIDS": ",".join(str(value) for value in cfg.query_taxids),
         "TARGET_TAXIDS": ",".join(str(value) for value in cfg.target_taxids),
+        "QUERY_ORGANISM_TERMS": "|".join(cfg.query_organism_terms),
+        "TARGET_ORGANISM_TERMS": "|".join(cfg.target_organism_terms),
         "QUERY_COL": cfg.query_col,
         "TARGET_COL": cfg.target_col,
         "CONDA_ENV": cfg.cluster.conda_env,
@@ -86,11 +91,13 @@ def run_stage1(cfg: Stage1Config) -> int:
         "PIPELINE_ROOT": str(pipeline),
         "INPUT_IDMAP_CSV": str(cfg.idmap_csv),
         "OUTPUT_SEARCH_JSON": str(cfg.search_json),
-        "OUTPUT_DIR": str(cfg.search_output_dir),
+        "OUTPUT_DIR": str(search_work_dir),
         "QUERY_TAXID": str(cfg.query_taxid),
         "TARGET_TAXID": str(cfg.target_taxid),
         "QUERY_TAXIDS": ",".join(str(value) for value in cfg.query_taxids),
         "TARGET_TAXIDS": ",".join(str(value) for value in cfg.target_taxids),
+        "QUERY_ORGANISM_TERMS": "|".join(cfg.query_organism_terms),
+        "TARGET_ORGANISM_TERMS": "|".join(cfg.target_organism_terms),
         "QUERY_COL": cfg.query_col,
         "TARGET_COL": cfg.target_col,
         "CONDA_ENV": cfg.cluster.conda_env,
