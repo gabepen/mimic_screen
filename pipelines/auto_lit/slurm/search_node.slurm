@@ -21,6 +21,8 @@ CONDA_ENV="${CONDA_ENV:-evorate}"
 : "${MAMBA_BIN:?MAMBA_BIN must be set (export or set in cluster config)}"
 NO_CACHE="${NO_CACHE:-}"
 ACCESSION_TEXT_OVERLAP="${ACCESSION_TEXT_OVERLAP:-}"
+QUERY_TAXIDS="${QUERY_TAXIDS:-${QUERY_TAXID}}"
+TARGET_TAXIDS="${TARGET_TAXIDS:-${TARGET_TAXID}}"
 
 export PYTHONPATH="${REPO_ROOT}/src:${PYTHONPATH:-}"
 export PYTHONUNBUFFERED=1
@@ -29,7 +31,7 @@ echo "search_node: REPO_ROOT=${REPO_ROOT}"
 echo "search_node: INPUT_IDMAP_CSV=${INPUT_IDMAP_CSV}"
 echo "search_node: OUTPUT_SEARCH_JSON=${OUTPUT_SEARCH_JSON}"
 echo "search_node: OUTPUT_DIR=${OUTPUT_DIR}"
-echo "search_node: QUERY_TAXID=${QUERY_TAXID} TARGET_TAXID=${TARGET_TAXID}"
+echo "search_node: QUERY_TAXIDS=${QUERY_TAXIDS} TARGET_TAXIDS=${TARGET_TAXIDS}"
 echo "search_node: QUERY_COL=${QUERY_COL} TARGET_COL=${TARGET_COL}"
 echo "search_node: CONDA_ENV=${CONDA_ENV}"
 
@@ -54,6 +56,8 @@ PY_ARGS=(
     --target-id-col "${TARGET_COL}"
     --query-taxid "${QUERY_TAXID}"
     --target-taxid "${TARGET_TAXID}"
+    --query-taxids "${QUERY_TAXIDS}"
+    --target-taxids "${TARGET_TAXIDS}"
 )
 if [[ "${NO_CACHE}" == "1" ]]; then
     PY_ARGS+=(--no-cache)
