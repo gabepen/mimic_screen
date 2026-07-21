@@ -92,7 +92,7 @@ data_root: {data_root}
 stage1:
   alignments_csv: inputs/my-ds_alignments.csv
   search_output_dir: search_results
-  query_taxid: 272624
+  query_taxids: [272624, 446]
   target_taxid: 9606
 """,
         encoding="utf-8",
@@ -105,6 +105,9 @@ stage1:
     assert cfg.idmap_csv == data_root / "search_results" / "my-ds_idmap.csv"
     assert cfg.search_json == data_root / "search_results" / "my-ds_search.json"
     assert cfg.query_taxid == 272624
+    assert cfg.query_taxids == (272624, 446)
+    assert cfg.target_taxid == 9606
+    assert cfg.target_taxids == (9606,)
 
 
 def test_load_stage2_derived_paths(tmp_path: Path):
