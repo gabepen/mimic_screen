@@ -35,6 +35,16 @@ import requests.packages.urllib3.util.connection as urllib3_cn
 from loguru import logger
 from lxml import etree
 
+from .gene_symbols import (
+    aliases_excluding_primary,
+    collect_mygene_aliases,
+    first_uniprot_orf_name,
+    format_gene_aliases,
+    gene_aliases_from_uniprot_gene,
+    infer_gene_name_from_protein_description,
+    prefer_gene_name_uniprot,
+)
+
 logger.remove()
 
 logger.add(
@@ -201,11 +211,11 @@ def map_uniprot_to_entrez_mygene(uniprot_ids, cache_file=None, batch_size=1000):
 def map_mygene_fallback_identifiers(uniprot_ids, cache_file=None, batch_size=1000):
     """
     For UniProt IDs that have a MyGene.info record, fetch richer identifiers
-    (gene name, locus tag when MyGene exposes it, GenBank/RefSeq accessions, common name).
+    (gene symbol, aliases, locus tag, GenBank/RefSeq accessions).
 
-    This does NOT try to infer Entrez IDs; it is meant to complement
-    map_uniprot_to_entrez_mygene() by providing better fallback identifiers
-    for IDs that already map to MyGene.
+    MyGene ``name`` (official full name / description) is intentionally not
+    stored as ``common_name`` — those strings (e.g. FlyBase "knockdown") are
+    unsafe literature search terms.
 
     Returns:
         dict {uniprot_id: {
@@ -213,6 +223,7 @@ def map_mygene_fallback_identifiers(uniprot_ids, cache_file=None, batch_size=100
             "locus_tag":   str | None,
             "genbank_acc": str | None,
             "common_name": str | None,
+            "gene_aliases": list[str],
         }}
     """
     cache = _load_cache(cache_file)
@@ -258,7 +269,7 @@ def map_mygene_fallback_identifiers(uniprot_ids, cache_file=None, batch_size=100
             resp = mg.querymany(
                 batch,
                 scopes=["uniprot", "accession", "uniprot.Swiss-Prot", "uniprot.TrEMBL"],
-                fields="symbol,name,locus_tag,accession,refseq,summary",
+                fields="symbol,alias,locus_tag,accession,refseq",
                 species="all",
                 as_dataframe=False,
                 returnall=True,
@@ -269,15 +280,15 @@ def map_mygene_fallback_identifiers(uniprot_ids, cache_file=None, batch_size=100
                 if not qid:
                     continue
 
-                gene_name = result.get("symbol") or result.get("name")
+                gene_name = result.get("symbol")
+                if isinstance(gene_name, str):
+                    gene_name = gene_name.strip() or None
+                else:
+                    gene_name = None
                 locus_raw = result.get("locus_tag")
                 locus_tag = str(locus_raw).strip() if locus_raw is not None else None
                 if not locus_tag or locus_tag.lower() == "nan":
                     locus_tag = None
-
-                common_name = result.get("name")
-                if not common_name:
-                    common_name = result.get("summary")
 
                 genbank_acc = None
                 acc_val = result.get("accession")
@@ -292,7 +303,8 @@ def map_mygene_fallback_identifiers(uniprot_ids, cache_file=None, batch_size=100
                     "gene_name": gene_name,
                     "locus_tag": locus_tag,
                     "genbank_acc": genbank_acc,
-                    "common_name": common_name,
+                    "common_name": None,
+                    "gene_aliases": collect_mygene_aliases(result),
                 }
 
             for nf in resp.get("notfound", []):
@@ -302,6 +314,7 @@ def map_mygene_fallback_identifiers(uniprot_ids, cache_file=None, batch_size=100
                         "locus_tag": None,
                         "genbank_acc": None,
                         "common_name": None,
+                        "gene_aliases": [],
                     }
 
         except Exception as e:
@@ -313,6 +326,7 @@ def map_mygene_fallback_identifiers(uniprot_ids, cache_file=None, batch_size=100
                         "locus_tag": None,
                         "genbank_acc": None,
                         "common_name": None,
+                        "gene_aliases": [],
                     }
 
     _save_cache(results, cache_file)
@@ -321,6 +335,7 @@ def map_mygene_fallback_identifiers(uniprot_ids, cache_file=None, batch_size=100
 LIT_SEARCH_COLUMNS = [
     "query_entrez_id", "target_entrez_id",
     "query_gene_name", "target_gene_name",
+    "query_gene_aliases", "target_gene_aliases",
     "query_locus_tag", "target_locus_tag",
     "query_genbank_acc", "target_genbank_acc",
     "query_common_name", "target_common_name",
@@ -338,50 +353,9 @@ _EMPTY_ENTRY = {
     "gene_name": None,
     "locus_tag": None,
     "common_name": None,
+    "gene_aliases": [],
     "status": "not_found",
 }
-
-# Last token of a protein name is often a usable symbol (e.g. "Glucosyltransferase Lgt1" → Lgt1).
-_GENERIC_PROTEIN_NAME_ENDS = frozenset({
-    "protein", "kinase", "hydrolase", "transferase", "domain", "family", "system",
-    "factor", "membrane", "synthase", "peptidase", "lipase", "ligase", "reductase",
-    "dehydrogenase", "oxidase", "subunit", "component", "type", "chain",
-})
-
-
-def _infer_gene_name_from_uniprot_protein_names(entry):
-    """
-    When genes[].geneName is absent, many Legionella effectors still name the protein
-    (e.g. recommended name ends in Lgt1; submission name ends in RomA). MyGene/NCBI may
-    only expose RS locus strings as *symbol* — use the protein title token when plausible.
-    """
-    pd = entry.get("proteinDescription") or {}
-    candidates = []
-    rec = pd.get("recommendedName") or {}
-    if rec.get("fullName", {}).get("value"):
-        candidates.append(rec["fullName"]["value"])
-    for sn in pd.get("submissionNames") or []:
-        fn = (sn.get("fullName") or {})
-        if fn.get("value"):
-            candidates.append(fn["value"])
-    for alt in pd.get("alternativeNames") or []:
-        fn = (alt.get("fullName") or {})
-        if fn.get("value"):
-            candidates.append(fn["value"])
-    for text in candidates:
-        parts = text.strip().split()
-        if not parts:
-            continue
-        last = parts[-1].strip(".,;")
-        if len(last) < 3 or len(last) > 24:
-            continue
-        if last.lower() in _GENERIC_PROTEIN_NAME_ENDS:
-            continue
-        if not re.match(r"^[A-Za-z][A-Za-z0-9\-]*$", last):
-            continue
-        return last
-    return None
-
 
 def _is_rs_style_locus_symbol(s) -> bool:
     """True for NCBI/MyGene symbols that are genome locus IDs (e.g. AVR58_RS07000)."""
@@ -391,19 +365,8 @@ def _is_rs_style_locus_symbol(s) -> bool:
 
 
 def _prefer_gene_name_uniprot_over_rs_mygene(existing, mygene_name):
-    """
-    Prefer UniProt-derived or inferred short symbols over MyGene when MyGene only
-    returns an RS locus string (official NCBI symbol for some effectors).
-    """
-    ex = (existing or "").strip() if existing else ""
-    mg = (mygene_name or "").strip() if mygene_name else ""
-    if not mg:
-        return ex or None
-    if not ex:
-        return mg or None
-    if _is_rs_style_locus_symbol(mg) and not _is_rs_style_locus_symbol(ex):
-        return ex
-    return mg
+    """Backward-compatible wrapper; UniProt wins whenever present."""
+    return prefer_gene_name_uniprot(existing, mygene_name)
 
 
 def _extract_uniprot_entry(entry):
@@ -449,11 +412,14 @@ def _extract_uniprot_entry(entry):
     refseq_acc = refseq_acc or any_refseq
 
     gene_name = None
+    orf_name = None
     locus_tag = None
+    gene_aliases: list = []
     genes = entry.get("genes", [])
     if genes:
         g0 = genes[0]
         gene_name = g0.get("geneName", {}).get("value")
+        orf_name = first_uniprot_orf_name(g0)
         ordered = g0.get("orderedLocusNames") or []
         if ordered:
             loc0 = ordered[0]
@@ -461,9 +427,17 @@ def _extract_uniprot_entry(entry):
                 locus_tag = loc0.get("value")
             elif isinstance(loc0, str):
                 locus_tag = loc0
+        gene_aliases = gene_aliases_from_uniprot_gene(g0)
 
+    # Precedence when geneName is absent: curated ORF name (CG#####) beats a parsed
+    # protein-name token, which in turn beats the locus tag. A bare enzyme-class or
+    # description word never becomes the gene_name — locus tag wins over that.
+    if not gene_name and orf_name:
+        gene_name = orf_name
     if not gene_name:
-        gene_name = _infer_gene_name_from_uniprot_protein_names(entry)
+        gene_name = infer_gene_name_from_protein_description(entry)
+    if not gene_name and locus_tag:
+        gene_name = locus_tag
 
     common_name = None
     desc = entry.get("proteinDescription") or {}
@@ -493,6 +467,7 @@ def _extract_uniprot_entry(entry):
         "gene_name": gene_name,
         "locus_tag": locus_tag,
         "common_name": common_name,
+        "gene_aliases": aliases_excluding_primary(gene_aliases, gene_name),
         "status": "found",
     }
 
@@ -994,6 +969,7 @@ def run(df, query_col="query", target_col="target",
                 "locus_tag": info.get("locus_tag"),
                 "genbank_acc": info.get("genbank_acc"),
                 "common_name": info.get("common_name"),
+                "gene_aliases": list(info.get("gene_aliases") or []),
             }
             if info.get("status") == "not_found":
                 not_found_in_uniprot.append(uid)
@@ -1050,11 +1026,17 @@ def run(df, query_col="query", target_col="target",
             if not isinstance(info, dict):
                 continue
             existing = fallback_ids.get(uid, {})
+            merged_gn = existing.get("gene_name") or info.get("gene_name")
             fallback_ids[uid] = {
-                "gene_name": existing.get("gene_name") or info.get("gene_name"),
+                "gene_name": merged_gn,
                 "locus_tag": existing.get("locus_tag") or info.get("locus_tag"),
                 "genbank_acc": existing.get("genbank_acc") or info.get("genbank_acc"),
                 "common_name": existing.get("common_name") or info.get("common_name"),
+                "gene_aliases": aliases_excluding_primary(
+                    list(existing.get("gene_aliases") or [])
+                    + list(info.get("gene_aliases") or []),
+                    merged_gn,
+                ),
             }
 
         n_uniparc_found = sum(1 for info in uniparc_results.values()
@@ -1084,15 +1066,20 @@ def run(df, query_col="query", target_col="target",
             if not isinstance(info, dict):
                 continue
             existing = fallback_ids.get(uid, {})
+            merged_gn = existing.get("gene_name") or info.get("gene_name")
             fallback_ids[uid] = {
-                "gene_name": existing.get("gene_name") or info.get("gene_name"),
+                "gene_name": merged_gn,
                 "locus_tag": existing.get("locus_tag") or info.get("locus_tag"),
                 "genbank_acc": existing.get("genbank_acc") or info.get("genbank_acc"),
                 "common_name": existing.get("common_name") or info.get("common_name"),
+                "gene_aliases": aliases_excluding_primary(
+                    list(existing.get("gene_aliases") or [])
+                    + list(info.get("gene_aliases") or []),
+                    merged_gn,
+                ),
             }
 
-    # For IDs that have a trusted MyGene mapping, prefer MyGene-derived
-    # identifiers over UniProt/UniParc fallbacks when available.
+    # Enrich with MyGene symbol/aliases; UniProt gene_name and protein common_name win.
     mygene_mapped_ids = [uid for uid, eid in mygene_results.items() if eid is not None]
     if mygene_mapped_ids:
         logger.info(
@@ -1109,14 +1096,22 @@ def run(df, query_col="query", target_col="target",
             existing = fallback_ids.get(uid, {})
             mg_lt = _sanitize_locus_tag(mg.get("locus_tag"), id_mapping.get(uid))
             ex_lt = _sanitize_locus_tag(existing.get("locus_tag"), id_mapping.get(uid))
-            merged_gn = _prefer_gene_name_uniprot_over_rs_mygene(
+            merged_gn = prefer_gene_name_uniprot(
                 existing.get("gene_name"), mg.get("gene_name")
             )
+            # Keep MyGene symbol as an alias when UniProt primary differs.
+            alias_pool = (
+                list(existing.get("gene_aliases") or [])
+                + list(mg.get("gene_aliases") or [])
+            )
+            if mg.get("gene_name"):
+                alias_pool.append(mg.get("gene_name"))
             fallback_ids[uid] = {
                 "gene_name": merged_gn,
                 "locus_tag": mg_lt or ex_lt,
                 "genbank_acc": mg.get("genbank_acc") or existing.get("genbank_acc"),
-                "common_name": mg.get("common_name") or existing.get("common_name"),
+                "common_name": existing.get("common_name") or mg.get("common_name"),
+                "gene_aliases": aliases_excluding_primary(alias_pool, merged_gn),
             }
 
     n_gb_locus = fill_locus_tag_from_genbank(
@@ -1168,10 +1163,16 @@ def run(df, query_col="query", target_col="target",
         result_df["query_entrez_id"] = result_df[query_col].map(id_mapping)
         result_df["query_gene_name"] = result_df[query_col].map(
             lambda uid: fallback_ids.get(uid, {}).get("gene_name"))
+        result_df["query_gene_aliases"] = result_df[query_col].map(
+            lambda uid: format_gene_aliases(
+                fallback_ids.get(uid, {}).get("gene_aliases")
+            )
+        )
         result_df["query_locus_tag"] = result_df[query_col].map(
             lambda uid: fallback_ids.get(uid, {}).get("locus_tag"))
         result_df["query_genbank_acc"] = result_df[query_col].map(
             lambda uid: fallback_ids.get(uid, {}).get("genbank_acc"))
+        # Metadata only (not searched): prefer UniProt protein name over Entrez description.
         q_desc = result_df["query_entrez_id"].map(
             lambda eid: gene_descriptions.get(_safe_int(eid))
             if _safe_int(eid) is not None
@@ -1180,11 +1181,16 @@ def run(df, query_col="query", target_col="target",
         q_fb = result_df[query_col].map(
             lambda uid: fallback_ids.get(uid, {}).get("common_name")
         )
-        result_df["query_common_name"] = q_desc.combine_first(q_fb)
+        result_df["query_common_name"] = q_fb.combine_first(q_desc)
     if target_col in result_df.columns:
         result_df["target_entrez_id"] = result_df[target_col].map(id_mapping)
         result_df["target_gene_name"] = result_df[target_col].map(
             lambda uid: fallback_ids.get(uid, {}).get("gene_name"))
+        result_df["target_gene_aliases"] = result_df[target_col].map(
+            lambda uid: format_gene_aliases(
+                fallback_ids.get(uid, {}).get("gene_aliases")
+            )
+        )
         result_df["target_locus_tag"] = result_df[target_col].map(
             lambda uid: fallback_ids.get(uid, {}).get("locus_tag"))
         result_df["target_genbank_acc"] = result_df[target_col].map(
@@ -1197,7 +1203,7 @@ def run(df, query_col="query", target_col="target",
         t_fb = result_df[target_col].map(
             lambda uid: fallback_ids.get(uid, {}).get("common_name")
         )
-        result_df["target_common_name"] = t_desc.combine_first(t_fb)
+        result_df["target_common_name"] = t_fb.combine_first(t_desc)
 
     if query_col in result_df.columns:
         mq = result_df["query_entrez_id"].notna().sum()

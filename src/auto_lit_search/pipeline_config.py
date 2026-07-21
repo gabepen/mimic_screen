@@ -128,6 +128,8 @@ class Stage1Config:
     search_json: Path
     query_taxid: int
     target_taxid: int
+    query_taxids: tuple[int, ...]
+    target_taxids: tuple[int, ...]
     query_col: str
     target_col: str
     no_cache: bool
@@ -306,6 +308,30 @@ def load_stage1_config(
     if search_only:
         run_mapping, run_search = False, True
 
+    def _taxids(side: str) -> tuple[int, ...]:
+        plural = stage1.get(f"{side}_taxids")
+        singular = stage1.get(f"{side}_taxid")
+        raw_values = plural if plural is not None else singular
+        if isinstance(raw_values, (list, tuple)):
+            values = raw_values
+        elif isinstance(raw_values, str) and "," in raw_values:
+            values = [part.strip() for part in raw_values.split(",")]
+        else:
+            values = [raw_values]
+        parsed = tuple(
+            dict.fromkeys(int(value) for value in values if value is not None and str(value).strip())
+        )
+        if not parsed:
+            raise ValueError(
+                f"stage1.{side}_taxid or stage1.{side}_taxids is required"
+            )
+        if any(value <= 0 for value in parsed):
+            raise ValueError(f"stage1.{side}_taxids must contain positive integers")
+        return parsed
+
+    query_taxids = _taxids("query")
+    target_taxids = _taxids("target")
+
     return Stage1Config(
         config_path=path,
         dataset=dataset,
@@ -314,8 +340,12 @@ def load_stage1_config(
         search_output_dir=search_output_dir,
         idmap_csv=idmap_csv,
         search_json=search_json,
-        query_taxid=int(stage1["query_taxid"]),
-        target_taxid=int(stage1["target_taxid"]),
+        # Mapping APIs still use the primary (first) taxid. Search uses the full
+        # ordered list in one organism-scoped Europe PMC query.
+        query_taxid=query_taxids[0],
+        target_taxid=target_taxids[0],
+        query_taxids=query_taxids,
+        target_taxids=target_taxids,
         query_col=str(stage1.get("query_col") or "query"),
         target_col=str(stage1.get("target_col") or "target"),
         no_cache=bool(stage1.get("no_cache", False)),
@@ -396,7 +426,7 @@ def load_stage2_config(config_path: Path | str) -> Stage2Config:
 
     def _slurm_script(key: str, default: str) -> Path:
         val = str(slurm_raw.get(key) or default)
-        return _resolve_path(val, data_root=data_root, repo=cluster.repo_root, kind="repo")
+        return _resolve_path(val, data_root=data_root, repo=cluster.pipeline_root, kind="repo")
 
     slurm = Stage2SlurmConfig(
         num_grader_nodes=int(slurm_raw.get("num_grader_nodes") or 1),
