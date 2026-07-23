@@ -136,6 +136,8 @@ class Stage1Config:
     target_col: str
     no_cache: bool
     accession_text_overlap: str
+    search_workers: int | None
+    term_hit_attribution: bool
     run_mapping: bool
     run_search: bool
     cluster: ClusterConfig
@@ -372,6 +374,12 @@ def load_stage1_config(
         target_col=str(stage1.get("target_col") or "target"),
         no_cache=bool(stage1.get("no_cache", False)),
         accession_text_overlap=str(stage1.get("accession_text_overlap") or ""),
+        search_workers=(
+            int(stage1["search_workers"])
+            if stage1.get("search_workers") is not None
+            else None
+        ),
+        term_hit_attribution=bool(stage1.get("term_hit_attribution", False)),
         run_mapping=run_mapping,
         run_search=run_search,
         cluster=cluster,

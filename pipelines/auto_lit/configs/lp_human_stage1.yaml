@@ -7,7 +7,7 @@ stage1:
   search_output_dir: search_results
   query_taxids: [272624, 446]
   target_taxid: 9606
-  query_organism_terms: [Legionella pneumophila, Legionella]
+  query_organism_terms: [Legionella pneumophila]
   target_organism_terms: [Homo sapiens, human]
   query_col: query
   target_col: target

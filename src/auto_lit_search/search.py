@@ -21,7 +21,9 @@ import os
 import re
 import socket
 import sys
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from io import StringIO
 from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 
@@ -92,6 +94,73 @@ _ALLOWED_RESEARCH_PUBTYPE_SUBSTRINGS = (
 )
 
 
+class RequestGate:
+    """Serialize outbound API pacing across threads (min interval between starts)."""
+
+    def __init__(self, min_interval: float) -> None:
+        self._min_interval = max(0.0, float(min_interval))
+        self._lock = threading.Lock()
+        self._next_allowed = 0.0
+
+    def wait(self) -> None:
+        if self._min_interval <= 0:
+            return
+        with self._lock:
+            now = time.monotonic()
+            sleep_for = max(0.0, self._next_allowed - now)
+            self._next_allowed = max(now, self._next_allowed) + self._min_interval
+        if sleep_for:
+            time.sleep(sleep_for)
+
+
+class LockedCache(dict):
+    """Dict with a lock for concurrent get/set of cached API responses."""
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        self._lock = threading.Lock()
+
+    def get_if_present(self, key: Any) -> Tuple[bool, Any]:
+        with self._lock:
+            if key in self:
+                return True, self[key]
+            return False, None
+
+    def store(self, key: Any, value: Any) -> Any:
+        with self._lock:
+            existing = self.get(key)
+            if existing is not None:
+                return existing
+            self[key] = value
+            return value
+
+
+_thread_local = threading.local()
+
+
+def _thread_session(base: Optional[requests.Session] = None) -> requests.Session:
+    sess = getattr(_thread_local, "session", None)
+    if sess is None:
+        sess = requests.Session()
+        if base is not None:
+            sess.headers.update(base.headers)
+        else:
+            sess.headers.setdefault(
+                "User-Agent",
+                "auto_lit_search/0.1 (contact: research pipeline; requests to NCBI E-utilities)",
+            )
+        _thread_local.session = sess
+    return sess
+
+
+def _search_workers_default() -> int:
+    raw = os.environ.get("AUTO_LIT_SEARCH_WORKERS", "8").strip()
+    try:
+        return max(1, int(raw))
+    except ValueError:
+        return 8
+
+
 def _set_pubtator_disabled(reason: str) -> None:
     global _PUBTATOR_ENABLED, _PUBTATOR_DISABLED_REASON
     if _PUBTATOR_ENABLED:
@@ -153,6 +222,7 @@ def run_europepmc_crossref(
     session: requests.Session,
     cache: Dict[str, Dict[str, List[str]]],
     delay: float = 0.35,
+    gate: Optional[RequestGate] = None,
 ) -> Dict[str, List[str]]:
     """
     Search Europe PMC for UniProt accession citations (ACCESSION_ID + ACCESSION_TYPE).
@@ -162,7 +232,12 @@ def run_europepmc_crossref(
     if not acc:
         return {"dois": [], "titles": []}
 
-    if acc in cache:
+    if isinstance(cache, LockedCache):
+        hit, cached = cache.get_if_present(acc)
+        if hit:
+            logger.debug(f"Cache hit for accession-cite uniprot:{acc}")
+            return cached
+    elif acc in cache:
         logger.debug(f"Cache hit for accession-cite uniprot:{acc}")
         return cache[acc]
 
@@ -180,15 +255,21 @@ def run_europepmc_crossref(
     }
     dois: List[str] = []
     titles: List[str] = []
+    sess = _thread_session(session)
 
     try:
-        time.sleep(delay)
-        resp = session.get(EUROPEPMC_SEARCH_URL, params=params, timeout=30)
+        if gate is not None:
+            gate.wait()
+        else:
+            time.sleep(delay)
+        resp = sess.get(EUROPEPMC_SEARCH_URL, params=params, timeout=30)
         resp.raise_for_status()
         data = resp.json()
     except Exception as e:
         logger.warning(f"Europe PMC accession-cite failed for uniprot:{acc}: {e}")
         result = {"dois": [], "titles": []}
+        if isinstance(cache, LockedCache):
+            return cache.store(acc, result)
         cache[acc] = result
         return result
 
@@ -204,6 +285,8 @@ def run_europepmc_crossref(
         titles.append(title)
 
     result = {"dois": dois, "titles": titles}
+    if isinstance(cache, LockedCache):
+        return cache.store(acc, result)
     cache[acc] = result
     return result
 
@@ -877,9 +960,15 @@ def _run_europepmc_search_query(
     session: requests.Session,
     cache: Dict[str, Dict[str, List[str]]],
     delay: float = 0.35,
+    gate: Optional[RequestGate] = None,
 ) -> Dict[str, List[str]]:
     """Run a Europe PMC search for a query string with caching."""
-    if query in cache:
+    if isinstance(cache, LockedCache):
+        hit, cached = cache.get_if_present(query)
+        if hit:
+            logger.debug(f"Cache hit for query={query!r}")
+            return cached
+    elif query in cache:
         logger.debug(f"Cache hit for query={query!r}")
         return cache[query]
 
@@ -892,9 +981,14 @@ def _run_europepmc_search_query(
     }
     dois: List[str] = []
     titles: List[str] = []
+    sess = _thread_session(session)
 
     try:
-        resp = session.get(EUROPEPMC_SEARCH_URL, params=params, timeout=30)
+        if gate is not None:
+            gate.wait()
+        else:
+            time.sleep(delay)
+        resp = sess.get(EUROPEPMC_SEARCH_URL, params=params, timeout=30)
         resp.raise_for_status()
         data = resp.json()
     except Exception as e:
@@ -907,10 +1001,10 @@ def _run_europepmc_search_query(
             "truncated": False,
             "request_ok": False,
         }
+        if isinstance(cache, LockedCache):
+            return cache.store(query, result)
         cache[query] = result
         return result
-    finally:
-        time.sleep(delay)
 
     records = (data.get("resultList") or {}).get("result") or []
     try:
@@ -939,13 +1033,16 @@ def _run_europepmc_search_query(
         "truncated": hit_count > int(params["pageSize"]),
         "request_ok": True,
     }
+    if isinstance(cache, LockedCache):
+        return cache.store(query, result)
     cache[query] = result
     return result
 
 
 def _term_hit_attribution_enabled() -> bool:
-    value = os.environ.get("AUTO_LIT_TERM_HIT_ATTRIBUTION", "1").strip().lower()
-    return value not in {"0", "false", "no", "off"}
+    # Default off: per-term re-queries dominate runtime; enable for audit runs.
+    value = os.environ.get("AUTO_LIT_TERM_HIT_ATTRIBUTION", "0").strip().lower()
+    return value in {"1", "true", "yes", "on"}
 
 
 def _attribute_result_ids_to_terms(
@@ -958,6 +1055,7 @@ def _attribute_result_ids_to_terms(
     session: requests.Session,
     cache: Dict[str, Dict[str, List[str]]],
     delay: float,
+    gate: Optional[RequestGate] = None,
 ) -> Tuple[Dict[str, List[Dict[str, Any]]], List[str]]:
     """
     Attribute an existing combined-query result set to individual terms.
@@ -984,7 +1082,9 @@ def _attribute_result_ids_to_terms(
         )
         if not query:
             continue
-        response = _run_europepmc_search_query(query, session, cache, delay=delay)
+        response = _run_europepmc_search_query(
+            query, session, cache, delay=delay, gate=gate
+        )
         for paper_id in wanted & set(response.get("dois") or []):
             hits.setdefault(paper_id, []).append(
                 {
@@ -1074,6 +1174,7 @@ def run_europepmc_search_for_row(
     prefix: str = "query",
     extra_terms: Optional[List[str]] = None,
     organism_terms: Optional[Sequence[str]] = None,
+    gate: Optional[RequestGate] = None,
 ) -> Dict[str, Any]:
     """
     Run a Europe PMC search for a single mapping row.
@@ -1180,7 +1281,9 @@ def run_europepmc_search_for_row(
 
     if q1:
         logger.debug(f"Europe PMC text pass1 ids={q1_types}")
-        r1 = _run_europepmc_search_query(q1, session, cache, delay=delay)
+        r1 = _run_europepmc_search_query(
+            q1, session, cache, delay=delay, gate=gate
+        )
         for pid, title in zip(r1["dois"], r1["titles"]):
             if pid not in id_to_title:
                 id_to_title[pid] = title
@@ -1190,7 +1293,9 @@ def run_europepmc_search_for_row(
     if q2_base:
         logger.debug(f"Europe PMC text pass2-base ids={q2_base_types} taxid={taxid}")
         logger.debug(f"[{prefix}] pass2-base query: {q2_base}")
-        r2_base = _run_europepmc_search_query(q2_base, session, cache, delay=delay)
+        r2_base = _run_europepmc_search_query(
+            q2_base, session, cache, delay=delay, gate=gate
+        )
         pass2_base_dois = list(r2_base["dois"])
         pass2_base_n = len(pass2_base_dois)
         if (
@@ -1211,7 +1316,7 @@ def run_europepmc_search_for_row(
                     f"(orig taxid={taxid}) ids={q2_base_alt_types}"
                 )
                 r2_base_alt = _run_europepmc_search_query(
-                    q2_base_alt, session, cache, delay=delay
+                    q2_base_alt, session, cache, delay=delay, gate=gate
                 )
                 pass2_base_dois = list(r2_base_alt["dois"])
                 pass2_base_n = len(pass2_base_dois)
@@ -1224,7 +1329,9 @@ def run_europepmc_search_for_row(
             f"Europe PMC text pass2-synonym ids={q2_syn_types} taxid={taxid}"
         )
         logger.debug(f"[{prefix}] pass2-synonym query: {q2_syn}")
-        r2_syn = _run_europepmc_search_query(q2_syn, session, cache, delay=delay)
+        r2_syn = _run_europepmc_search_query(
+            q2_syn, session, cache, delay=delay, gate=gate
+        )
         pass2_synonym_dois = list(r2_syn["dois"])
         pass2_synonym_n = len(pass2_synonym_dois)
         if (
@@ -1245,7 +1352,7 @@ def run_europepmc_search_for_row(
                     f"(orig taxid={taxid}) ids={q2_syn_alt_types}"
                 )
                 r2_syn_alt = _run_europepmc_search_query(
-                    q2_syn_alt, session, cache, delay=delay
+                    q2_syn_alt, session, cache, delay=delay, gate=gate
                 )
                 pass2_synonym_dois = list(r2_syn_alt["dois"])
                 pass2_synonym_n = len(pass2_synonym_dois)
@@ -1288,6 +1395,7 @@ def run_europepmc_search_for_row(
             session=session,
             cache=cache,
             delay=delay,
+            gate=gate,
         )
         _merge_term_hit_maps(paper_term_hits, attributed)
         if unresolved:
@@ -1405,6 +1513,351 @@ def _drop_accession_only_without_text_hit(
     return out_dois, out_titles, n_drop
 
 
+
+def _search_one_alignment_row(
+    *,
+    idx,
+    row: pd.Series,
+    query_id_col: str,
+    target_id_col: str,
+    taxid_col: Optional[str],
+    default_taxid: Optional[int],
+    query_taxid: Optional[int],
+    target_taxid: Optional[int],
+    query_taxids: Optional[Sequence[int]],
+    target_taxids: Optional[Sequence[int]],
+    query_organism_terms: Optional[Sequence[str]],
+    target_organism_terms: Optional[Sequence[str]],
+    result_columns: Sequence[str],
+    session: requests.Session,
+    uniprot_cache: Dict[str, Dict[str, List[str]]],
+    text_cache: Dict[str, Dict[str, List[str]]],
+    gene_synonyms_by_entrez: Dict[int, List[str]],
+    delay: float,
+    gate: Optional[RequestGate],
+    filter_q_acc: bool,
+    filter_t_acc: bool,
+) -> Dict[str, Any]:
+    """Search Europe PMC for one alignment row (thread-safe with LockedCache + gate)."""
+    row_taxid: Optional[int] = None
+    if taxid_col and taxid_col in result_columns:
+        val = row.get(taxid_col)
+        try:
+            row_taxid = int(val) if pd.notna(val) else None
+        except Exception:
+            row_taxid = None
+    elif default_taxid is not None:
+        row_taxid = int(default_taxid)
+
+    q_acc = _normalize_uniprot_id(row.get(query_id_col))
+    t_acc = _normalize_uniprot_id(row.get(target_id_col))
+
+    # ------------------------------------------------------------
+    # Query side: Europe PMC-only retrieval (PubTator disabled)
+    # ------------------------------------------------------------
+    merged_q_dois: List[str] = []
+    merged_q_titles: List[str] = []
+    query_paper_counts: Dict[str, int] = {
+        "entrez_pubtator": 0,
+        "europepmc_accession": 0,
+        "text_pass1": 0,
+        "text_pass2": 0,
+        "text_pass2_base": 0,
+        "text_pass2_synonym": 0,
+        "text_pass2_overlap": 0,
+    }
+    query_paper_ids_by_source: Dict[str, List[str]] = {
+        "entrez_pubtator": [],
+        "europepmc_accession": [],
+        "text_pass1": [],
+        "text_pass2": [],
+        "text_pass2_base": [],
+        "text_pass2_synonym": [],
+        "text_pass2_overlap": [],
+    }
+
+    q_entrez_id = _normalize_entrez_id(row.get("query_entrez_id"))
+    q_from_entrez = q_entrez_id is not None
+    q_pubtator_used = False
+    q_pubtator_empty = False
+    q_search_terms: List[str] = []
+    q_paper_term_hits: Dict[str, List[Dict[str, Any]]] = {}
+    q_unattributed_term_hits: Dict[str, List[str]] = {}
+    q_organism_fallbacks: List[Dict[str, Any]] = []
+    if q_entrez_id is not None:
+        q_pubtator_empty = True
+
+    # Fallback: UniProt citation + Europe PMC text search.
+    if not merged_q_dois:
+        query_res = run_europepmc_crossref(q_acc, session, uniprot_cache, delay=delay, gate=gate)
+        query_text_taxid: TaxidInput = (
+            query_taxids
+            if query_taxids is not None
+            else (query_taxid if query_taxid is not None else row_taxid)
+        )
+        text_res_query = run_europepmc_search_for_row(
+            row,
+            query_text_taxid,
+            session,
+            text_cache,
+            delay=delay,
+            prefix="query",
+            extra_terms=gene_synonyms_by_entrez.get(q_entrez_id or -1, []),
+            organism_terms=query_organism_terms,
+            gate=gate,
+        )
+        q_search_terms = list(text_res_query.get("search_terms") or [])
+        q_paper_term_hits = dict(text_res_query.get("paper_term_hits") or {})
+        q_unattributed_term_hits = dict(
+            text_res_query.get("unattributed_term_hit_dois_by_pass") or {}
+        )
+        q_organism_fallbacks = list(
+            text_res_query.get("organism_fallbacks") or []
+        )
+        # Merge UniProt and text results for query (deduplicated by paper ID)
+        q_id_to_title: Dict[str, str] = {}
+        for pid, title in zip(query_res["dois"], query_res["titles"]):
+            if pid not in q_id_to_title:
+                q_id_to_title[pid] = title
+        for pid, title in zip(text_res_query["dois"], text_res_query["titles"]):
+            if pid not in q_id_to_title:
+                q_id_to_title[pid] = title
+        merged_q_dois = list(q_id_to_title.keys())
+        merged_q_titles = [q_id_to_title[pid] for pid in merged_q_dois]
+
+        acc_only_drop_q = 0
+        if filter_q_acc:
+            merged_q_dois, merged_q_titles, acc_only_drop_q = (
+                _drop_accession_only_without_text_hit(
+                    merged_q_dois,
+                    q_id_to_title,
+                    query_res["dois"],
+                    text_res_query["dois"],
+                )
+            )
+
+        query_paper_counts = {
+            "entrez_pubtator": 0,
+            "europepmc_accession": len(query_res["dois"]),
+            "text_pass1": text_res_query.get("pass1_count", 0),
+            "text_pass2": text_res_query.get("pass2_count", 0),
+            "text_pass2_base": text_res_query.get("pass2_base_count", 0),
+            "text_pass2_synonym": text_res_query.get("pass2_synonym_count", 0),
+            "text_pass2_overlap": text_res_query.get("pass2_overlap_count", 0),
+            "accession_only_dropped": acc_only_drop_q,
+        }
+        query_paper_ids_by_source = {
+            "entrez_pubtator": [],
+            "europepmc_accession": list(query_res["dois"]),
+            "text_pass1": list(text_res_query.get("pass1_dois", [])),
+            "text_pass2": list(text_res_query.get("pass2_dois", [])),
+            "text_pass2_base": list(text_res_query.get("pass2_base_dois", [])),
+            "text_pass2_synonym": list(
+                text_res_query.get("pass2_synonym_dois", [])
+            ),
+            "text_pass2_overlap": list(
+                text_res_query.get("pass2_overlap_dois", [])
+            ),
+        }
+
+    query_dois = json.dumps(merged_q_dois)
+    query_titles = json.dumps(merged_q_titles)
+    query_paper_counts_out = query_paper_counts
+    query_paper_ids_by_source_out = json.dumps(query_paper_ids_by_source)
+    query_search_terms_out = json.dumps(q_search_terms)
+    query_paper_term_hits_out = json.dumps(q_paper_term_hits)
+    query_unattributed_term_hits_out = json.dumps(q_unattributed_term_hits)
+    query_organism_fallbacks_out = json.dumps(q_organism_fallbacks)
+
+    # ------------------------------------------------------------
+    # Target side: Europe PMC-only retrieval (PubTator disabled)
+    # ------------------------------------------------------------
+    merged_t_dois: List[str] = []
+    merged_t_titles: List[str] = []
+    target_paper_counts: Dict[str, int] = {
+        "entrez_pubtator": 0,
+        "europepmc_accession": 0,
+        "text_pass1": 0,
+        "text_pass2": 0,
+        "text_pass2_base": 0,
+        "text_pass2_synonym": 0,
+        "text_pass2_overlap": 0,
+    }
+    target_paper_ids_by_source: Dict[str, List[str]] = {
+        "entrez_pubtator": [],
+        "europepmc_accession": [],
+        "text_pass1": [],
+        "text_pass2": [],
+        "text_pass2_base": [],
+        "text_pass2_synonym": [],
+        "text_pass2_overlap": [],
+    }
+
+    t_entrez_id = _normalize_entrez_id(row.get("target_entrez_id"))
+    t_from_entrez = t_entrez_id is not None
+    t_pubtator_used = False
+    t_pubtator_empty = False
+    t_search_terms: List[str] = []
+    t_paper_term_hits: Dict[str, List[Dict[str, Any]]] = {}
+    t_unattributed_term_hits: Dict[str, List[str]] = {}
+    t_organism_fallbacks: List[Dict[str, Any]] = []
+    if t_entrez_id is not None:
+        t_pubtator_empty = True
+
+    # Fallback: UniProt citation + Europe PMC text search.
+    if not merged_t_dois:
+        target_res = run_europepmc_crossref(t_acc, session, uniprot_cache, delay=delay, gate=gate)
+        target_text_taxid: TaxidInput = (
+            target_taxids
+            if target_taxids is not None
+            else (target_taxid if target_taxid is not None else row_taxid)
+        )
+        text_res_target = run_europepmc_search_for_row(
+            row,
+            target_text_taxid,
+            session,
+            text_cache,
+            delay=delay,
+            prefix="target",
+            extra_terms=gene_synonyms_by_entrez.get(t_entrez_id or -1, []),
+            organism_terms=target_organism_terms,
+            gate=gate,
+        )
+        t_search_terms = list(text_res_target.get("search_terms") or [])
+        t_paper_term_hits = dict(text_res_target.get("paper_term_hits") or {})
+        t_unattributed_term_hits = dict(
+            text_res_target.get("unattributed_term_hit_dois_by_pass") or {}
+        )
+        t_organism_fallbacks = list(
+            text_res_target.get("organism_fallbacks") or []
+        )
+
+        # Merge UniProt and text results for target (deduplicated by paper ID)
+        t_id_to_title: Dict[str, str] = {}
+        for pid, title in zip(target_res["dois"], target_res["titles"]):
+            if pid not in t_id_to_title:
+                t_id_to_title[pid] = title
+        for pid, title in zip(text_res_target["dois"], text_res_target["titles"]):
+            if pid not in t_id_to_title:
+                t_id_to_title[pid] = title
+        merged_t_dois = list(t_id_to_title.keys())
+        merged_t_titles = [t_id_to_title[pid] for pid in merged_t_dois]
+
+        acc_only_drop_t = 0
+        if filter_t_acc:
+            merged_t_dois, merged_t_titles, acc_only_drop_t = (
+                _drop_accession_only_without_text_hit(
+                    merged_t_dois,
+                    t_id_to_title,
+                    target_res["dois"],
+                    text_res_target["dois"],
+                )
+            )
+
+        target_paper_ids_by_source = {
+            "entrez_pubtator": [],
+            "europepmc_accession": list(target_res["dois"]),
+            "text_pass1": list(text_res_target.get("pass1_dois", [])),
+            "text_pass2": list(text_res_target.get("pass2_dois", [])),
+            "text_pass2_base": list(text_res_target.get("pass2_base_dois", [])),
+            "text_pass2_synonym": list(
+                text_res_target.get("pass2_synonym_dois", [])
+            ),
+            "text_pass2_overlap": list(
+                text_res_target.get("pass2_overlap_dois", [])
+            ),
+        }
+        target_paper_counts = {
+            "entrez_pubtator": 0,
+            "europepmc_accession": len(target_res["dois"]),
+            "text_pass1": text_res_target.get("pass1_count", 0),
+            "text_pass2": text_res_target.get("pass2_count", 0),
+            "text_pass2_base": text_res_target.get("pass2_base_count", 0),
+            "text_pass2_synonym": text_res_target.get("pass2_synonym_count", 0),
+            "text_pass2_overlap": text_res_target.get("pass2_overlap_count", 0),
+            "accession_only_dropped": acc_only_drop_t,
+        }
+
+    target_dois = json.dumps(merged_t_dois)
+    target_titles = json.dumps(merged_t_titles)
+    target_paper_ids_by_source_out = json.dumps(target_paper_ids_by_source)
+    target_search_terms_out = json.dumps(t_search_terms)
+    target_paper_term_hits_out = json.dumps(t_paper_term_hits)
+    target_unattributed_term_hits_out = json.dumps(t_unattributed_term_hits)
+    target_organism_fallbacks_out = json.dumps(t_organism_fallbacks)
+
+    # Write per-row trace (useful for debugging why a gene got 0 hits).
+    trace_obj = {
+        "row_idx": idx,
+        "query": str(row.get(query_id_col)),
+        "target": str(row.get(target_id_col)),
+        "query_entrez_id": q_entrez_id,
+        "target_entrez_id": t_entrez_id,
+        "query_uniprot": q_acc,
+        "target_uniprot": t_acc,
+        "query_pubtator_used": q_pubtator_used,
+        "query_pubtator_empty": q_pubtator_empty,
+        "pubtator_enabled": _PUBTATOR_ENABLED,
+        "pubtator_disabled_reason": _PUBTATOR_DISABLED_REASON,
+        "query_counts": query_paper_counts,
+        "query_search_terms": q_search_terms,
+        "query_paper_term_hits": q_paper_term_hits,
+        "query_term_hit_counts": _summarize_term_hits(q_paper_term_hits),
+        "query_unattributed_term_hit_dois_by_pass": q_unattributed_term_hits,
+        "query_organism_fallbacks": q_organism_fallbacks,
+        "accession_text_overlap_filter_query": filter_q_acc,
+        "query_dois_n": len(merged_q_dois),
+        "query_dois_sample": merged_q_dois[:10],
+        "target_pubtator_used": t_pubtator_used,
+        "target_pubtator_empty": t_pubtator_empty,
+        "target_counts": target_paper_counts,
+        "target_search_terms": t_search_terms,
+        "target_paper_term_hits": t_paper_term_hits,
+        "target_term_hit_counts": _summarize_term_hits(t_paper_term_hits),
+        "target_unattributed_term_hit_dois_by_pass": t_unattributed_term_hits,
+        "target_organism_fallbacks": t_organism_fallbacks,
+        "accession_text_overlap_filter_target": filter_t_acc,
+        "target_dois_n": len(merged_t_dois),
+        "target_dois_sample": merged_t_dois[:10],
+    }
+
+    q_from_accession = bool(locals().get("query_res") and query_res.get("dois"))
+    q_from_text = bool(locals().get("text_res_query") and text_res_query.get("dois"))
+    t_from_accession = bool(locals().get("target_res") and target_res.get("dois"))
+    t_from_text = bool(locals().get("text_res_target") and text_res_target.get("dois"))
+
+    return {
+        "query_dois": query_dois,
+        "query_titles": query_titles,
+        "target_dois": target_dois,
+        "target_titles": target_titles,
+        "query_paper_counts": query_paper_counts_out,
+        "query_paper_ids_by_source": query_paper_ids_by_source_out,
+        "target_paper_ids_by_source": target_paper_ids_by_source_out,
+        "query_search_terms": query_search_terms_out,
+        "target_search_terms": target_search_terms_out,
+        "query_paper_term_hits": query_paper_term_hits_out,
+        "target_paper_term_hits": target_paper_term_hits_out,
+        "query_unattributed_term_hits": query_unattributed_term_hits_out,
+        "target_unattributed_term_hits": target_unattributed_term_hits_out,
+        "query_organism_fallbacks": query_organism_fallbacks_out,
+        "target_organism_fallbacks": target_organism_fallbacks_out,
+        "trace": trace_obj,
+        "stats": {
+            "q_entrez_id": str(q_entrez_id) if q_entrez_id is not None else None,
+            "t_entrez_id": str(t_entrez_id) if t_entrez_id is not None else None,
+            "q_acc": q_acc,
+            "t_acc": t_acc,
+            "q_from_accession": q_from_accession,
+            "q_from_text": q_from_text,
+            "t_from_accession": t_from_accession,
+            "t_from_text": t_from_text,
+            "q_with_papers": bool(q_acc and merged_q_dois),
+            "t_with_papers": bool(t_acc and merged_t_dois),
+        },
+    }
+
+
 def run(
     df: pd.DataFrame,
     query_id_col: str = "query",
@@ -1421,6 +1874,7 @@ def run(
     delay: float = 0.35,
     use_cache: bool = True,
     accession_text_overlap: Optional[str] = None,
+    workers: Optional[int] = None,
 ) -> pd.DataFrame:
     """
     Two-phase Europe PMC search for each alignment row:
@@ -1455,6 +1909,8 @@ def run(
             Values: ``off``, ``query``, ``target``, ``both`` (or ``1``/``true`` via env).
             When enabled for a side, DOIs that appear only in the Europe PMC UniProt-accession
             search and not in the text-search union are dropped from merged outputs.
+        workers: Parallel alignment-row workers. Default from ``AUTO_LIT_SEARCH_WORKERS`` (8).
+            Outbound Europe PMC calls still share a process-wide rate gate (``delay``).
 
     Returns a new DataFrame with additional columns:
         - query_paper_dois, query_paper_titles (merged UniProt + text search)
@@ -1510,6 +1966,9 @@ def run(
             logger.info(f"Loaded cache from {cache_path} ({len(uniprot_cache)} uniprot, {len(text_cache)} text entries)")
         except Exception as e:
             logger.warning(f"Could not load cache from {cache_path}: {e}")
+
+    uniprot_cache = LockedCache(uniprot_cache)
+    text_cache = LockedCache(text_cache)
 
     # Build synonym map from NCBI human gene_info for text fallback expansion.
     # This is best-effort and only applies for IDs present in that file.
@@ -1596,314 +2055,105 @@ def run(
 
     # Machine-readable per-row trace of the search logic.
     # Each line is a JSON object.
+    gate = RequestGate(delay)
+    workers = max(1, int(workers if workers is not None else _search_workers_default()))
+    logger.info(
+        "Europe PMC search: workers={} delay={}s term_hit_attribution={}",
+        workers,
+        delay,
+        _term_hit_attribution_enabled(),
+    )
+
+    row_items = list(result_df.iterrows())
+    result_columns = list(result_df.columns)
+    row_results: List[Optional[Dict[str, Any]]] = [None] * len(row_items)
+
+    def _job(pos: int, idx, row: pd.Series) -> Tuple[int, Dict[str, Any]]:
+        out = _search_one_alignment_row(
+            idx=idx,
+            row=row,
+            query_id_col=query_id_col,
+            target_id_col=target_id_col,
+            taxid_col=taxid_col,
+            default_taxid=default_taxid,
+            query_taxid=query_taxid,
+            target_taxid=target_taxid,
+            query_taxids=query_taxids,
+            target_taxids=target_taxids,
+            query_organism_terms=query_organism_terms,
+            target_organism_terms=target_organism_terms,
+            result_columns=result_columns,
+            session=session,
+            uniprot_cache=uniprot_cache,
+            text_cache=text_cache,
+            gene_synonyms_by_entrez=gene_synonyms_by_entrez,
+            delay=delay,
+            gate=gate,
+            filter_q_acc=filter_q_acc,
+            filter_t_acc=filter_t_acc,
+        )
+        return pos, out
+
+    if workers == 1:
+        for pos, (idx, row) in enumerate(row_items):
+            _, out = _job(pos, idx, row)
+            row_results[pos] = out
+            if (pos + 1) % 50 == 0 or (pos + 1) == n_rows:
+                logger.info("Search progress: {}/{}", pos + 1, n_rows)
+    else:
+        done = 0
+        with ThreadPoolExecutor(max_workers=workers) as executor:
+            futures = [
+                executor.submit(_job, pos, idx, row)
+                for pos, (idx, row) in enumerate(row_items)
+            ]
+            for fut in as_completed(futures):
+                pos, out = fut.result()
+                row_results[pos] = out
+                done += 1
+                if done % 50 == 0 or done == n_rows:
+                    logger.info("Search progress: {}/{}", done, n_rows)
+
     trace_fh = open(trace_path, "w", encoding="utf-8")
-
-    for idx, row in result_df.iterrows():
-        row_taxid: Optional[int] = None
-        if taxid_col and taxid_col in result_df.columns:
-            val = row.get(taxid_col)
-            try:
-                row_taxid = int(val) if pd.notna(val) else None
-            except Exception:
-                row_taxid = None
-        elif default_taxid is not None:
-            row_taxid = int(default_taxid)
-
-        q_acc = _normalize_uniprot_id(row.get(query_id_col))
-        t_acc = _normalize_uniprot_id(row.get(target_id_col))
-
-        # ------------------------------------------------------------
-        # Query side: Europe PMC-only retrieval (PubTator disabled)
-        # ------------------------------------------------------------
-        merged_q_dois: List[str] = []
-        merged_q_titles: List[str] = []
-        query_paper_counts: Dict[str, int] = {
-            "entrez_pubtator": 0,
-            "europepmc_accession": 0,
-            "text_pass1": 0,
-            "text_pass2": 0,
-            "text_pass2_base": 0,
-            "text_pass2_synonym": 0,
-            "text_pass2_overlap": 0,
-        }
-        query_paper_ids_by_source: Dict[str, List[str]] = {
-            "entrez_pubtator": [],
-            "europepmc_accession": [],
-            "text_pass1": [],
-            "text_pass2": [],
-            "text_pass2_base": [],
-            "text_pass2_synonym": [],
-            "text_pass2_overlap": [],
-        }
-
-        q_entrez_id = _normalize_entrez_id(row.get("query_entrez_id"))
-        q_from_entrez = q_entrez_id is not None
-        q_pubtator_used = False
-        q_pubtator_empty = False
-        q_search_terms: List[str] = []
-        q_paper_term_hits: Dict[str, List[Dict[str, Any]]] = {}
-        q_unattributed_term_hits: Dict[str, List[str]] = {}
-        q_organism_fallbacks: List[Dict[str, Any]] = []
-        if q_entrez_id is not None:
-            query_ids_seen.add(str(q_entrez_id))
-            q_pubtator_empty = True
-
-        # Fallback: UniProt citation + Europe PMC text search.
-        if not merged_q_dois:
-            query_res = run_europepmc_crossref(q_acc, session, uniprot_cache)
-            if q_acc:
-                query_ids_seen.add(q_acc)
-                if query_res["dois"]:
-                    rows_query_from_europepmc_accession += 1
-
-            query_text_taxid: TaxidInput = (
-                query_taxids
-                if query_taxids is not None
-                else (query_taxid if query_taxid is not None else row_taxid)
-            )
-            text_res_query = run_europepmc_search_for_row(
-                row,
-                query_text_taxid,
-                session,
-                text_cache,
-                prefix="query",
-                extra_terms=gene_synonyms_by_entrez.get(q_entrez_id or -1, []),
-                organism_terms=query_organism_terms,
-            )
-            q_search_terms = list(text_res_query.get("search_terms") or [])
-            q_paper_term_hits = dict(text_res_query.get("paper_term_hits") or {})
-            q_unattributed_term_hits = dict(
-                text_res_query.get("unattributed_term_hit_dois_by_pass") or {}
-            )
-            q_organism_fallbacks = list(
-                text_res_query.get("organism_fallbacks") or []
-            )
-            if text_res_query["dois"]:
-                rows_query_from_text += 1
-
-            # Merge UniProt and text results for query (deduplicated by paper ID)
-            q_id_to_title: Dict[str, str] = {}
-            for pid, title in zip(query_res["dois"], query_res["titles"]):
-                if pid not in q_id_to_title:
-                    q_id_to_title[pid] = title
-            for pid, title in zip(text_res_query["dois"], text_res_query["titles"]):
-                if pid not in q_id_to_title:
-                    q_id_to_title[pid] = title
-            merged_q_dois = list(q_id_to_title.keys())
-            merged_q_titles = [q_id_to_title[pid] for pid in merged_q_dois]
-
-            acc_only_drop_q = 0
-            if filter_q_acc:
-                merged_q_dois, merged_q_titles, acc_only_drop_q = (
-                    _drop_accession_only_without_text_hit(
-                        merged_q_dois,
-                        q_id_to_title,
-                        query_res["dois"],
-                        text_res_query["dois"],
-                    )
-                )
-
-            if q_acc and merged_q_dois:
-                query_ids_with_papers.add(q_acc)
-
-            query_paper_counts = {
-                "entrez_pubtator": 0,
-                "europepmc_accession": len(query_res["dois"]),
-                "text_pass1": text_res_query.get("pass1_count", 0),
-                "text_pass2": text_res_query.get("pass2_count", 0),
-                "text_pass2_base": text_res_query.get("pass2_base_count", 0),
-                "text_pass2_synonym": text_res_query.get("pass2_synonym_count", 0),
-                "text_pass2_overlap": text_res_query.get("pass2_overlap_count", 0),
-                "accession_only_dropped": acc_only_drop_q,
-            }
-            query_paper_ids_by_source = {
-                "entrez_pubtator": [],
-                "europepmc_accession": list(query_res["dois"]),
-                "text_pass1": list(text_res_query.get("pass1_dois", [])),
-                "text_pass2": list(text_res_query.get("pass2_dois", [])),
-                "text_pass2_base": list(text_res_query.get("pass2_base_dois", [])),
-                "text_pass2_synonym": list(
-                    text_res_query.get("pass2_synonym_dois", [])
-                ),
-                "text_pass2_overlap": list(
-                    text_res_query.get("pass2_overlap_dois", [])
-                ),
-            }
-
-        query_dois_col.append(json.dumps(merged_q_dois))
-        query_titles_col.append(json.dumps(merged_q_titles))
-        query_paper_counts_col.append(query_paper_counts)
-        query_paper_ids_by_source_col.append(json.dumps(query_paper_ids_by_source))
-        query_search_terms_col.append(json.dumps(q_search_terms))
-        query_paper_term_hits_col.append(json.dumps(q_paper_term_hits))
-        query_unattributed_term_hits_col.append(
-            json.dumps(q_unattributed_term_hits)
-        )
-        query_organism_fallbacks_col.append(json.dumps(q_organism_fallbacks))
-
-        # ------------------------------------------------------------
-        # Target side: Europe PMC-only retrieval (PubTator disabled)
-        # ------------------------------------------------------------
-        merged_t_dois: List[str] = []
-        merged_t_titles: List[str] = []
-        target_paper_counts: Dict[str, int] = {
-            "entrez_pubtator": 0,
-            "europepmc_accession": 0,
-            "text_pass1": 0,
-            "text_pass2": 0,
-            "text_pass2_base": 0,
-            "text_pass2_synonym": 0,
-            "text_pass2_overlap": 0,
-        }
-        target_paper_ids_by_source: Dict[str, List[str]] = {
-            "entrez_pubtator": [],
-            "europepmc_accession": [],
-            "text_pass1": [],
-            "text_pass2": [],
-            "text_pass2_base": [],
-            "text_pass2_synonym": [],
-            "text_pass2_overlap": [],
-        }
-
-        t_entrez_id = _normalize_entrez_id(row.get("target_entrez_id"))
-        t_from_entrez = t_entrez_id is not None
-        t_pubtator_used = False
-        t_pubtator_empty = False
-        t_search_terms: List[str] = []
-        t_paper_term_hits: Dict[str, List[Dict[str, Any]]] = {}
-        t_unattributed_term_hits: Dict[str, List[str]] = {}
-        t_organism_fallbacks: List[Dict[str, Any]] = []
-        if t_entrez_id is not None:
-            target_ids_seen.add(str(t_entrez_id))
-            t_pubtator_empty = True
-
-        # Fallback: UniProt citation + Europe PMC text search.
-        if not merged_t_dois:
-            target_res = run_europepmc_crossref(t_acc, session, uniprot_cache)
-            target_text_taxid: TaxidInput = (
-                target_taxids
-                if target_taxids is not None
-                else (target_taxid if target_taxid is not None else row_taxid)
-            )
-            text_res_target = run_europepmc_search_for_row(
-                row,
-                target_text_taxid,
-                session,
-                text_cache,
-                prefix="target",
-                extra_terms=gene_synonyms_by_entrez.get(t_entrez_id or -1, []),
-                organism_terms=target_organism_terms,
-            )
-            t_search_terms = list(text_res_target.get("search_terms") or [])
-            t_paper_term_hits = dict(text_res_target.get("paper_term_hits") or {})
-            t_unattributed_term_hits = dict(
-                text_res_target.get("unattributed_term_hit_dois_by_pass") or {}
-            )
-            t_organism_fallbacks = list(
-                text_res_target.get("organism_fallbacks") or []
-            )
-
-            if t_acc:
-                target_ids_seen.add(t_acc)
-                if target_res["dois"]:
-                    rows_target_from_europepmc_accession += 1
-                if text_res_target["dois"]:
-                    rows_target_from_text += 1
-
-            # Merge UniProt and text results for target (deduplicated by paper ID)
-            t_id_to_title: Dict[str, str] = {}
-            for pid, title in zip(target_res["dois"], target_res["titles"]):
-                if pid not in t_id_to_title:
-                    t_id_to_title[pid] = title
-            for pid, title in zip(text_res_target["dois"], text_res_target["titles"]):
-                if pid not in t_id_to_title:
-                    t_id_to_title[pid] = title
-            merged_t_dois = list(t_id_to_title.keys())
-            merged_t_titles = [t_id_to_title[pid] for pid in merged_t_dois]
-
-            acc_only_drop_t = 0
-            if filter_t_acc:
-                merged_t_dois, merged_t_titles, acc_only_drop_t = (
-                    _drop_accession_only_without_text_hit(
-                        merged_t_dois,
-                        t_id_to_title,
-                        target_res["dois"],
-                        text_res_target["dois"],
-                    )
-                )
-
-            if t_acc and merged_t_dois:
-                target_ids_with_papers.add(t_acc)
-
-            target_paper_ids_by_source = {
-                "entrez_pubtator": [],
-                "europepmc_accession": list(target_res["dois"]),
-                "text_pass1": list(text_res_target.get("pass1_dois", [])),
-                "text_pass2": list(text_res_target.get("pass2_dois", [])),
-                "text_pass2_base": list(text_res_target.get("pass2_base_dois", [])),
-                "text_pass2_synonym": list(
-                    text_res_target.get("pass2_synonym_dois", [])
-                ),
-                "text_pass2_overlap": list(
-                    text_res_target.get("pass2_overlap_dois", [])
-                ),
-            }
-            target_paper_counts = {
-                "entrez_pubtator": 0,
-                "europepmc_accession": len(target_res["dois"]),
-                "text_pass1": text_res_target.get("pass1_count", 0),
-                "text_pass2": text_res_target.get("pass2_count", 0),
-                "text_pass2_base": text_res_target.get("pass2_base_count", 0),
-                "text_pass2_synonym": text_res_target.get("pass2_synonym_count", 0),
-                "text_pass2_overlap": text_res_target.get("pass2_overlap_count", 0),
-                "accession_only_dropped": acc_only_drop_t,
-            }
-
-        target_dois_col.append(json.dumps(merged_t_dois))
-        target_titles_col.append(json.dumps(merged_t_titles))
-        target_paper_ids_by_source_col.append(json.dumps(target_paper_ids_by_source))
-        target_search_terms_col.append(json.dumps(t_search_terms))
-        target_paper_term_hits_col.append(json.dumps(t_paper_term_hits))
-        target_unattributed_term_hits_col.append(
-            json.dumps(t_unattributed_term_hits)
-        )
-        target_organism_fallbacks_col.append(json.dumps(t_organism_fallbacks))
-
-        # Write per-row trace (useful for debugging why a gene got 0 hits).
-        trace_obj = {
-            "row_idx": idx,
-            "query": str(row.get(query_id_col)),
-            "target": str(row.get(target_id_col)),
-            "query_entrez_id": q_entrez_id,
-            "target_entrez_id": t_entrez_id,
-            "query_uniprot": q_acc,
-            "target_uniprot": t_acc,
-            "query_pubtator_used": q_pubtator_used,
-            "query_pubtator_empty": q_pubtator_empty,
-            "pubtator_enabled": _PUBTATOR_ENABLED,
-            "pubtator_disabled_reason": _PUBTATOR_DISABLED_REASON,
-            "query_counts": query_paper_counts,
-            "query_search_terms": q_search_terms,
-            "query_paper_term_hits": q_paper_term_hits,
-            "query_term_hit_counts": _summarize_term_hits(q_paper_term_hits),
-            "query_unattributed_term_hit_dois_by_pass": q_unattributed_term_hits,
-            "query_organism_fallbacks": q_organism_fallbacks,
-            "accession_text_overlap_filter_query": filter_q_acc,
-            "query_dois_n": len(merged_q_dois),
-            "query_dois_sample": merged_q_dois[:10],
-            "target_pubtator_used": t_pubtator_used,
-            "target_pubtator_empty": t_pubtator_empty,
-            "target_counts": target_paper_counts,
-            "target_search_terms": t_search_terms,
-            "target_paper_term_hits": t_paper_term_hits,
-            "target_term_hit_counts": _summarize_term_hits(t_paper_term_hits),
-            "target_unattributed_term_hit_dois_by_pass": t_unattributed_term_hits,
-            "target_organism_fallbacks": t_organism_fallbacks,
-            "accession_text_overlap_filter_target": filter_t_acc,
-            "target_dois_n": len(merged_t_dois),
-            "target_dois_sample": merged_t_dois[:10],
-        }
-        trace_fh.write(json.dumps(trace_obj, ensure_ascii=False) + "\n")
+    for out in row_results:
+        assert out is not None
+        query_dois_col.append(out["query_dois"])
+        query_titles_col.append(out["query_titles"])
+        target_dois_col.append(out["target_dois"])
+        target_titles_col.append(out["target_titles"])
+        query_paper_counts_col.append(out["query_paper_counts"])
+        query_paper_ids_by_source_col.append(out["query_paper_ids_by_source"])
+        target_paper_ids_by_source_col.append(out["target_paper_ids_by_source"])
+        query_search_terms_col.append(out["query_search_terms"])
+        target_search_terms_col.append(out["target_search_terms"])
+        query_paper_term_hits_col.append(out["query_paper_term_hits"])
+        target_paper_term_hits_col.append(out["target_paper_term_hits"])
+        query_unattributed_term_hits_col.append(out["query_unattributed_term_hits"])
+        target_unattributed_term_hits_col.append(out["target_unattributed_term_hits"])
+        query_organism_fallbacks_col.append(out["query_organism_fallbacks"])
+        target_organism_fallbacks_col.append(out["target_organism_fallbacks"])
+        st = out["stats"]
+        if st["q_entrez_id"] is not None:
+            query_ids_seen.add(st["q_entrez_id"])
+        if st["t_entrez_id"] is not None:
+            target_ids_seen.add(st["t_entrez_id"])
+        if st["q_acc"]:
+            query_ids_seen.add(st["q_acc"])
+            if st["q_with_papers"]:
+                query_ids_with_papers.add(st["q_acc"])
+        if st["t_acc"]:
+            target_ids_seen.add(st["t_acc"])
+            if st["t_with_papers"]:
+                target_ids_with_papers.add(st["t_acc"])
+        if st["q_from_accession"]:
+            rows_query_from_europepmc_accession += 1
+        if st["q_from_text"]:
+            rows_query_from_text += 1
+        if st["t_from_accession"]:
+            rows_target_from_europepmc_accession += 1
+        if st["t_from_text"]:
+            rows_target_from_text += 1
+        trace_fh.write(json.dumps(out["trace"], ensure_ascii=False) + "\n")
 
     trace_fh.close()
 
@@ -2178,13 +2428,13 @@ def main() -> int:
         "--query-taxids",
         type=str,
         default=None,
-        help="Comma-separated query-organism taxids searched together (overrides --query-taxid).",
+        help="Query-organism taxids searched together ('|' or ',' separated; overrides --query-taxid).",
     )
     parser.add_argument(
         "--target-taxids",
         type=str,
         default=None,
-        help="Comma-separated target-organism taxids searched together (overrides --target-taxid).",
+        help="Target-organism taxids searched together ('|' or ',' separated; overrides --target-taxid).",
     )
     parser.add_argument(
         "--query-organism-terms",
@@ -2227,6 +2477,24 @@ def main() -> int:
         ),
     )
     parser.add_argument(
+        "--workers",
+        type=int,
+        default=None,
+        help=(
+            "Parallel alignment-row workers (default: AUTO_LIT_SEARCH_WORKERS or 8). "
+            "Europe PMC requests still share a process-wide rate gate."
+        ),
+    )
+    parser.add_argument(
+        "--term-hit-attribution",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help=(
+            "Enable/disable per-term Europe PMC re-queries for audit attribution. "
+            "Default is off (AUTO_LIT_TERM_HIT_ATTRIBUTION=0)."
+        ),
+    )
+    parser.add_argument(
         "--output-format",
         type=str,
         choices=["json", "csv"],
@@ -2235,6 +2503,11 @@ def main() -> int:
     )
 
     args = parser.parse_args()
+
+    if args.term_hit_attribution is not None:
+        os.environ["AUTO_LIT_TERM_HIT_ATTRIBUTION"] = (
+            "1" if args.term_hit_attribution else "0"
+        )
 
     output_dir = args.output_dir or os.path.dirname(os.path.abspath(args.output))
     os.makedirs(output_dir, exist_ok=True)
@@ -2250,9 +2523,13 @@ def main() -> int:
     def _parse_taxid_csv(raw: Optional[str]) -> Optional[List[int]]:
         if raw is None:
             return None
-        values = [int(part.strip()) for part in raw.split(",") if part.strip()]
+        # Accept | (preferred for Slurm --export) or commas.
+        sep = "|" if "|" in raw else ","
+        values = [int(part.strip()) for part in raw.split(sep) if part.strip()]
         if not values or any(value <= 0 for value in values):
-            parser.error("taxid lists must contain positive comma-separated integers")
+            parser.error(
+                "taxid lists must contain positive integers separated by '|' or ','"
+            )
         return list(dict.fromkeys(values))
 
     def _parse_organism_terms(raw: Optional[str]) -> Optional[List[str]]:
@@ -2276,6 +2553,7 @@ def main() -> int:
         target_organism_terms=_parse_organism_terms(args.target_organism_terms),
         output_dir=output_dir,
         use_cache=not args.no_cache,
+        workers=args.workers,
     )
 
     logger.info(f"Writing search output to: {args.output}")
