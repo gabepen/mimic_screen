@@ -75,8 +75,10 @@ def run_stage1(cfg: Stage1Config) -> int:
         "OUTPUT_DIR": str(mapping_work_dir),
         "QUERY_TAXID": str(cfg.query_taxid),
         "TARGET_TAXID": str(cfg.target_taxid),
-        "QUERY_TAXIDS": ",".join(str(value) for value in cfg.query_taxids),
-        "TARGET_TAXIDS": ",".join(str(value) for value in cfg.target_taxids),
+        # Use | not commas: sbatch --export splits on commas, so
+        # QUERY_TAXIDS=272624,446 would silently become just 272624.
+        "QUERY_TAXIDS": "|".join(str(value) for value in cfg.query_taxids),
+        "TARGET_TAXIDS": "|".join(str(value) for value in cfg.target_taxids),
         "QUERY_ORGANISM_TERMS": "|".join(cfg.query_organism_terms),
         "TARGET_ORGANISM_TERMS": "|".join(cfg.target_organism_terms),
         "QUERY_COL": cfg.query_col,
@@ -94,8 +96,8 @@ def run_stage1(cfg: Stage1Config) -> int:
         "OUTPUT_DIR": str(search_work_dir),
         "QUERY_TAXID": str(cfg.query_taxid),
         "TARGET_TAXID": str(cfg.target_taxid),
-        "QUERY_TAXIDS": ",".join(str(value) for value in cfg.query_taxids),
-        "TARGET_TAXIDS": ",".join(str(value) for value in cfg.target_taxids),
+        "QUERY_TAXIDS": "|".join(str(value) for value in cfg.query_taxids),
+        "TARGET_TAXIDS": "|".join(str(value) for value in cfg.target_taxids),
         "QUERY_ORGANISM_TERMS": "|".join(cfg.query_organism_terms),
         "TARGET_ORGANISM_TERMS": "|".join(cfg.target_organism_terms),
         "QUERY_COL": cfg.query_col,
@@ -104,6 +106,10 @@ def run_stage1(cfg: Stage1Config) -> int:
         "MAMBA_BIN": str(cfg.cluster.mamba_bin),
         "NO_CACHE": "1" if cfg.no_cache else "",
         "ACCESSION_TEXT_OVERLAP": cfg.accession_text_overlap,
+        "SEARCH_WORKERS": (
+            str(cfg.search_workers) if cfg.search_workers is not None else ""
+        ),
+        "TERM_HIT_ATTRIBUTION": "1" if cfg.term_hit_attribution else "0",
     }
 
     mapping_job_id = ""

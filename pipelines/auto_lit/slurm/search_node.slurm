@@ -21,6 +21,8 @@ CONDA_ENV="${CONDA_ENV:-evorate}"
 : "${MAMBA_BIN:?MAMBA_BIN must be set (export or set in cluster config)}"
 NO_CACHE="${NO_CACHE:-}"
 ACCESSION_TEXT_OVERLAP="${ACCESSION_TEXT_OVERLAP:-}"
+SEARCH_WORKERS="${SEARCH_WORKERS:-}"
+TERM_HIT_ATTRIBUTION="${TERM_HIT_ATTRIBUTION:-0}"
 QUERY_TAXIDS="${QUERY_TAXIDS:-${QUERY_TAXID}}"
 TARGET_TAXIDS="${TARGET_TAXIDS:-${TARGET_TAXID}}"
 QUERY_ORGANISM_TERMS="${QUERY_ORGANISM_TERMS:-}"
@@ -28,6 +30,10 @@ TARGET_ORGANISM_TERMS="${TARGET_ORGANISM_TERMS:-}"
 
 export PYTHONPATH="${REPO_ROOT}/src:${PYTHONPATH:-}"
 export PYTHONUNBUFFERED=1
+export AUTO_LIT_TERM_HIT_ATTRIBUTION="${TERM_HIT_ATTRIBUTION}"
+if [[ -n "${SEARCH_WORKERS}" ]]; then
+    export AUTO_LIT_SEARCH_WORKERS="${SEARCH_WORKERS}"
+fi
 
 echo "search_node: REPO_ROOT=${REPO_ROOT}"
 echo "search_node: INPUT_IDMAP_CSV=${INPUT_IDMAP_CSV}"
@@ -37,6 +43,7 @@ echo "search_node: QUERY_TAXIDS=${QUERY_TAXIDS} TARGET_TAXIDS=${TARGET_TAXIDS}"
 echo "search_node: QUERY_ORGANISM_TERMS=${QUERY_ORGANISM_TERMS}"
 echo "search_node: TARGET_ORGANISM_TERMS=${TARGET_ORGANISM_TERMS}"
 echo "search_node: QUERY_COL=${QUERY_COL} TARGET_COL=${TARGET_COL}"
+echo "search_node: SEARCH_WORKERS=${SEARCH_WORKERS:-default} TERM_HIT_ATTRIBUTION=${TERM_HIT_ATTRIBUTION}"
 echo "search_node: CONDA_ENV=${CONDA_ENV}"
 
 if [[ ! -x "${MAMBA_BIN}" ]]; then
@@ -74,6 +81,14 @@ if [[ "${NO_CACHE}" == "1" ]]; then
 fi
 if [[ -n "${ACCESSION_TEXT_OVERLAP}" ]]; then
     PY_ARGS+=(--accession-text-overlap "${ACCESSION_TEXT_OVERLAP}")
+fi
+if [[ -n "${SEARCH_WORKERS}" ]]; then
+    PY_ARGS+=(--workers "${SEARCH_WORKERS}")
+fi
+if [[ "${TERM_HIT_ATTRIBUTION}" == "1" ]]; then
+    PY_ARGS+=(--term-hit-attribution)
+else
+    PY_ARGS+=(--no-term-hit-attribution)
 fi
 
 run_python -u "${PY_ARGS[@]}"

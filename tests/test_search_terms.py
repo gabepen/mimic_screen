@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import json
+
 import pandas as pd
 import auto_lit_search.search as search_module
 
@@ -224,7 +226,9 @@ def test_from_terms_filters_gap_synonym():
 
 
 def test_term_hit_attribution_records_exact_matching_term(monkeypatch):
-    def fake_search(query, _session, _cache, delay=0):
+    monkeypatch.setenv("AUTO_LIT_TERM_HIT_ATTRIBUTION", "1")
+
+    def fake_search(query, _session, _cache, delay=0, gate=None):
         if '"Cs1"' in query:
             return {"dois": ["doi:one"], "titles": ["one"]}
         if '"CG3861"' in query:
@@ -267,7 +271,9 @@ def test_term_hit_attribution_records_exact_matching_term(monkeypatch):
 
 
 def test_taxid_fallback_requires_organism_name_text(monkeypatch):
-    def fake_search(query, _session, _cache, delay=0):
+    monkeypatch.setenv("AUTO_LIT_TERM_HIT_ATTRIBUTION", "1")
+
+    def fake_search(query, _session, _cache, delay=0, gate=None):
         if "ORGANISM_ID" in query:
             return {
                 "dois": [],
@@ -323,7 +329,7 @@ def test_taxid_fallback_requires_organism_name_text(monkeypatch):
 
 
 def test_failed_taxid_request_does_not_trigger_fallback(monkeypatch):
-    def fake_search(_query, _session, _cache, delay=0):
+    def fake_search(_query, _session, _cache, delay=0, gate=None):
         return {
             "dois": [],
             "titles": [],
@@ -345,3 +351,74 @@ def test_failed_taxid_request_does_not_trigger_fallback(monkeypatch):
         organism_terms=["Legionella"],
     )
     assert result["organism_fallbacks"] == []
+
+
+def test_request_gate_spaces_starts():
+    gate = search_module.RequestGate(0.05)
+    t0 = search_module.time.monotonic()
+    gate.wait()
+    gate.wait()
+    elapsed = search_module.time.monotonic() - t0
+    assert elapsed >= 0.045
+
+
+def test_locked_cache_get_store_roundtrip():
+    cache = search_module.LockedCache()
+    hit, _ = cache.get_if_present("q")
+    assert hit is False
+    cache.store("q", {"dois": ["a"]})
+    hit, val = cache.get_if_present("q")
+    assert hit is True
+    assert val == {"dois": ["a"]}
+    # store is first-writer-wins
+    assert cache.store("q", {"dois": ["b"]}) == {"dois": ["a"]}
+
+
+def test_parallel_run_preserves_row_order(monkeypatch):
+    monkeypatch.setenv("AUTO_LIT_TERM_HIT_ATTRIBUTION", "0")
+
+    def fake_crossref(uniprot_id, session, cache, delay=0.35, gate=None):
+        return {"dois": [f"acc:{uniprot_id}"], "titles": [str(uniprot_id)]}
+
+    def fake_text(row, taxid, session, cache, delay=0.35, prefix="query",
+                  extra_terms=None, organism_terms=None, gate=None):
+        uid = str(row.get(prefix) or "")
+        return {
+            "dois": [f"text:{prefix}:{uid}"],
+            "titles": [uid],
+            "pass1_count": 0,
+            "pass2_count": 1,
+            "pass1_dois": [],
+            "pass2_dois": [f"text:{prefix}:{uid}"],
+            "pass2_base_count": 1,
+            "pass2_synonym_count": 0,
+            "pass2_overlap_count": 0,
+            "pass2_base_dois": [f"text:{prefix}:{uid}"],
+            "pass2_synonym_dois": [],
+            "pass2_overlap_dois": [],
+            "search_terms": [],
+            "paper_term_hits": {},
+            "unattributed_term_hit_dois_by_pass": {},
+            "organism_fallbacks": [],
+        }
+
+    monkeypatch.setattr(search_module, "run_europepmc_crossref", fake_crossref)
+    monkeypatch.setattr(search_module, "run_europepmc_search_for_row", fake_text)
+    monkeypatch.setattr(search_module, "_load_human_gene_name_synonyms", lambda **k: {})
+    monkeypatch.setattr(search_module, "_load_mygene_synonyms_for_entrez", lambda *a, **k: {})
+    monkeypatch.setattr(search_module, "_configure_file_logging", lambda *_a, **_k: None)
+    monkeypatch.setattr(search_module, "_force_ipv4_resolution", lambda: None)
+
+    df = pd.DataFrame(
+        {
+            "query": ["Q1", "Q2", "Q3"],
+            "target": ["T1", "T2", "T3"],
+        }
+    )
+    out = search_module.run(df, output_dir="/tmp", use_cache=False, workers=3, delay=0)
+    assert list(out["query"]) == ["Q1", "Q2", "Q3"]
+    assert [json.loads(x)[0] for x in out["query_paper_dois"]] == [
+        "acc:Q1",
+        "acc:Q2",
+        "acc:Q3",
+    ]
