@@ -36,7 +36,7 @@ def test_normalize_criterion_scores_accepts_int_or_object():
     }
     out = normalize_criterion_scores(raw)
     assert out["functional_characterisation_depth"] == {"score": 2, "note": ""}
-    assert out["biochemical_property_definition"]["score"] == 1
+    assert out["biochemical_property_definition"] == {"score": 1, "note": ""}
     assert "bad" not in out
 
 
@@ -85,7 +85,7 @@ def test_microbe_rubric_role_mapping():
     assert primary_axis_for_role("microbe") == "system_relevance"
 
 
-def test_derive_axis_rationales_from_criterion_notes():
+def test_derive_axis_rationales_scores_only_ignores_notes():
     host = _load_rubric("host_rubric_v1.json")
     crit_ids = required_scored_criterion_ids(host)
     scores = {cid: {"score": 0, "note": ""} for cid in crit_ids}
@@ -96,7 +96,9 @@ def test_derive_axis_rationales_from_criterion_notes():
 
     rax = derive_axis_rationales_from_criterion_scores(host, scores)
     assert HOST_PRIMARY_AXIS in rax
-    assert "Rab GTPase" in rax[HOST_PRIMARY_AXIS]
+    assert "exploitation_process_overlap=2" in rax[HOST_PRIMARY_AXIS]
+    assert "Rab GTPase" not in rax[HOST_PRIMARY_AXIS]
+    assert "partial assay" not in rax[HOST_PRIMARY_AXIS]
     agg = aggregate_paper_scores(host, scores, rubric_role="host")
     assert agg["rubric_axis_rationales"][HOST_PRIMARY_AXIS] == rax[HOST_PRIMARY_AXIS]
 

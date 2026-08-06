@@ -11,7 +11,6 @@ from auto_lit_search.synthesis_scorecard import (
     merge_synthesis_repair,
     mimicry_flag_handling_block,
     parse_llm_scorecard,
-    query_asserts_molecular_mimicry,
     quick_summary_prompt_footer,
     score_to_dimension_tier,
     synthesis_output_diagnosis,
@@ -123,10 +122,10 @@ def test_merge_synthesis_repair_attaches_json_footer() -> None:
     assert synthesis_output_well_formed(merged)
 
 
-def test_quick_summary_footer_has_mimicry_anchors() -> None:
+def test_quick_summary_footer_asks_for_mimicry_score() -> None:
     footer = quick_summary_prompt_footer()
-    assert "80-100: query literature establishes molecular/functional mimicry" in footer
-    assert "Do not lower mimicry_plausibility_score" in footer
+    assert "mimicry_plausibility_score" in footer
+    assert "Score mimicry_plausibility from the graded paper evidence" in footer
 
 
 def test_mimicry_flag_handling_block_from_host_rubric() -> None:
@@ -159,22 +158,8 @@ def _gp(**kwargs):
     return SimpleNamespace(**defaults)
 
 
-def test_query_mimicry_detected_from_criterion_notes() -> None:
-    papers = [
-        _gp(
-            claim_summary="Translocated effector.",
-            criterion_scores={
-                "system_context": {
-                    "score": 2,
-                    "note": "Sec7-domain fold matching eukaryotic Arf GEFs.",
-                }
-            },
-        )
-    ]
-    assert query_asserts_molecular_mimicry(papers)
-
-
-def test_query_mimicry_literature_floors_rubric_and_protects_blend() -> None:
+def test_build_conclusion_uses_synthesis_scores_not_rubric_blend() -> None:
+    """Top-level scores must match synthesis Quick results, not grade aggregates."""
     papers = [
         _gp(
             paper_role="query",
@@ -185,22 +170,21 @@ def test_query_mimicry_literature_floors_rubric_and_protects_blend() -> None:
             paper_id="h1",
             file_name="h1.txt",
             paper_role="target",
-            relevance_grade=0.4,
-            rubric_dimension_scores={"infection_process_relevance": 0.3},
-            claim_summary="Host actin regulator, infection-naive.",
+            relevance_grade=0.9,
+            rubric_dimension_scores={
+                "infection_process_relevance": 0.9,
+                "protein_characterisation_quality": 0.9,
+            },
+            claim_summary="Host actin regulator.",
+            # Host mimicry tag would have inflated the old rubric index to 85.
+            rubric_tags={"mimicry_potential_flag": "mimicry_strong"},
         ),
     ]
-    assert query_asserts_molecular_mimicry(papers)
-    rubric = compute_rubric_scorecard(papers)
-    assert rubric["evidence"]["query_mimicry_literature"] is True
-    assert rubric["mimicry_plausibility"]["score"] >= 80
-
-    # Conservative LLM pair score must not demote query-side molecular mimicry.
     synth = (
         "Quick results summary:\n"
         "```json\n"
         "{\n"
-        '  "headline": "Known F-box mimic; Foldseek host not co-mentioned.",\n'
+        '  "headline": "Query effector literature; Foldseek host not co-mentioned.",\n'
         '  "host_exploitation_score": 40,\n'
         '  "query_effector_score": 90,\n'
         '  "mimicry_plausibility_score": 20,\n'
@@ -212,16 +196,18 @@ def test_query_mimicry_literature_floors_rubric_and_protects_blend() -> None:
         "```\n"
     )
     conc = build_conclusion(papers, synth, synthesis_status="ok")
-    assert conc["mimicry_plausibility"]["score"] >= 80
-    assert score_to_dimension_tier(conc["mimicry_plausibility"]["score"]) == "Strong"
+    assert conc["mimicry_plausibility"]["score"] == 20
+    assert conc["mimicry_plausibility"]["source"] == "synthesis"
+    assert conc["query_effector"]["score"] == 90
+    assert conc["host_exploitation"]["score"] == 40
+    assert conc["pair_priority"]["score"] == 50
+    assert conc["synthesis_scores"]["mimicry_plausibility_score"] == 20
+    # Rubric diagnostics still available and may disagree.
+    assert conc["rubric_indices"]["mimicry_plausibility"]["score"] == 85
 
 
-def test_no_query_mimicry_language_allows_low_llm_blend() -> None:
+def test_build_conclusion_falls_back_to_rubric_when_synthesis_missing() -> None:
     papers = [
-        _gp(
-            claim_summary="Translocated Dot/Icm effector with phospholipase activity.",
-            rationale="Strong effector evidence without mimicry wording.",
-        ),
         _gp(
             paper_id="h1",
             file_name="h1.txt",
@@ -234,22 +220,44 @@ def test_no_query_mimicry_language_allows_low_llm_blend() -> None:
             rubric_tags={"mimicry_potential_flag": "none"},
         ),
     ]
-    assert not query_asserts_molecular_mimicry(papers)
+    conc = build_conclusion(papers, "", synthesis_status="grades_only")
+    assert conc["mimicry_plausibility"]["source"] == "rubric"
+    assert conc["synthesis_scores"] == {}
+    assert conc["mimicry_plausibility"]["score"] == conc["rubric_indices"][
+        "mimicry_plausibility"
+    ]["score"]
+
+
+def test_optional_legacy_blend_still_available() -> None:
+    papers = [
+        _gp(
+            paper_id="h1",
+            file_name="h1.txt",
+            paper_role="target",
+            relevance_grade=0.9,
+            rubric_dimension_scores={
+                "infection_process_relevance": 0.9,
+                "protein_characterisation_quality": 0.9,
+            },
+            rubric_tags={"mimicry_potential_flag": "mimicry_strong"},
+        ),
+    ]
     synth = (
         "Quick results summary:\n"
         "```json\n"
         "{\n"
-        '  "headline": "Effector yes; pair mimicry unclear.",\n'
-        '  "host_exploitation_score": 50,\n'
-        '  "query_effector_score": 90,\n'
+        '  "headline": "x",\n'
+        '  "host_exploitation_score": 10,\n'
+        '  "query_effector_score": 10,\n'
         '  "mimicry_plausibility_score": 20,\n'
-        '  "pair_priority_score": 55,\n'
+        '  "pair_priority_score": 10,\n'
         '  "best_host_paper": "h1",\n'
-        '  "best_query_paper": "p1",\n'
-        '  "main_uncertainties": "No pair link."\n'
+        '  "best_query_paper": "",\n'
+        '  "main_uncertainties": "n"\n'
         "}\n"
         "```\n"
     )
-    conc = build_conclusion(papers, synth, synthesis_status="ok")
-    # Without query mimicry literature, LLM can still pull blended mimicry down.
-    assert conc["mimicry_plausibility"]["score"] < 80
+    conc = build_conclusion(papers, synth, synthesis_status="ok", rubric_weight=0.6)
+    # 0.6*85 + 0.4*20 = 51 + 8 = 59
+    assert conc["mimicry_plausibility"]["score"] == 59
+    assert conc["mimicry_plausibility"]["source"] == "blend"

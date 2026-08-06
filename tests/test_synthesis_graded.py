@@ -14,6 +14,7 @@ def _gp(
     relevance: float,
     *,
     max_axis: float = 0.0,
+    no_meaningful_mention: bool = False,
 ) -> SimpleNamespace:
     axis = max(max_axis, relevance)
     return SimpleNamespace(
@@ -26,6 +27,7 @@ def _gp(
         criterion_scores={},
         rationale="",
         rubric_tags={},
+        no_meaningful_mention=no_meaningful_mention,
     )
 
 
