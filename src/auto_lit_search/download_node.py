@@ -38,7 +38,10 @@ from auto_lit_search.scheduler_http import post_run_alignment_graded
 from auto_lit_search.slurm_utils import (
     get_job_node,
     get_job_state,
+    grader_scale_down_should_trigger,
     is_terminal_job_state,
+    scancel_jobs,
+    select_idle_grader_jobs_to_kill,
 )
 
 logger.remove()
@@ -943,6 +946,22 @@ def run(
         len(data) if isinstance(data, dict) else 0,
     )
     sys.stdout.flush()
+    planned_alignment_ids: set[str] = set()
+    if isinstance(data, dict):
+        for query_id, alignments in data.items():
+            if not isinstance(alignments, list):
+                continue
+            for al in alignments:
+                if not isinstance(al, dict):
+                    continue
+                target = al.get("target") or ""
+                aid = f"{query_id}_{target}".replace("/", "_").replace(" ", "_")
+                if _alignment_paper_ids(al):
+                    planned_alignment_ids.add(aid)
+    logger.info(
+        "download_node: {} alignment packet(s) planned from search JSON",
+        len(planned_alignment_ids),
+    )
     collection_org = os.environ.get("COLLECTION_ORG", "ucsc").strip() or "ucsc"
     collection_auth_scope = (
         os.environ.get("COLLECTION_AUTH_SCOPE", "email_only").strip() or "email_only"
@@ -1042,6 +1061,29 @@ def run(
             else ""
         ),
     )
+    try:
+        cluster_respect = max(0, int(os.environ.get("CLUSTER_RESPECT", "0") or "0"))
+    except ValueError:
+        cluster_respect = 0
+    try:
+        respect_threshold = max(
+            0, int(float(os.environ.get("RESPECT_THRESHOLD", "0") or "0"))
+        )
+    except ValueError:
+        respect_threshold = 0
+    grader_scale_down_done = False
+    grader_scale_down_file = os.environ.get("GRADER_SCALE_DOWN_FILE", "").strip()
+    if not grader_scale_down_file and run_logs_dir:
+        grader_scale_down_file = os.path.join(
+            run_logs_dir, "grader_scale_down_jobs.txt"
+        )
+    if cluster_respect > 0 and respect_threshold > 0:
+        logger.info(
+            "download_node: cluster_respect enabled "
+            "(kill_up_to={}, when remaining grade packets <= {})",
+            cluster_respect,
+            respect_threshold,
+        )
     docling_submit_max_attempts = max(
         1, int(os.environ.get("DOCLING_SUBMIT_MAX_ATTEMPTS", "4"))
     )
@@ -1065,6 +1107,19 @@ def run(
 
     def _graded_path(alignment_id: str) -> str:
         return os.path.join(output_root, f"{alignment_id}_graded.json")
+
+    def _remaining_grade_packets() -> int:
+        """Alignments that still need grading (no graded.json yet, not FAILED)."""
+        n = 0
+        for aid in planned_alignment_ids:
+            if _graded_exists(aid):
+                continue
+            with scheduler_lock:
+                st = alignment_states.get(aid)
+                if st and st.get("state") == STATE_FAILED:
+                    continue
+            n += 1
+        return n
 
     def _results_path(alignment_id: str) -> str:
         return os.path.join(output_root, f"{alignment_id}_results.json")
@@ -1762,6 +1817,93 @@ def run(
                 )
                 _write_state(pending_aid)
 
+    def _maybe_cluster_respect_scale_down() -> None:
+        """Cancel idle grader Slurm jobs once remaining grade packets hit respect_threshold."""
+        nonlocal grader_scale_down_done
+        if grader_scale_down_done:
+            return
+        if cluster_respect <= 0 or respect_threshold <= 0:
+            return
+        remaining = _remaining_grade_packets()
+        if not grader_scale_down_should_trigger(
+            remaining_packets=remaining,
+            respect_threshold=respect_threshold,
+        ):
+            return
+
+        with scheduler_lock:
+            urls = list(grader_url_bases)
+            inflight_by_url = {
+                u: sum(
+                    1
+                    for meta in grader_inflight.values()
+                    if str(meta.get("grader_url_base") or "") == u
+                )
+                for u in urls
+            }
+
+        url_by_port: Dict[int, str] = {}
+        for url in urls:
+            try:
+                port = urlparse(url).port
+            except Exception:
+                port = None
+            if port is not None:
+                url_by_port[int(port)] = url
+
+        kill_ids = select_idle_grader_jobs_to_kill(
+            job_specs=list(grader_job_specs),
+            inflight_by_url=inflight_by_url,
+            url_by_port=url_by_port,
+            n_kill=cluster_respect,
+            min_keep=1,
+        )
+        if not kill_ids:
+            return
+
+        kill_set = set(kill_ids)
+        ports_to_drop = {
+            int(spec["port"])
+            for spec in grader_job_specs
+            if str(spec.get("job_id") or "").strip() in kill_set
+        }
+        drop_urls = {url_by_port[p] for p in ports_to_drop if p in url_by_port}
+
+        with scheduler_lock:
+            grader_url_bases[:] = [u for u in grader_url_bases if u not in drop_urls]
+        for spec in grader_job_specs:
+            if str(spec.get("job_id") or "").strip() in kill_set:
+                spec["failed"] = True
+                spec["failed_logged"] = True
+
+        if grader_scale_down_file:
+            try:
+                os.makedirs(os.path.dirname(grader_scale_down_file) or ".", exist_ok=True)
+                tmp = grader_scale_down_file + ".tmp"
+                with open(tmp, "w", encoding="utf-8") as f:
+                    for jid in kill_ids:
+                        f.write(f"{jid}\n")
+                os.replace(tmp, grader_scale_down_file)
+            except OSError as e:
+                logger.warning(
+                    "download_node: could not write grader scale-down file {}: {}",
+                    grader_scale_down_file,
+                    e,
+                )
+
+        cancelled = scancel_jobs(kill_ids)
+        grader_scale_down_done = True
+        logger.info(
+            "download_node: cluster_respect scale-down "
+            "(remaining_packets={}, threshold={}, "
+            "requested_kill={}, scancel_ok={}, remaining_endpoints={})",
+            remaining,
+            respect_threshold,
+            kill_ids,
+            cancelled,
+            len(grader_url_bases),
+        )
+
     _discovery_status_tick = 0
 
     def _tick_scheduler() -> None:
@@ -1791,6 +1933,7 @@ def run(
         _poll_inflight()
         _dispatch_docling()
         _dispatch_grader()
+        _maybe_cluster_respect_scale_down()
         _dispatch_synthesis()
 
     def _preload_scheduler_states() -> int:

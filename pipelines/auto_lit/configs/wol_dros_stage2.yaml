@@ -8,7 +8,10 @@ stage2:
   microbe_rubric: rubrics/wolbachia_wmel_rubric_v1.json
   instructions_file: prompts/wol_dros_instructions.txt
   slurm:
-    num_grader_nodes: 10
+    num_grader_nodes: 5
+    # Kill this many idle graders once remaining grade packets <= respect_threshold (0 = off).
+    cluster_respect: 3
+    respect_threshold: 20
     num_synthesis_nodes: 2
     grader_script: slurm/gpu_grader_a5500.slurm
     gpu_port: 9000
@@ -27,3 +30,4 @@ stage2:
     STAGE_WATCHDOG_SECONDS: "3600"
     GRADER_PAPER_WORKERS: "1"
     VLLM_MAX_NUM_SEQS: "1"
+    GRADER_REUSE_EXISTING: "1"

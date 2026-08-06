@@ -20,6 +20,10 @@ from auto_lit_search.analysis_packet import (
     RunAlignmentGradedRequest,
     RunAlignmentResponse,
 )
+from auto_lit_search.grader_focus_identity import (
+    enforce_focus_identity,
+    focus_identity_prompt_block,
+)
 from auto_lit_search.env_config import env_flag
 from auto_lit_search.paper_excerpt import (
     build_grader_excerpt_with_meta,
@@ -29,12 +33,14 @@ from auto_lit_search.paper_io import (
     DOWNLOAD_MANIFEST_FILENAME,
     ensure_dir as _ensure_dir,
     extract_paper_role as _extract_paper_role,
+    focus_terms_for_paper_role,
     identification_terms_block,
     list_paper_files as _list_paper_files,
     paper_id_by_artifact_basename as _paper_id_by_artifact_basename,
     read_text as _read_text,
 )
 from auto_lit_search.rubric_scoring import (
+    CLAIM_SUMMARY_MAX_CHARS,
     GRADING_SCHEMA_VERSION,
     aggregate_paper_scores,
     criteria_prompt_block,
@@ -55,8 +61,6 @@ _GRADER_LLM_JSONL_LOCK = threading.Lock()
 _MODEL_ID_CACHE_LOCK = threading.Lock()
 _DEFAULT_GRADER_MAX_TOKENS = 4096
 _DEFAULT_GRADER_PAPER_WORKERS = 3
-_GRADER_CRITERION_NOTE_MAX_CHARS = 60
-_GRADER_CLAIM_SUMMARY_MAX_CHARS = 150
 
 
 def _grader_paper_workers() -> int:
@@ -88,14 +92,16 @@ def _grader_json_output_instructions(rubric: Dict[str, Any], rubric_role: str) -
     return (
         "OUTPUT (pipeline JSON schema v2; not part of the rubric file):\n"
         "Return strict JSON only with keys:\n"
-        "criterion_scores (object: each scored criterion id → "
-        f"{{score: 0|1|2, note: optional string ≤{_GRADER_CRITERION_NOTE_MAX_CHARS} chars}}),\n"
+        "criterion_scores (object: each scored criterion id → {score: 0|1|2}; "
+        "do not include per-criterion notes),\n"
         "mention_type (string: focal_study | supporting_evidence | incidental_mention | "
         "negative_result | methodological_reference),\n"
         "no_meaningful_mention (boolean),\n"
         f"{host_meta}"
         f"{flag_line}"
-        f"claim_summary (optional string ≤{_GRADER_CLAIM_SUMMARY_MAX_CHARS} chars).\n"
+        f"claim_summary (string ≤{CLAIM_SUMMARY_MAX_CHARS} chars; "
+        "MUST begin with the focus gene id or symbol, or exactly NO_FOCUS_MENTION; "
+        "put the paper's focus-gene finding here — this is the only grader prose field).\n"
         "Required criterion_scores ids:\n"
         f"{scored_list}\n"
         "Do not output rubric_dimension_scores, axis totals, paper_grade, or relevance_grade; "
@@ -103,18 +109,19 @@ def _grader_json_output_instructions(rubric: Dict[str, Any], rubric_role: str) -
     )
 
 
+
 def _clamp_parsed_metadata(parsed: Dict[str, Any]) -> None:
     cs = parsed.get("criterion_scores")
     if isinstance(cs, dict):
-        for crit_id, entry in cs.items():
-            if not isinstance(entry, dict):
-                continue
-            if entry.get("note"):
-                entry["note"] = str(entry["note"]).strip()[:_GRADER_CRITERION_NOTE_MAX_CHARS]
+        for _crit_id, entry in cs.items():
+            if isinstance(entry, dict) and "note" in entry:
+                entry["note"] = ""
     if parsed.get("claim_summary"):
         parsed["claim_summary"] = str(parsed["claim_summary"]).strip()[
-            :_GRADER_CLAIM_SUMMARY_MAX_CHARS
+            :CLAIM_SUMMARY_MAX_CHARS
         ]
+    if parsed.get("rationale"):
+        parsed["rationale"] = str(parsed["rationale"]).strip()[:CLAIM_SUMMARY_MAX_CHARS]
 
 
 def _env_positive_float(name: str, default: float) -> float:
@@ -303,15 +310,22 @@ def _build_grader_system_prompt(
 ) -> str:
     criterion_block = criteria_prompt_block(rubric)
     term_block = identification_terms_block(req.query, req.target_id, req.gene_context)
-    gene_focus = (
-        "the QUERY gene (pathogen / microbe-side rubric context)"
-        if role == "query"
-        else (
-            "the TARGET gene (host-side rubric context)"
-            if role == "target"
-            else "the gene implied by this paper's role in the pair below (query vs target)"
-        )
+    focus_terms = focus_terms_for_paper_role(
+        role, req.query, req.target_id, req.gene_context
     )
+    if role == "query":
+        gene_focus = (
+            f"the QUERY gene {req.query} (pathogen / microbe-side rubric context)"
+        )
+    elif role == "target":
+        gene_focus = (
+            f"the TARGET gene {req.target_id} (host-side rubric context)"
+        )
+    else:
+        gene_focus = (
+            "the gene implied by this paper's role in the pair below (query vs target)"
+        )
+    identity_block = focus_identity_prompt_block(focus_terms, gene_focus)
     return (
         "Grade using the RUBRIC JSON object below. If `grader_instructions` exists, read it first; "
         "then `system_context`, `evaluation_unit`, `scoring_scale`, and each `axis` with criteria.\n\n"
@@ -322,6 +336,7 @@ def _build_grader_system_prompt(
         f"- paper_role={role or 'unknown'} (query → microbe rubric; target → host rubric)\n"
         f"- gene_focus_for_this_paper: {gene_focus}\n"
         f"{term_block}\n"
+        f"{identity_block}\n"
         f"{_grader_json_output_instructions(rubric, rubric_role)}\n"
         f"Scored criteria by axis:\n{criterion_block}\n\n"
         f"RUBRIC:\n{json.dumps(rubric, ensure_ascii=False)}"
@@ -580,7 +595,7 @@ def _build_grade_repair_prompt(
         "Do NOT re-grade the paper and do NOT add new evidence.\n"
         "Only reformat/recover the previous response into strict JSON.\n\n"
         "Return JSON only with keys:\n"
-        "- criterion_scores (object: criterion id -> {score: 0|1|2, note: optional string})\n"
+        "- criterion_scores (object: criterion id -> {score: 0|1|2}; no notes)\n"
         "- mention_type, no_meaningful_mention, rubric_tags, claim_summary (as applicable)\n\n"
         f"Scored criterion ids must be exactly: {criterion_ids}\n\n"
         "Invalid output to repair:\n"
@@ -809,8 +824,8 @@ def _grade_single_paper(
                     "or missing required JSON keys). Follow rubric.grader_instructions and the axes, "
                     "then respond with ONLY one JSON object—no other text.\n"
                     "Required keys: criterion_scores (each scored criterion id -> "
-                    f"{{score: 0|1|2, note: optional ≤{_GRADER_CRITERION_NOTE_MAX_CHARS} chars}}), "
-                    "mention_type, no_meaningful_mention. "
+                    "{score: 0|1|2}; no notes), mention_type, no_meaningful_mention, "
+                    f"claim_summary (≤{CLAIM_SUMMARY_MAX_CHARS} chars). "
                     f"Criterion ids: {criterion_ids}.\n"
                 )
                 if bad:
@@ -924,6 +939,20 @@ def _grade_single_paper(
             parsed = _parse_grade_output(raw, rubric, rubric_role)
     if parsed.pop("notes_parse_failed", False) and not notes:
         notes = "grader JSON parse failed"
+    focus_terms = focus_terms_for_paper_role(
+        role, req.query, req.target_id, req.gene_context
+    )
+    before_nmm = bool(parsed.get("no_meaningful_mention"))
+    parsed = enforce_focus_identity(
+        parsed,
+        excerpt=excerpt,
+        focus_terms=focus_terms,
+        rubric=rubric,
+        rubric_role=rubric_role,
+    )
+    if parsed.get("no_meaningful_mention") and not before_nmm:
+        note_bit = "focus identity gate zeroed scores"
+        notes = f"{notes}; {note_bit}".strip("; ") if notes else note_bit
     paper = GradedPaper(
         paper_id=paper_id,
         file_name=fname,

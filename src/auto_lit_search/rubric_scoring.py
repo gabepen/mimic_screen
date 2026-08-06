@@ -11,7 +11,8 @@ HOST_PRIMARY_AXIS = "infection_process_relevance"
 MICROBE_PRIMARY_AXIS = "system_relevance"
 HOST_BONUS_AXIS = "disease_population_relevance"
 
-_CRITERION_NOTE_MAX_CHARS = 60
+# Single paper-level claim is the grader prose channel; per-criterion notes are ignored.
+CLAIM_SUMMARY_MAX_CHARS = 500
 
 
 @dataclass(frozen=True)
@@ -114,7 +115,10 @@ def derive_axis_rationales_from_criterion_scores(
     *,
     max_axis_chars: int = 700,
 ) -> Dict[str, str]:
-    """Roll v2 per-criterion notes into per-axis strings for synthesis prompts."""
+    """Roll v2 criterion scores into compact per-axis strings for synthesis prompts.
+
+    Per-criterion notes are ignored; prose for synthesis lives in claim_summary.
+    """
     crit_to_axis = criterion_id_to_axis_map(rubric)
     by_axis: Dict[str, List[str]] = {}
     for crit_id in sorted(crit_to_axis.keys()):
@@ -123,12 +127,7 @@ def derive_axis_rationales_from_criterion_scores(
         if entry is None:
             continue
         score = entry.get("score", "?")
-        note = str(entry.get("note") or "").strip()
-        if note:
-            part = f"{crit_id}={score}: {note}"
-        else:
-            part = f"{crit_id}={score}"
-        by_axis.setdefault(axis_id, []).append(part)
+        by_axis.setdefault(axis_id, []).append(f"{crit_id}={score}")
     return {
         axis_id: "; ".join(parts)[:max_axis_chars]
         for axis_id, parts in by_axis.items()
@@ -155,7 +154,11 @@ def resolve_axis_rationales(
 
 
 def normalize_criterion_scores(raw: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
-    """Normalize LLM output to {id: {score: int, note: str}}."""
+    """Normalize LLM output to {id: {score: int, note: str}}.
+
+    Notes are accepted for backward compatibility but always cleared — synthesis
+    uses claim_summary + excerpts, not per-criterion prose.
+    """
     out: Dict[str, Dict[str, Any]] = {}
     for key, value in raw.items():
         crit_id = str(key).strip()
@@ -163,15 +166,13 @@ def normalize_criterion_scores(raw: Dict[str, Any]) -> Dict[str, Dict[str, Any]]
             continue
         if isinstance(value, dict):
             score_raw = value.get("score")
-            note = str(value.get("note") or "").strip()[:_CRITERION_NOTE_MAX_CHARS]
         else:
             score_raw = value
-            note = ""
         try:
             score = int(score_raw)
         except (TypeError, ValueError):
             continue
-        out[crit_id] = {"score": max(0, min(2, score)), "note": note}
+        out[crit_id] = {"score": max(0, min(2, score)), "note": ""}
     return out
 
 

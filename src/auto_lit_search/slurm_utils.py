@@ -108,3 +108,78 @@ def is_terminal_job_state(state: str | None) -> bool:
     if not state:
         return False
     return state.upper() in _TERMINAL_JOB_STATES
+
+
+def scancel_bin() -> str:
+    return os.environ.get("SCANCEL", "scancel").strip() or "scancel"
+
+
+def scancel_jobs(job_ids: list[str]) -> list[str]:
+    """Best-effort cancel Slurm jobs. Returns job ids for which scancel was invoked."""
+    cancelled: list[str] = []
+    for raw in job_ids:
+        jid = str(raw or "").strip()
+        if not jid:
+            continue
+        try:
+            subprocess.check_call(
+                [scancel_bin(), jid],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            cancelled.append(jid)
+        except (subprocess.CalledProcessError, FileNotFoundError, OSError):
+            continue
+    return cancelled
+
+
+def grader_scale_down_should_trigger(
+    *,
+    remaining_packets: int,
+    respect_threshold: int,
+) -> bool:
+    """True when remaining paper packets still needing grading is at/below respect_threshold."""
+    if respect_threshold <= 0:
+        return False
+    return int(remaining_packets) <= int(respect_threshold)
+
+
+def select_idle_grader_jobs_to_kill(
+    *,
+    job_specs: list[dict[str, object]],
+    inflight_by_url: dict[str, int],
+    url_by_port: dict[int, str],
+    n_kill: int,
+    min_keep: int = 1,
+) -> list[str]:
+    """
+    Choose up to ``n_kill`` grader Slurm job ids that currently have zero inflight work.
+
+    Prefer higher ports (later-started graders). Always leave at least ``min_keep``
+    registered endpoints that are not selected for kill.
+    """
+    if n_kill <= 0:
+        return []
+    registered_ports = sorted(url_by_port.keys())
+    if len(registered_ports) <= min_keep:
+        return []
+
+    idle: list[tuple[int, str]] = []
+    for spec in job_specs:
+        try:
+            port = int(spec["port"])  # type: ignore[arg-type]
+            jid = str(spec["job_id"] or "").strip()
+        except (KeyError, TypeError, ValueError):
+            continue
+        if not jid:
+            continue
+        url = url_by_port.get(port)
+        if not url:
+            continue
+        if int(inflight_by_url.get(url, 0) or 0) > 0:
+            continue
+        idle.append((port, jid))
+
+    idle.sort(key=lambda item: item[0], reverse=True)
+    max_kill = min(n_kill, max(0, len(registered_ports) - min_keep), len(idle))
+    return [jid for _, jid in idle[:max_kill]]

@@ -121,6 +121,8 @@ def build_cpu_env(
         "GRADER_URLS": grader_urls.replace(",", ";"),
         "GRADER_JOB_IDS": grader_job_ids,
         "NUM_GRADER_NODES": str(num_grader_nodes) if num_grader_nodes else "",
+        "CLUSTER_RESPECT": str(getattr(cfg.slurm, "cluster_respect", 0) or 0),
+        "RESPECT_THRESHOLD": str(getattr(cfg.slurm, "respect_threshold", 0) or 0),
         "GRADER_HOST": grader_host,
         "GRADER_API_PORT": str(cfg.slurm.grader_port),
         "HOST_RUBRIC_PATH": str(cfg.host_rubric),
