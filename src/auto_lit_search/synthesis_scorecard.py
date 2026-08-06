@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 from statistics import mean
 from types import SimpleNamespace
@@ -22,27 +23,6 @@ MIMICRY_TAG_KEYS = ("mimicry_potential_flag", "mimicry_flag")
 MIMICRY_STRONG_VALUES = frozenset(
     {"mimicry_strong", "strong", "mimicry_possible", "possible"}
 )
-# Query-side published molecular / functional mimicry of eukaryotic machinery.
-# Used to floor rubric mimicry_plausibility so Foldseek-host sparsity cannot
-# erase effector literature that already establishes a mimetic mechanism.
-QUERY_MIMICRY_LITERATURE_RE = re.compile(
-    r"(?i)(?:"
-    r"molecular\s+mimic(?:ry|s)?|"
-    r"structural\s+mimic(?:ry|s)?|"
-    r"functional\s+mimic(?:ry|s)?|"
-    r"mimics?\s+(?:a\s+)?(?:host|eukaryotic|cellular)|"
-    r"mimic(?:s|ry)?\s+of\s+(?:(?:a|the)\s+)?(?:host|eukaryotic)|"
-    r"eukaryotic[- ]like|"
-    r"sec7[- ](?:domain|fold)|"
-    r"(?:functions?\s+as\s+)?(?:an?\s+)?arf\s+gef|"
-    r"f[- ]?box\s+(?:domain|protein|motif|effector)|"
-    r"set[- ]domain|"
-    r"histone\s+methyltransferase|"
-    r"hijacks?\s+the\s+host\s+(?:scf|ubiquitin)|"
-    r"mimics?\s+host\s+\w+\s+kinase"
-    r")"
-)
-QUERY_MIMICRY_RUBRIC_FLOOR = 80
 
 
 def _axis_score(gp: Any, axis: str) -> float:
@@ -107,55 +87,6 @@ def graded_papers_from_json(graded: Dict[str, Any]) -> List[Any]:
             )
         )
     return out
-
-
-def _criterion_notes_text(criterion_scores: Any) -> str:
-    if not isinstance(criterion_scores, dict):
-        return ""
-    bits: List[str] = []
-    for entry in criterion_scores.values():
-        if isinstance(entry, dict):
-            note = str(entry.get("note") or "").strip()
-            if note:
-                bits.append(note)
-        elif entry is not None:
-            bits.append(str(entry))
-    return " ".join(bits)
-
-
-def _query_paper_text_blob(gp: Any) -> str:
-    parts = [
-        str(getattr(gp, "claim_summary", None) or ""),
-        str(getattr(gp, "rationale", None) or ""),
-        _criterion_notes_text(getattr(gp, "criterion_scores", None)),
-    ]
-    for v in (getattr(gp, "rubric_axis_rationales", None) or {}).values():
-        parts.append(str(v or ""))
-    tags = getattr(gp, "rubric_tags", None) or {}
-    if isinstance(tags, dict):
-        for v in tags.values():
-            parts.append(str(v or ""))
-    return " ".join(parts)
-
-
-def query_asserts_molecular_mimicry(graded_papers: List[Any], *, top_k: int = 10) -> bool:
-    """True if top query grades assert molecular/functional eukaryotic mimicry."""
-    query = [gp for gp in graded_papers if _role(gp) == "query"]
-    ranked = sorted(
-        query,
-        key=lambda g: (
-            max(
-                (_axis_score(g, a) for a in QUERY_EVIDENCE_AXES),
-                default=_max_axis_score(g),
-            ),
-            _relevance_grade(g),
-        ),
-        reverse=True,
-    )[: max(1, top_k)]
-    for gp in ranked:
-        if QUERY_MIMICRY_LITERATURE_RE.search(_query_paper_text_blob(gp)):
-            return True
-    return False
 
 
 def score_to_dimension_tier(score: int) -> str:
@@ -251,10 +182,6 @@ def compute_rubric_scorecard(graded_papers: List[Any]) -> Dict[str, Any]:
         if mimicry_score == 0 and _axis_score(gp, HOST_CHAR_AXIS) >= 0.5:
             mimicry_score = max(mimicry_score, 35)
 
-    query_mimicry_literature = query_asserts_molecular_mimicry(graded_papers)
-    if query_mimicry_literature:
-        mimicry_score = max(mimicry_score, QUERY_MIMICRY_RUBRIC_FLOOR)
-
     w_host = env_positive_float("SCORECARD_WEIGHT_HOST", 0.40)
     w_query = env_positive_float("SCORECARD_WEIGHT_QUERY", 0.35)
     w_mimicry = env_positive_float("SCORECARD_WEIGHT_MIMICRY", 0.15)
@@ -322,7 +249,6 @@ def compute_rubric_scorecard(graded_papers: List[Any]) -> Dict[str, Any]:
             "max_query_relevance_grade": max((_relevance_grade(gp) for gp in query), default=0.0),
             "top_host_axis": top_host_ax,
             "top_host_axis_score": round(top_host_ax_score, 3),
-            "query_mimicry_literature": query_mimicry_literature,
         },
         "best_host_paper": _best_paper_id(best_host),
         "best_query_paper": _best_paper_id(best_query),
@@ -459,11 +385,24 @@ def parse_llm_scorecard(synthesis_text: str) -> Dict[str, Any]:
     return out
 
 
-def _blend_scores(rubric: int, llm: Optional[int], rubric_weight: float = 0.6) -> int:
+def _blend_scores(rubric: int, llm: Optional[int], rubric_weight: float = 0.0) -> int:
+    """Optional legacy blend. rubric_weight=0 → LLM-only when LLM score present."""
     if llm is None:
         return rubric
     w = max(0.0, min(1.0, rubric_weight))
+    if w <= 0.0:
+        return int(llm)
+    if w >= 1.0:
+        return int(rubric)
     return _clamp_score(w * rubric + (1.0 - w) * llm)
+
+
+def _score_entry(score: int, *, source: str) -> Dict[str, Any]:
+    return {
+        "score": score,
+        "tier": score_to_dimension_tier(score),
+        "source": source,
+    }
 
 
 def build_conclusion(
@@ -473,71 +412,110 @@ def build_conclusion(
     synthesis_status: str,
     rubric_weight: Optional[float] = None,
 ) -> Dict[str, Any]:
+    """Build the stored pair conclusion.
+
+    When synthesis_status is ok and Quick results scores parse, those synthesis
+    scores are authoritative (host / query / mimicry / pair). Rubric aggregates
+    remain under rubric_indices for diagnostics only.
+
+    Set SCORECARD_RUBRIC_BLEND_WEIGHT > 0 only if you intentionally want a
+    legacy rubric+LLM blend (default 0 = synthesis-only).
+    """
     rubric = compute_rubric_scorecard(graded_papers)
     llm = parse_llm_scorecard(synthesis_text) if synthesis_status == "ok" else {}
-    rw = rubric_weight if rubric_weight is not None else env_positive_float(
-        "SCORECARD_RUBRIC_BLEND_WEIGHT", 0.6
-    )
+    if rubric_weight is not None:
+        rw = max(0.0, min(1.0, float(rubric_weight)))
+    else:
+        raw = os.environ.get("SCORECARD_RUBRIC_BLEND_WEIGHT")
+        if raw is None or not str(raw).strip():
+            rw = 0.0
+        else:
+            try:
+                rw = max(0.0, min(1.0, float(str(raw).strip())))
+            except ValueError:
+                rw = 0.0
 
-    host_score = _blend_scores(
-        rubric["host_exploitation"]["score"],
-        llm.get("host_exploitation_score"),
-        rw,
+    def _resolve(rubric_score: int, llm_key: str) -> tuple[int, str]:
+        llm_val = llm.get(llm_key)
+        if llm_val is None:
+            return int(rubric_score), "rubric"
+        if rw <= 0.0:
+            return int(llm_val), "synthesis"
+        if rw >= 1.0:
+            return int(rubric_score), "rubric"
+        return _blend_scores(int(rubric_score), int(llm_val), rw), "blend"
+
+    host_score, host_src = _resolve(
+        rubric["host_exploitation"]["score"], "host_exploitation_score"
     )
-    query_score = _blend_scores(
-        rubric["query_effector"]["score"],
-        llm.get("query_effector_score"),
-        rw,
+    query_score, query_src = _resolve(
+        rubric["query_effector"]["score"], "query_effector_score"
     )
-    rubric_mimicry = int(rubric["mimicry_plausibility"]["score"])
-    mimicry_score = _blend_scores(
-        rubric_mimicry,
-        llm.get("mimicry_plausibility_score"),
-        rw,
+    mimicry_score, mimicry_src = _resolve(
+        int(rubric["mimicry_plausibility"]["score"]), "mimicry_plausibility_score"
     )
-    # Query-side published molecular mimicry must not be demoted by LLM pairing
-    # conservatism (Foldseek host seldom co-mentioned with known mimics).
-    if (rubric.get("evidence") or {}).get("query_mimicry_literature"):
-        mimicry_score = max(mimicry_score, rubric_mimicry)
-    pair_score = _blend_scores(
-        rubric["pair_priority"]["score"],
-        llm.get("pair_priority_score"),
-        rw,
+    pair_score, pair_src = _resolve(
+        rubric["pair_priority"]["score"], "pair_priority_score"
     )
+    # pair_priority uses letter tiers, not dimension tiers
+    pair_entry = {
+        "score": pair_score,
+        "tier": score_to_pair_tier(pair_score),
+        "source": pair_src,
+    }
 
     headline = str(llm.get("headline") or "").strip()
     if not headline:
         headline = _auto_headline(host_score, query_score, mimicry_score, pair_score)
 
-    best_host = str(llm.get("best_host_paper") or rubric.get("best_host_paper") or "")
-    best_query = str(llm.get("best_query_paper") or rubric.get("best_query_paper") or "")
+    best_host = str(llm.get("best_host_paper") or "").strip()
+    if not best_host:
+        best_host = str(rubric.get("best_host_paper") or "")
+    best_query = str(llm.get("best_query_paper") or "").strip()
+    if not best_query or best_query.lower() == "none":
+        # Prefer an explicit empty synthesis choice over rubric nomination.
+        if "best_query_paper" in llm:
+            best_query = "" if best_query.lower() == "none" else best_query
+        else:
+            best_query = str(rubric.get("best_query_paper") or "")
+
     uncertainties = str(llm.get("main_uncertainties") or "").strip()
     if synthesis_status == "grades_only" and not uncertainties:
         uncertainties = "Conclusion derived from rubric grades only (synthesis LLM unavailable)."
+
+    synthesis_scores: Dict[str, Any] = {}
+    if llm:
+        for key in (
+            "host_exploitation_score",
+            "query_effector_score",
+            "mimicry_plausibility_score",
+            "pair_priority_score",
+        ):
+            if key in llm:
+                synthesis_scores[key] = llm[key]
+        if llm.get("headline") is not None:
+            synthesis_scores["headline"] = str(llm.get("headline") or "")
+        if "best_host_paper" in llm:
+            synthesis_scores["best_host_paper"] = str(llm.get("best_host_paper") or "")
+        if "best_query_paper" in llm:
+            synthesis_scores["best_query_paper"] = str(llm.get("best_query_paper") or "")
+        if "main_uncertainties" in llm:
+            synthesis_scores["main_uncertainties"] = str(
+                llm.get("main_uncertainties") or ""
+            )
 
     return {
         "scorecard_version": "2",
         "synthesis_status": synthesis_status,
         "headline": headline,
-        "host_exploitation": {
-            "score": host_score,
-            "tier": score_to_dimension_tier(host_score),
-        },
-        "query_effector": {
-            "score": query_score,
-            "tier": score_to_dimension_tier(query_score),
-        },
-        "mimicry_plausibility": {
-            "score": mimicry_score,
-            "tier": score_to_dimension_tier(mimicry_score),
-        },
-        "pair_priority": {
-            "score": pair_score,
-            "tier": score_to_pair_tier(pair_score),
-        },
+        "host_exploitation": _score_entry(host_score, source=host_src),
+        "query_effector": _score_entry(query_score, source=query_src),
+        "mimicry_plausibility": _score_entry(mimicry_score, source=mimicry_src),
+        "pair_priority": pair_entry,
         "best_host_paper": best_host,
         "best_query_paper": best_query,
         "main_uncertainties": uncertainties,
+        "synthesis_scores": synthesis_scores,
         "rubric_indices": rubric,
         "evidence": rubric.get("evidence") or {},
     }
@@ -606,22 +584,14 @@ def quick_summary_prompt_footer() -> str:
         '  "main_uncertainties": "<1-3 sentences>"\n'
         "}\n"
         "```\n\n"
-        "Score guide (host_exploitation / query_effector / pair_priority): "
-        "0=no support, 40=limited/indirect, 60=moderate pathway overlap, "
+        "Score guide (all 0-100 dimensions): "
+        "0=no support, 40=limited/indirect, 60=moderate evidence, "
         "80=strong evidence, 100=exceptional/multiple papers.\n"
-        "mimicry_plausibility_score anchors (independent of Foldseek-host co-mention):\n"
-        "- 80-100: query literature establishes molecular/functional mimicry of a "
-        "eukaryotic fold, catalytic strategy, or pathway regulator "
-        "(e.g. F-box/SCF, Sec7/GEF, SET/HMT, kinase-pathway mimic), and/or multiple "
-        "papers support that mechanism — even if Foldseek host ≠ published substrate.\n"
-        "- 60-79: strong pathway-manipulation plausibility for this Foldseek pair "
-        "without naming both genes.\n"
-        "- 40-59: indirect pathway overlap only; no clear query mimetic mechanism.\n"
-        "- <40: neither query mimetic mechanism nor useful pathway overlap.\n"
-        "Do not lower mimicry_plausibility_score because the Foldseek host is unnamed "
-        "with the effector; put that only in main_uncertainties. "
-        "pair_priority weights host exploitation, query effector biology, mimicry tags, "
-        "and evidence depth. Do not use categorical labels like Some/High.\n\n"
+        "Score mimicry_plausibility from the graded paper evidence and rubric tags "
+        "for this pair only. Do not invent domain-specific boosts. "
+        "pair_priority should reflect host exploitation, query effector evidence, "
+        "mimicry, and evidence depth together. "
+        "Do not use categorical labels like Some/High.\n\n"
     )
 
 

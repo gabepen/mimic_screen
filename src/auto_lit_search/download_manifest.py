@@ -109,6 +109,7 @@ def _load_idmap(csv_path: str) -> Dict[str, Dict[str, Any]]:
                 syn_raw = (
                     row.get(f"{prefix}_synonyms")
                     or row.get(f"{prefix}_gene_synonyms")
+                    or row.get(f"{prefix}_gene_aliases")
                     or row.get(f"{prefix}_aliases")
                     or ""
                 )

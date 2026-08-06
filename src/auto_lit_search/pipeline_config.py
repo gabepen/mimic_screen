@@ -147,6 +147,10 @@ class Stage1Config:
 class Stage2SlurmConfig:
     num_grader_nodes: int
     num_synthesis_nodes: int
+    # When remaining paper packets still needing grading falls to/below
+    # respect_threshold, cancel this many idle grader Slurm jobs (0 = off).
+    cluster_respect: int
+    respect_threshold: int
     gpu_script: Path
     docling_script: Path
     grader_script: Path
@@ -461,6 +465,8 @@ def load_stage2_config(config_path: Path | str) -> Stage2Config:
     slurm = Stage2SlurmConfig(
         num_grader_nodes=int(slurm_raw.get("num_grader_nodes") or 1),
         num_synthesis_nodes=int(slurm_raw.get("num_synthesis_nodes") or 1),
+        cluster_respect=max(0, int(slurm_raw.get("cluster_respect") or 0)),
+        respect_threshold=max(0, int(float(slurm_raw.get("respect_threshold") or 0))),
         gpu_script=_slurm_script("gpu_script", "slurm/gpu_llm_node.slurm"),
         docling_script=_slurm_script("docling_script", "slurm/gpu_docling_node.slurm"),
         grader_script=_slurm_script("grader_script", "slurm/gpu_grader_node.slurm"),

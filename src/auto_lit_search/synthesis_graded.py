@@ -27,6 +27,7 @@ from auto_lit_search.mention_excerpt import (
     format_excerpt_block,
 )
 from auto_lit_search.rubric_scoring import (
+    CLAIM_SUMMARY_MAX_CHARS,
     resolve_axis_rationales,
     rubric_role_for_paper_role,
 )
@@ -51,6 +52,8 @@ def max_axis_score(gp: Any) -> float:
 
 
 def paper_kept_for_synthesis(gp: Any, min_axis_score: float) -> bool:
+    if bool(getattr(gp, "no_meaningful_mention", False)):
+        return False
     if float(gp.relevance_grade) > 0.0:
         return True
     return max_axis_score(gp) >= min_axis_score
@@ -168,9 +171,10 @@ def _paper_metadata_lines(
     for ax in order:
         sc = float(scores.get(ax, 0.0))
         why = (rax.get(ax) or "")[:per_axis_cap]
-        parts.append(f"    • {ax}: score={sc:.3f} | grader_reasoning: {why}")
-    if (gp.rationale or "").strip():
-        parts.append(f"    • cross_axis_note: {gp.rationale.strip()[:400]}")
+        parts.append(f"    • {ax}: score={sc:.3f} | criterion_scores: {why}")
+    claim = (gp.claim_summary or gp.rationale or "").strip()
+    if claim:
+        parts.append(f"    • claim_summary: {claim[:CLAIM_SUMMARY_MAX_CHARS]}")
     return "\n".join(p for p in parts if p)
 
 
@@ -387,16 +391,10 @@ def _synthesis_pair_context_block() -> str:
         "host-side rubric support (e.g. infection/symbiosis/interaction-relevant axes) "
         "and/or the query shows effector, secretion, persistence, or host-targeting "
         "evidence—even if genes are never named together.\n"
-        "- Mimicry plausibility has two independent positive signals:\n"
-        "  (1) Query-side molecular mimicry of a eukaryotic fold, catalytic strategy, "
-        "or pathway regulator (score ≥80 even if Foldseek host ≠ published substrate);\n"
-        "  (2) Pair/pathway plausibility from structural similarity + host pathway "
-        "overlap with the query effector’s biochemistry (typically 40–79 without "
-        "co-mention).\n"
-        "- Do not penalize mimicry_plausibility because the Foldseek host gene is "
-        "unnamed with the effector; put that only in main_uncertainties.\n"
-        "- Separate host exploitation / symbiont-relevant pathway support from "
-        "molecular mimicry plausibility in the discussion.\n\n"
+        "- Score mimicry_plausibility from the graded evidence and rubric tags for "
+        "this pair; keep it separate from host-exploitation support in the discussion.\n"
+        "- Put missing co-mention / substrate mismatch in main_uncertainties, not as "
+        "an automatic score penalty or boost.\n\n"
     )
 
 
@@ -790,7 +788,8 @@ def run_alignment_graded(
     final_max_tokens = env_positive_int("SYNTHESIS_FINAL_MAX_TOKENS", 8192)
     prior_summary_max_chars = env_positive_int("SYNTHESIS_PRIOR_SUMMARY_MAX_CHARS", 2500)
     filtered_rule = (
-        f"relevance_grade > 0.0 OR max(axis_score) >= {min_axis_score}"
+        f"relevance_grade > 0.0 OR max(axis_score) >= {min_axis_score}; "
+        "exclude no_meaningful_mention"
     )
 
     sorted_graded = _sort_papers_by_relevance(list(req.graded_papers))
@@ -881,9 +880,7 @@ def run_alignment_graded(
         f"{mimicry_flag_handling_block(host_rubric)}"
         f"{term_block}\n\n"
         "You are in final pair-level synthesis. Bridge host (target) exploitation evidence "
-        "with query (microbe) effector evidence. Do not require co-mention of both genes.\n"
-        "Credit query-side published molecular mimicry under mimicry_plausibility "
-        "(≥80) even when the Foldseek host is not the published substrate.\n\n"
+        "with query (microbe) effector evidence. Do not require co-mention of both genes.\n\n"
         f"Host track summary ({len(host_pool)} papers, {host_batch_count} batches):\n"
         f"{host_running_summary or '(no host papers in synthesis pool)'}\n\n"
         f"Query track summary ({len(query_pool)} papers, {query_batch_count} batches):\n"

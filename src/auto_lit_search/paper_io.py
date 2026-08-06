@@ -155,6 +155,26 @@ def meta_search_literals(meta: Dict[str, Any], canonical_id: str) -> List[str]:
     return out
 
 
+def focus_terms_for_paper_role(
+    paper_role: Optional[str],
+    query: str,
+    target_id: str,
+    gene_context: Optional[Dict[str, Any]],
+) -> List[str]:
+    """Identification terms for the gene this paper is supposed to be graded on."""
+    role = (paper_role or "").strip().lower()
+    ctx = gene_context or {}
+    if role in ("query", "microbe"):
+        return meta_search_literals(ctx.get("query") or {}, query)
+    if role in ("target", "host"):
+        return meta_search_literals(ctx.get("target") or {}, target_id)
+    # Unknown role: allow either side (conservative for mention checks).
+    return dedupe_keep_order(
+        meta_search_literals(ctx.get("query") or {}, query)
+        + meta_search_literals(ctx.get("target") or {}, target_id)
+    )
+
+
 def gene_terms(meta: Dict[str, Any], fallback_id: str) -> Dict[str, Any]:
     symbol = str(meta.get("gene_name") or "").strip() or fallback_id
     common_name = str(meta.get("common_name") or "").strip()
