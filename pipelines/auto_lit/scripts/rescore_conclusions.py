@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """Rebuild conclusion scorecards from existing graded + synthesis text (no LLM).
 
-Applies current synthesis_scorecard blending, including the query-side
-molecular-mimicry floor. Does not regrade papers or rewrite synthesis prose.
+Re-applies current synthesis_scorecard rules (synthesis Quick results are
+authoritative; rubric_indices stay diagnostic). Does not regrade papers or
+rewrite synthesis prose.
 """
 
 from __future__ import annotations
@@ -95,9 +96,7 @@ def rescore_alignment(
         f"mimicry {old_mim}->{new_mim} "
         f"({new_conclusion['mimicry_plausibility']['tier']}); "
         f"pair {old_pair}->{new_pair} "
-        f"({new_conclusion['pair_priority']['tier']}); "
-        f"query_mimicry_lit="
-        f"{bool((new_conclusion.get('evidence') or {}).get('query_mimicry_literature'))}"
+        f"({new_conclusion['pair_priority']['tier']})"
     )
 
     if dry_run:

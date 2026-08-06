@@ -8,8 +8,8 @@ stage2:
   microbe_rubric: rubrics/hpylori_microbe_side_v1.json
   instructions_file: prompts/hpylori_human_instructions.txt
   slurm:
-    num_grader_nodes: 12
-    num_synthesis_nodes: 4
+    num_grader_nodes: 5
+    num_synthesis_nodes: 2
     grader_script: slurm/gpu_grader_a5500.slurm
     gpu_port: 9000
     docling_port: 9100
@@ -29,3 +29,4 @@ stage2:
     VLLM_MAX_NUM_SEQS: "1"
     GRADER_MAX_TOKENS: "2048"
     VLLM_MAX_MODEL_LEN: "40960"
+    GRADER_REUSE_EXISTING: "1"

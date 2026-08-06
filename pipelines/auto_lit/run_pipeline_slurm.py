@@ -197,6 +197,8 @@ def _defaults_from_stage2(cfg: Stage2Config) -> dict[str, Any]:
         "grader_port": cfg.slurm.grader_port,
         "num_grader_nodes": cfg.slurm.num_grader_nodes,
         "num_synthesis_nodes": cfg.slurm.num_synthesis_nodes,
+        "cluster_respect": cfg.slurm.cluster_respect,
+        "respect_threshold": cfg.slurm.respect_threshold,
         "instructions_file": str(cfg.instructions_file),
         "idmap_csv": str(cfg.idmap_csv),
         "host_rubric_path": str(cfg.host_rubric),
@@ -466,6 +468,8 @@ def run_pipeline(args: argparse.Namespace) -> int:
         "GRADER_URLS": ";".join(grader_urls),
         "GRADER_JOB_IDS": ":".join(grader_job_ids),
         "NUM_GRADER_NODES": str(args.num_grader_nodes),
+        "CLUSTER_RESPECT": str(getattr(args, "cluster_respect", 0) or 0),
+        "RESPECT_THRESHOLD": str(getattr(args, "respect_threshold", 0) or 0),
         "HOST_RUBRIC_PATH": os.path.abspath(args.host_rubric_path),
         "MICROBE_RUBRIC_PATH": os.path.abspath(args.microbe_rubric_path),
         "COLLECTION_ORG": args.collection_org,
@@ -522,6 +526,8 @@ def run_pipeline(args: argparse.Namespace) -> int:
             f"GRADER_HOST=<FIRST_GRADER_HOST>,"
             f"GRADER_API_PORT={args.grader_port},"
             f"NUM_GRADER_NODES={args.num_grader_nodes},"
+            f"CLUSTER_RESPECT={getattr(args, 'cluster_respect', 0) or 0},"
+            f"RESPECT_THRESHOLD={getattr(args, 'respect_threshold', 0) or 0},"
             f"HOST_RUBRIC_PATH={os.path.abspath(args.host_rubric_path)},"
             f"MICROBE_RUBRIC_PATH={os.path.abspath(args.microbe_rubric_path)},"
             f"COLLECTION_ORG={args.collection_org},"
@@ -599,6 +605,18 @@ def _build_parser(defaults: dict[str, Any] | None = None) -> argparse.ArgumentPa
     p.add_argument("--grader-port", type=int, default=None)
     p.add_argument("--num-grader-nodes", type=int, default=None)
     p.add_argument("--num-synthesis-nodes", type=int, default=None)
+    p.add_argument(
+        "--cluster-respect",
+        type=int,
+        default=None,
+        help="When remaining grade packets <= --respect-threshold, cancel this many idle grader jobs (0=off).",
+    )
+    p.add_argument(
+        "--respect-threshold",
+        type=int,
+        default=None,
+        help="Absolute count of remaining alignment packets still needing grading; trigger scale-down at/below this.",
+    )
     p.add_argument("--instructions-file", default=None)
     p.add_argument("--idmap-csv", default=None)
     p.add_argument("--host-rubric-path", default=None)
@@ -630,6 +648,8 @@ def main() -> int:
         "grader_port": 9200,
         "num_grader_nodes": int(os.environ.get("NUM_GRADER_NODES", "1")),
         "num_synthesis_nodes": int(os.environ.get("NUM_SYNTHESIS_NODES", "1")),
+        "cluster_respect": int(os.environ.get("CLUSTER_RESPECT", "0") or "0"),
+        "respect_threshold": int(float(os.environ.get("RESPECT_THRESHOLD", "0") or "0")),
         "collection_org": os.environ.get("COLLECTION_ORG", "ucsc"),
         "collection_auth_scope": os.environ.get("COLLECTION_AUTH_SCOPE", "email_only"),
         "collector_email": os.environ.get("COLLECTOR_EMAIL", ""),
